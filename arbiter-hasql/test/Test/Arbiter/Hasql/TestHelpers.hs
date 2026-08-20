@@ -12,6 +12,8 @@ import Data.Text (Text)
 import Database.PostgreSQL.Simple (close, connectPostgreSQL)
 import Hasql.Connection qualified as Hasql
 
+import Arbiter.Hasql.Compat qualified as Compat
+
 import Arbiter.Hasql.HasqlDb (hasqlSettings)
 
 createHasqlPool :: Int -> ByteString -> IO (Pool Hasql.Connection)
@@ -20,7 +22,7 @@ createHasqlPool numConnections connStr =
     $ setNumStripes (Just 1)
     $ defaultPoolConfig
       ( do
-          result <- Hasql.acquire (hasqlSettings connStr)
+          result <- Compat.acquire (hasqlSettings connStr)
           case result of
             Right conn -> pure conn
             Left err -> error $ "hasql test: connection failed: " <> show err
