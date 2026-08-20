@@ -200,7 +200,7 @@ createHasqlEnvWithConfig _proxy connStr schemaName config = liftIO $ do
       $ setNumStripes (poolStripes config)
       $ defaultPoolConfig
         ( do
-            result <- Hasql.acquire (hasqlSettings connStr)
+            result <- Compat.acquire (hasqlSettings connStr)
             case result of
               Right conn -> pure conn
               Left err -> throwIO $ HasqlConnectionError (show err)
