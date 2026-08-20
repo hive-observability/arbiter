@@ -7,6 +7,8 @@
 -- imports from this module and never uses CPP directly.
 module Arbiter.Hasql.Compat
   ( runSQL
+  , acquire
+  , AcquireErrorOf
   , hasqlSettings
   , HasqlSettings
   ) where
@@ -20,6 +22,12 @@ import Data.Text.Encoding.Error qualified as TE
 import Hasql.Connection qualified as Hasql
 import Hasql.Session qualified as Session
 import UnliftIO (MonadUnliftIO)
+
+#if MIN_VERSION_hasql(2,0,0)
+import Pqi.Ffi qualified
+#endif
+
+import Hasql.Errors qualified as Errors
 
 #if MIN_VERSION_hasql(1,10,0)
 import Hasql.Connection.Settings qualified as Settings
@@ -56,4 +64,28 @@ hasqlSettingsFromConnStr = Settings.connectionString . TE.decodeUtf8With TE.leni
 type HasqlSettings = [Setting.Setting]
 hasqlSettingsFromConnStr :: ByteString -> [Setting.Setting]
 hasqlSettingsFromConnStr connStr = [Setting.connection (ConnSetting.string (TE.decodeUtf8With TE.lenientDecode connStr))]
+#endif
+
+-- | What 'Hasql.acquire' reports on failure.
+--
+-- hasql 2.1 replaced @ConnectionError@ with @AcquireError@, which classifies
+-- the failure (networking, authentication, compatibility, other) rather than
+-- carrying a bare message.
+#if MIN_VERSION_hasql(2,1,0)
+type AcquireErrorOf = Errors.AcquireError
+#else
+type AcquireErrorOf = Errors.ConnectionError
+#endif
+
+-- | Establish a connection.
+--
+-- From hasql 2 on, 'Hasql.acquire' takes a @pqi@ adapter that selects the
+-- transport implementation; before that the settings were the only argument.
+-- We pick the libpq-backed adapter, which is the one that matches how earlier
+-- versions talked to PostgreSQL.
+acquire :: HasqlSettings -> IO (Either AcquireErrorOf Hasql.Connection)
+#if MIN_VERSION_hasql(2,0,0)
+acquire = Hasql.acquire Pqi.Ffi.adapter
+#else
+acquire = Hasql.acquire
 #endif

@@ -42,8 +42,13 @@ library
     , base           >=4.14 && <5
     , bytestring     >=0.10 && <0.13
     , exceptions     >=0.10 && <0.11
-    , hasql          >=1.9  && <1.11
+    , hasql          >=1.10 && <2.2
     , mtl            >=2.2  && <2.4
+    -- Only used from hasql 2 on, where 'acquire' takes a pqi adapter. Cabal
+    -- cannot make a dependency conditional on another package's version, so
+    -- 1.x builds carry it unused; say the word if you would rather it were a
+    -- manual flag.
+    , pqi-ffi        >=1.0  && <1.1
     , resource-pool  >=0.4  && <0.6
     , text           >=1.2  && <2.2
     , transformers   >=0.5  && <0.7
