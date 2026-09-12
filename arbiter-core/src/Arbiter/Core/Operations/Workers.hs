@@ -1,6 +1,8 @@
 -- | Worker-registry database operations.
 module Arbiter.Core.Operations.Workers
-  ( registerWorker
+  ( countOr0
+  , countOr0Prepared
+  , registerWorker
   , heartbeatWorker
   , setWorkerPaused
   , markWorkerShuttingDown
@@ -49,7 +51,7 @@ heartbeatWorker schema workerId =
 -- | Set a worker's pause flag.
 setWorkerPaused :: (MonadArbiter m) => SchemaName -> UUID -> Bool -> m Int64
 setWorkerPaused schema workerId paused =
-  countOrZero (Sql.setWorkerPausedSQL schema paused workerId)
+  countOr0 (Sql.setWorkerPausedSQL schema paused workerId)
 
 -- | Mark a worker as gracefully draining.
 markWorkerShuttingDown :: (MonadArbiter m) => SchemaName -> UUID -> m Int64
@@ -85,9 +87,13 @@ listWorkers schema queue liveSecs = do
 sweepStaleWorkers :: (MonadArbiter m) => SchemaName -> m Int64
 sweepStaleWorkers schema = MA.executeStatement (Sql.deleteStaleWorkersSQL schema)
 
-countOrZero :: (MonadArbiter m) => Query Int64 -> m Int64
-countOrZero query = do
-  rows <- MA.executeQuery query
-  pure $ case rows of
-    [count] -> count
-    _ -> 0
+-- | Run a single-row count @Query@, returning 0 on an empty or unexpected result.
+countOr0 :: (MonadArbiter m) => Query Int64 -> m Int64
+countOr0 = fmap singleCount . MA.executeQuery
+
+countOr0Prepared :: (MonadArbiter m) => Query Int64 -> m Int64
+countOr0Prepared = fmap singleCount . MA.executeQueryPrepared
+
+singleCount :: [Int64] -> Int64
+singleCount [count] = count
+singleCount _ = 0

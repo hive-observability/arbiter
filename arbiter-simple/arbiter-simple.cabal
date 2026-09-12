@@ -50,12 +50,10 @@ library
     , arbiter-core       >=0.1  && <0.2
     , base               >=4.20 && <5
     , bytestring         >=0.10 && <0.13
-    , exceptions         >=0.10 && <0.11
     , mtl                >=2.2  && <2.4
     , postgresql-simple  >=0.6  && <0.8
     , resource-pool      >=0.4  && <0.6
     , text               >=1.2  && <2.2
-    , transformers       >=0.5  && <0.7
     , unliftio           >=0.2  && <0.3
 
 test-suite arbiter-simple-tests
@@ -70,7 +68,6 @@ test-suite arbiter-simple-tests
     Test.Arbiter.Simple.Operations
     Test.Arbiter.Simple.RateLimit
     Test.Arbiter.Simple.StateMachine
-    Test.Arbiter.Simple.TestHelpers
 
   build-depends:
     , arbiter-core         >=0.1 && <0.2

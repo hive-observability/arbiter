@@ -32,9 +32,8 @@ import Arbiter.Core.Queues qualified as Q
 import Arbiter.Core.Sql.Query (raw)
 import Arbiter.Core.Worker qualified as WR
 import Arbiter.Simple
-  ( SimpleConnectionPool (..)
-  , SimpleDb
-  , SimpleEnv (..)
+  ( SimpleDb
+  , SimpleEnv
   , createSimpleEnvWithPool
   , destroySimpleEnv
   , disableListener
@@ -68,10 +67,11 @@ import Data.Either (isRight)
 import Data.Foldable (for_, toList, traverse_)
 import Data.IORef (atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.Int (Int64)
+import Data.List (find)
 import Data.List.NonEmpty (NonEmpty (..))
 import Data.Map.Strict qualified as Map
-import Data.Maybe (fromJust, fromMaybe, isJust, isNothing)
-import Data.Pool (withResource)
+import Data.Maybe (fromMaybe, isJust, isNothing)
+import Data.Pool (Pool, withResource)
 import Data.Proxy (Proxy (..))
 import Data.String (fromString)
 import Data.Text (Text)
@@ -125,7 +125,7 @@ spec :: ByteString -> Spec
 spec connStr = beforeAll (setupOnce connStr testSchema testTable True) $ do
   sharedPool <- runIO (createSharedPool connStr)
   sharedEnv <- runIO (createSimpleEnvWithPool (Proxy @WorkerTestRegistry) sharedPool testSchema)
-  afterAll_ (destroySimpleEnv sharedEnv) $ around (withPool sharedEnv) $ do
+  afterAll_ (destroySimpleEnv sharedEnv) $ around (withPool sharedPool sharedEnv) $ do
     workerSpec @WorkerTestPayload
       SimpleTask
       FailingTask
@@ -151,7 +151,7 @@ spec connStr = beforeAll (setupOnce connStr testSchema testTable True) $ do
         result `shouldBe` Nothing
 
     describe "Transactional Atomicity" $ do
-      it "rolls back user operations when handler fails" $ \env -> withTestOpsTable env $ do
+      it "rolls back user operations when handler fails" $ \env -> withTestOpsTable sharedPool $ do
         let handler :: JobHandler (SimpleDb WorkerTestRegistry IO) WorkerTestPayload ()
             handler conn job = do
               liftIO
@@ -182,10 +182,10 @@ spec connStr = beforeAll (setupOnce connStr testSchema testTable True) $ do
             dlqJobs <- runSimpleDb env $ HL.listDLQJobs 10 0 :: IO [DLQ.DLQJob WorkerTestPayload]
             length dlqJobs `shouldBe` 1
 
-            count <- queryOpsCount env
+            count <- queryOpsCount sharedPool
             count `shouldBe` 0
 
-      it "commits user operations when handler succeeds" $ \env -> withTestOpsTable env $ do
+      it "commits user operations when handler succeeds" $ \env -> withTestOpsTable sharedPool $ do
         let handler :: JobHandler (SimpleDb WorkerTestRegistry IO) WorkerTestPayload ()
             handler conn job = do
               liftIO
@@ -204,12 +204,12 @@ spec connStr = beforeAll (setupOnce connStr testSchema testTable True) $ do
         withLinkedAsync
           (runSimpleDb env $ runWorkerPool config {workerCount = 1, pollInterval = 0.1})
           $ \_ -> do
-            waitUntil 10_000 $ (== 1) <$> queryOpsCount env
+            waitUntil 10_000 $ (== 1) <$> queryOpsCount sharedPool
 
-            count <- queryOpsCount env
+            count <- queryOpsCount sharedPool
             count `shouldBe` 1
 
-      it "manual commit inside handler persists despite subsequent failure" $ \env -> withTestOpsTable env $ do
+      it "manual commit inside handler persists despite subsequent failure" $ \env -> withTestOpsTable sharedPool $ do
         let handler :: JobHandler (SimpleDb WorkerTestRegistry IO) WorkerTestPayload ()
             handler conn job = do
               liftIO
@@ -243,7 +243,7 @@ spec connStr = beforeAll (setupOnce connStr testSchema testTable True) $ do
             length dlqJobs `shouldBe` 1
 
             -- User's manual commit survives despite handler failure
-            count <- queryOpsCount env
+            count <- queryOpsCount sharedPool
             count `shouldBe` 1
 
     describe "Graceful Shutdown" $ do
@@ -381,8 +381,7 @@ spec connStr = beforeAll (setupOnce connStr testSchema testTable True) $ do
                 traverse_
                   ( \job ->
                       when (payload job == SimpleTask "ca-stolen") $ do
-                        let pool = fromJust (connectionPool (simplePool env))
-                        withResource pool $ \conn ->
+                        withResource sharedPool $ \conn ->
                           void $
                             execute
                               conn
@@ -677,11 +676,10 @@ spec connStr = beforeAll (setupOnce connStr testSchema testTable True) $ do
 
         -- Verify reducer is in DLQ with snapshot
         dlqJobs <- runSimpleDb env $ HL.listDLQJobs @WorkerTestPayload 10 0
-        let reducerDlq = filter (\dlqJob -> payload (DLQ.jobSnapshot dlqJob) == SimpleTask "dlq-reducer") dlqJobs
-        length reducerDlq `shouldBe` 1
+        let reducerDlq = find (\dlqJob -> payload (DLQ.jobSnapshot dlqJob) == SimpleTask "dlq-reducer") dlqJobs
 
         -- Phase 2: Retry from DLQ - reducer should see preserved results from snapshot
-        let dlqId = DLQ.dlqPrimaryKey (head reducerDlq)
+        dlqId <- maybe (fail "dlq-reducer is not in the DLQ") (pure . DLQ.dlqPrimaryKey) reducerDlq
         mRetried <- runSimpleDb env $ HL.retryFromDLQ @WorkerTestPayload dlqId
         case mRetried of
           Nothing -> expectationFailure "retryFromDLQ returned Nothing"
@@ -743,7 +741,9 @@ spec connStr = beforeAll (setupOnce connStr testSchema testTable True) $ do
         dlqPayloads `shouldContain` [SimpleTask "recover-reducer"]
 
         -- Phase 2: Retry child-fail from DLQ → auto-retries reducer (suspended)
-        let childDlq = head $ filter (\dlqJob -> payload (DLQ.jobSnapshot dlqJob) == SimpleTask "recover-child-fail") dlqJobs
+        childDlq <-
+          maybe (fail "recover-child-fail is not in the DLQ") pure $
+            find (\dlqJob -> payload (DLQ.jobSnapshot dlqJob) == SimpleTask "recover-child-fail") dlqJobs
         mRetried <- runSimpleDb env $ HL.retryFromDLQ @WorkerTestPayload (DLQ.dlqPrimaryKey childDlq)
         case mRetried of
           Nothing -> expectationFailure "retryFromDLQ returned Nothing"
@@ -1261,7 +1261,6 @@ spec connStr = beforeAll (setupOnce connStr testSchema testTable True) $ do
       it "flags a job that is claimed concurrently with the force-cancel" $ \env -> do
         Just job <- runSimpleDb env $ HL.insertJob (defaultJob (SimpleTask "concurrent-claim"))
         let jid = primaryKey job
-            pool = fromJust (connectionPool (simplePool env))
             claimSql =
               fromString . T.unpack $
                 "UPDATE "
@@ -1284,7 +1283,7 @@ spec connStr = beforeAll (setupOnce connStr testSchema testTable True) $ do
 
         cancelledCount `shouldBe` 1
         [Only flagged] <-
-          withResource pool $ \conn ->
+          withResource sharedPool $ \conn ->
             PG.query
               conn
               ( fromString . T.unpack $
@@ -1298,12 +1297,11 @@ spec connStr = beforeAll (setupOnce connStr testSchema testTable True) $ do
         wid <- UUID.nextRandom
         Just job <- runSimpleDb env $ HL.insertJob (defaultJob (SimpleTask "lapsed-cancel"))
         let jid = primaryKey job
-            pool = fromJust (connectionPool (simplePool env))
         claimed <- runSimpleDb env (HL.claimNextVisibleJobsAs 1 60 wid) :: IO [JobRead WorkerTestPayload]
         length claimed `shouldBe` 1
 
         void $
-          withResource pool $ \conn ->
+          withResource sharedPool $ \conn ->
             PG.execute
               conn
               ( fromString . T.unpack $
@@ -1426,14 +1424,13 @@ spec connStr = beforeAll (setupOnce connStr testSchema testTable True) $ do
         holdingWorker <- UUID.nextRandom
         Just job <- runSimpleDb env $ HL.insertJob (defaultJob (SimpleTask "aba"))
         let jid = primaryKey job
-            pool = fromJust (connectionPool (simplePool env))
             expire =
               fromString . T.unpack $
                 "UPDATE " <> testSchema <> "." <> testTable <> " SET not_visible_until = NOW() - interval '1 second' WHERE id = ?"
 
         [stale] <- runSimpleDb env (HL.claimNextVisibleJobsAs 1 60 staleWorker) :: IO [JobRead WorkerTestPayload]
         primaryKey stale `shouldBe` jid
-        void $ withResource pool $ \conn -> PG.execute conn expire (Only jid)
+        void $ withResource sharedPool $ \conn -> PG.execute conn expire (Only jid)
 
         [held] <- runSimpleDb env (HL.claimNextVisibleJobsAs 1 60 holdingWorker) :: IO [JobRead WorkerTestPayload]
         primaryKey held `shouldBe` jid
@@ -1620,15 +1617,13 @@ spec connStr = beforeAll (setupOnce connStr testSchema testTable True) $ do
 -- | Clean the queue for one test. The env is built once for the suite. Its LISTEN
 -- hub holds a pool connection for as long as the env lives, and the shared pool
 -- has five.
-withPool :: SimpleEnv WorkerTestRegistry -> (SimpleEnv WorkerTestRegistry -> IO a) -> IO a
-withPool env action = do
-  let pool = fromJust (connectionPool (simplePool env))
+withPool :: Pool PG.Connection -> SimpleEnv WorkerTestRegistry -> (SimpleEnv WorkerTestRegistry -> IO a) -> IO a
+withPool pool env action = do
   withResource pool $ \conn -> cleanupData testSchema testTable conn
   action env
 
-withTestOpsTable :: SimpleEnv WorkerTestRegistry -> IO a -> IO a
-withTestOpsTable env action = do
-  let pool = fromJust (connectionPool (simplePool env))
+withTestOpsTable :: Pool PG.Connection -> IO a -> IO a
+withTestOpsTable pool action = do
   withResource pool (cleanupData testSchema testTable)
   withResource pool $ \conn -> do
     void $ execute_ conn $ "CREATE TABLE IF NOT EXISTS " <> testSchema <> ".test_operations (job_id INT, operation TEXT)"
@@ -1638,9 +1633,8 @@ withTestOpsTable env action = do
     void $ execute_ conn $ "DROP TABLE IF EXISTS " <> testSchema <> ".test_operations"
   pure result
 
-queryOpsCount :: SimpleEnv WorkerTestRegistry -> IO Int
-queryOpsCount env = do
-  let pool = fromJust (connectionPool (simplePool env))
+queryOpsCount :: Pool PG.Connection -> IO Int
+queryOpsCount pool =
   withResource pool $ \conn -> do
     [Only count] <-
       query

@@ -23,7 +23,6 @@ import Data.ByteString (ByteString)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
-import Database.PostgreSQL.Simple (close, connectPostgreSQL)
 import Orville.PostgreSQL qualified as O
 import Orville.PostgreSQL.Raw.Connection (destroyIdleConnections)
 import Orville.PostgreSQL.Raw.RawSql qualified as RawSql
@@ -119,10 +118,7 @@ disableOrvilleListener :: OrvilleTestEnv registry -> OrvilleTestEnv registry
 disableOrvilleListener env = env {testListen = Nothing}
 
 cleanupOrvilleTest :: OrvilleTestEnv registry -> IO ()
-cleanupOrvilleTest env = do
-  conn <- connectPostgreSQL (testConnStr env)
-  TestSetup.cleanupData (testSchema env) (testTableName env) conn
-  close conn
+cleanupOrvilleTest env = TestSetup.cleanupOnce (testConnStr env) (testSchema env) (testTableName env)
 
 -- | Run a TestOrville action with the test environment
 runOrvilleTest :: OrvilleTestEnv registry -> TestOrville registry a -> IO a

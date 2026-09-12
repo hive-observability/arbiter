@@ -63,13 +63,12 @@ import Test.Hspec.Wai
 import Arbiter.Servant (ArbiterServerConfig (..), arbiterApp, initArbiterServer)
 import Arbiter.Servant.Types
   ( AckRequest (..)
-  , ApiJob (..)
   , ApiJobWithStatus (..)
   , ApiJobWrite (..)
   , BatchDeleteResponse (..)
   , BatchInsertRequest (..)
   , BatchInsertResponse (..)
-  , ClaimResponse (..)
+  , ClaimResponse (ClaimResponse)
   , DLQResponse (..)
   , JobLease (..)
   , JobResponse (..)
@@ -86,7 +85,7 @@ postJson path = request "POST" path [("Content-Type", "application/json")]
 -- | The jobs a claim response leased.
 decodeClaim :: SResponse -> [JobRead ServantTestPayload]
 decodeClaim response = case decode (simpleBody response) of
-  Just claim -> map unApiJob (claimedJobs claim)
+  Just (ClaimResponse claimed) -> claimed
   Nothing -> error "claim response did not decode"
 
 -- | The lease a finalize has to present for this job.
@@ -195,8 +194,8 @@ spec connStr = do
 
       -- Verify POST response contains the inserted job
       liftIO $ do
-        body :: JobResponse (ApiJob ServantTestPayload) <- decodeBody postResp
-        let returnedJob = unApiJob (job body)
+        body :: JobResponse (JobRead ServantTestPayload) <- decodeBody postResp
+        let returnedJob = job body
         payload returnedJob `shouldBe` TestMessage "test message"
         groupKey returnedJob `shouldBe` Just "group1"
         dedupKey returnedJob `shouldBe` Just (IgnoreDuplicate "test-dedup-1")
@@ -227,8 +226,8 @@ spec connStr = do
           )
 
       liftIO $ do
-        body :: JobResponse (ApiJob ServantTestPayload) <- decodeBody postResp
-        let returnedJob = unApiJob (job body)
+        body :: JobResponse (JobRead ServantTestPayload) <- decodeBody postResp
+        let returnedJob = job body
         payload returnedJob `shouldBe` TestMessage "delayed"
         notVisibleUntil returnedJob `shouldBe` Just futureTime
 
@@ -247,8 +246,8 @@ spec connStr = do
               }|]
           )
       firstId <- liftIO $ do
-        body :: JobResponse (ApiJob ServantTestPayload) <- decodeBody firstResp
-        let returnedJob = unApiJob (job body)
+        body :: JobResponse (JobRead ServantTestPayload) <- decodeBody firstResp
+        let returnedJob = job body
         payload returnedJob `shouldBe` TestMessage "first"
         pure (primaryKey returnedJob)
 
@@ -266,8 +265,8 @@ spec connStr = do
               }|]
           )
       liftIO $ do
-        body :: JobResponse (ApiJob ServantTestPayload) <- decodeBody dupResp
-        let returnedJob = unApiJob (job body)
+        body :: JobResponse (JobRead ServantTestPayload) <- decodeBody dupResp
+        let returnedJob = job body
         primaryKey returnedJob `shouldBe` firstId
         payload returnedJob `shouldBe` TestMessage "first"
 
@@ -351,8 +350,8 @@ spec connStr = do
 
       resp <- get (TE.encodeUtf8 $ "/api/v1/arbiter_servant_test/jobs/" <> T.pack (show jobId))
       liftIO $ do
-        body :: JobResponse (ApiJob ServantTestPayload) <- decodeBody resp
-        let returnedJob = unApiJob (job body)
+        body :: JobResponse (JobRead ServantTestPayload) <- decodeBody resp
+        let returnedJob = job body
         payload returnedJob `shouldBe` TestMessage "get me"
         groupKey returnedJob `shouldBe` Just "group1"
         primaryKey returnedJob `shouldBe` jobId
@@ -950,7 +949,7 @@ spec connStr = do
           |]
 
     it "decodes a job object carrying none of the fields added since" $
-      (claimSeq . unApiJob <$> decode @(ApiJob ServantTestPayload) (encode olderJob)) `shouldBe` Just 0
+      (claimSeq <$> decode @(JobRead ServantTestPayload) (encode olderJob)) `shouldBe` Just 0
 
   describe "Landing overview wire contract" $ do
     let overview =

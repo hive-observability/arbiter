@@ -117,6 +117,7 @@ import UnliftIO.Async (withAsync)
 
 import Arbiter.Otel qualified as Otel
 import Arbiter.Otel.Gauges.Cache qualified as Cache
+import Arbiter.Otel.Gauges.Instruments qualified as Instruments
 
 newtype Greeting = Greeting Text
   deriving stock (Eq, Generic, Show)
@@ -329,7 +330,7 @@ spec = do
       Cache.lastScan (Cache.Idle Nothing) `shouldBe` Nothing
 
   describe "counter baselines" $ do
-    let rise = Cache.riseSince ("arbiter.jobs.processed", [("outcome", "success")])
+    let rise = Instruments.riseSince ("arbiter.jobs.processed", [("outcome", "success")])
         counted scanAt total = fst (rise scanAt total mempty)
 
     it "counts nothing from the first scan" $
@@ -352,7 +353,7 @@ spec = do
           meter <- getMeter meterProvider "arbiter-otel-test"
           counter <- meterCreateCounterDouble meter name Nothing Nothing defaultAdvisoryParameters
           let count seen (scanAt, total) = do
-                let (seen', rise) = Cache.riseSince key scanAt total seen
+                let (seen', rise) = Instruments.riseSince key scanAt total seen
                 counterAdd counter rise emptyAttributes
                 pure seen'
           foldM_ count mempty totals

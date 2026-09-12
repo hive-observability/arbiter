@@ -10,20 +10,18 @@ import Arbiter.Core.MonadArbiter (withDbTransaction)
 import Arbiter.Core.QueueRegistry (QueueSpec (..))
 import Arbiter.Test.Fixtures (TestPayload (..))
 import Arbiter.Test.Operations (operationsSpec)
-import Arbiter.Test.Setup (setupOnce)
+import Arbiter.Test.Setup (cleanupOnce, setupOnce)
 import Control.Exception (SomeException, catch, throwIO)
 import Control.Monad.IO.Class (liftIO)
 import Data.ByteString (ByteString)
-import Data.Maybe (fromJust)
 import Data.Pool (withResource)
 import Data.Proxy (Proxy (..))
 import Data.Text (Text)
 import Test.Hspec
 
 import Arbiter.Hasql.Compat qualified as Compat
-import Arbiter.Hasql.HasqlDb (HasqlEnv (..), createHasqlEnvWithPool, inTransaction, runHasqlDb)
-import Arbiter.Hasql.MonadArbiter (HasqlConnectionPool (..))
-import Test.Arbiter.Hasql.TestHelpers (cleanupHasqlTest, createHasqlPool)
+import Arbiter.Hasql.HasqlDb (createHasqlEnvWithPool, inTransaction, runHasqlDb)
+import Test.Arbiter.Hasql.TestHelpers (createHasqlPool)
 
 testSchema :: Text
 testSchema = "arbiter_hasql_ops_test"
@@ -37,14 +35,14 @@ spec :: ByteString -> Spec
 spec connStr = beforeAll (setupOnce connStr testSchema testTable False) $ do
   sharedPool <- runIO (createHasqlPool 5 connStr)
   mkEnv <- runIO (createHasqlEnvWithPool (Proxy @HasqlOpsTestRegistry) sharedPool testSchema)
-  around (\action -> cleanupHasqlTest connStr testSchema testTable >> action mkEnv) $ do
+  around (\action -> cleanupOnce connStr testSchema testTable >> action mkEnv) $ do
     operationsSpec @TestPayload TestMessage pure runHasqlDb
 
     describe "Transaction Participation (inTransaction)" $ do
       it "commits job insertion within user transaction" $ \env -> do
         let job = defaultJob (TestMessage "InTx")
 
-        withResource (fromJust $ connectionPool (hasqlPool env)) $ \conn -> do
+        withResource sharedPool $ \conn -> do
           Compat.runSQL conn "BEGIN"
           inTransaction @HasqlOpsTestRegistry conn testSchema $ do
             _ <- HL.insertJob job
@@ -60,7 +58,7 @@ spec connStr = beforeAll (setupOnce connStr testSchema testTable False) $ do
         let job = defaultJob (TestMessage "RollbackTest")
 
         result <-
-          ( withResource (fromJust $ connectionPool (hasqlPool env)) $ \conn -> do
+          ( withResource sharedPool $ \conn -> do
               Compat.runSQL conn "BEGIN"
               inTransaction @HasqlOpsTestRegistry conn testSchema $ do
                 _ <- HL.insertJob job

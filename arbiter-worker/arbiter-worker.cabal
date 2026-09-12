@@ -46,8 +46,8 @@ library
     Arbiter.Worker
     Arbiter.Worker.BackoffStrategy
     Arbiter.Worker.Config
-    Arbiter.Worker.Cron
     Arbiter.Worker.Batch
+    Arbiter.Worker.Cron
     Arbiter.Worker.Heartbeat
     Arbiter.Worker.Heartbeat.Guard
     Arbiter.Worker.Logger
@@ -108,6 +108,7 @@ test-suite arbiter-worker-tests
     Test.Arbiter.Worker.Logging
     Test.Arbiter.Worker.MultiQueue
     Test.Arbiter.Worker.PoolSizing
+    Test.Arbiter.Worker.SharedPool
     Test.Arbiter.Worker.Sim
     Test.Arbiter.Worker.WorkQueue
 

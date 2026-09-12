@@ -79,8 +79,7 @@ colToBytes :: Col a -> a -> Either Text ByteString
 colToBytes col value = sqlValueToBytes $ FieldDef.fieldValueToSqlValue (colFieldDef "" col) value
 
 colToNullableBytes :: Col a -> Maybe a -> Either Text (Maybe ByteString)
-colToNullableBytes _ Nothing = Right Nothing
-colToNullableBytes col (Just value) = Just <$> colToBytes col value
+colToNullableBytes col = traverse (colToBytes col)
 
 sqlValueToBytes :: SqlValue -> Either Text ByteString
 sqlValueToBytes =
@@ -126,10 +125,5 @@ jsonbValue =
     O.jsonb
 
 readRowCount :: LibPQ.Result -> IO Int64
-readRowCount res = do
-  mbTuples <- LibPQ.cmdTuples res
-  case mbTuples of
-    Nothing -> pure 0
-    Just bytes -> case SqlValue.toInt (SqlValue.fromRawBytes bytes) of
-      Right count -> pure (fromIntegral count)
-      Left _ -> pure 0
+readRowCount res =
+  maybe 0 (either (const 0) fromIntegral . SqlValue.toInt . SqlValue.fromRawBytes) <$> LibPQ.cmdTuples res

@@ -29,14 +29,6 @@ withJobContext config jobs
   | loggingActive config = config {additionalContext = (buildJobContext jobs <>) <$> additionalContext config}
   | otherwise = config
 
--- | 'withJobContext' scoped to a single job.
-withJobContextOne :: LogConfig -> Job.JobRead payload -> LogConfig
-withJobContextOne config job = withJobContext config (job :| [])
-
--- | 'withJobContext' scoped to a job list. No context when the list is empty.
-withJobContextList :: LogConfig -> [Job.JobRead payload] -> LogConfig
-withJobContextList config = maybe config (withJobContext config) . nonEmpty
-
 -- | True when some destination emits messages.
 loggingActive :: LogConfig -> Bool
 loggingActive = destinationActive . logDestination
@@ -76,11 +68,11 @@ runHook cfg hookName action =
 
 -- | Run an observability hook with the job in the log context.
 jobHook :: (MonadUnliftIO m) => LogConfig -> Job.JobRead payload -> Text -> m () -> m ()
-jobHook cfg = runHook . withJobContextOne cfg
+jobHook cfg job = runHook (withJobContext cfg (job :| []))
 
 -- | Log with the jobs in context.
 poolLog :: LogConfig -> LogLevel -> [Job.JobRead payload] -> Text -> IO ()
-poolLog cfg level jobs = tryLog (withJobContextList cfg jobs) level
+poolLog cfg level jobs = tryLog (maybe cfg (withJobContext cfg) (nonEmpty jobs)) level
 
 -- | Run an action and log a warning if it fails.
 tryWarn :: (MonadUnliftIO m) => LogConfig -> Text -> m a -> m ()

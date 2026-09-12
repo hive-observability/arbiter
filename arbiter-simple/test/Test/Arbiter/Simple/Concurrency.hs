@@ -8,28 +8,26 @@ import Arbiter.Core.Job.Types
 import Arbiter.Core.QueueRegistry (Queue)
 import Arbiter.Test.Concurrency
   ( concurrencySpec
-  , countHolViolations
+  , drainAll
+  , holViolations
   , installHolDetector
   , raceConditionSpec
   , removeHolDetector
   )
 import Arbiter.Test.Fixtures (TestPayload (..))
-import Arbiter.Test.Setup (setupOnce)
+import Arbiter.Test.Setup (cleanupOnce, createPoolOf, setupOnce)
 import Control.Concurrent (threadDelay)
 import Control.Monad (forM_, replicateM_, void, when)
 import Data.ByteString (ByteString)
 import Data.IORef (atomicModifyIORef', newIORef, readIORef)
-import Data.Maybe (fromJust)
-import Data.Pool (Pool, withResource)
+import Data.Pool (withResource)
 import Data.Proxy (Proxy (..))
 import Data.Text (Text)
 import Database.PostgreSQL.Simple qualified as PG
 import Test.Hspec
 import UnliftIO.Async (mapConcurrently)
 
-import Arbiter.Simple.MonadArbiter (SimpleConnectionPool (..))
-import Arbiter.Simple.SimpleDb (SimpleEnv (..), createSimpleEnvWithPool, inTransaction, runSimpleDb)
-import Test.Arbiter.Simple.TestHelpers (cleanupSimpleTest, createSimplePool)
+import Arbiter.Simple.SimpleDb (createSimpleEnvWithPool, inTransaction, runSimpleDb)
 
 testSchema :: Text
 testSchema = "arbiter_simple_concurrency_test"
@@ -39,19 +37,11 @@ type SimpleConcurrencyTestRegistry = '[Queue "arbiter_simple_concurrency_test" T
 testTable :: Text
 testTable = "arbiter_simple_concurrency_test"
 
-withCleanup
-  :: Pool PG.Connection -> (SimpleEnv SimpleConcurrencyTestRegistry -> IO a) -> IO a
-withCleanup sharedPool action = do
-  env <- createSimpleEnvWithPool (Proxy @SimpleConcurrencyTestRegistry) sharedPool testSchema
-  cleanupSimpleTest env testSchema testTable
-  action env
-
 spec :: ByteString -> Spec
 spec connStr = beforeAll (setupOnce connStr testSchema testTable False) $ do
-  sharedPool <- runIO (createSimplePool 10 connStr)
-  let withConn :: SimpleEnv SimpleConcurrencyTestRegistry -> (PG.Connection -> IO ()) -> IO ()
-      withConn env action = withResource (fromJust (connectionPool (simplePool env))) action
-  around (withCleanup sharedPool) $ do
+  sharedPool <- runIO (createPoolOf 10 connStr)
+  sharedEnv <- runIO (createSimpleEnvWithPool (Proxy @SimpleConcurrencyTestRegistry) sharedPool testSchema)
+  around (\action -> cleanupOnce connStr testSchema testTable >> action sharedEnv) $ do
     concurrencySpec @TestPayload TestMessage runSimpleDb
     raceConditionSpec @TestPayload TestMessage runSimpleDb
 
@@ -91,20 +81,15 @@ spec connStr = beforeAll (setupOnce connStr testSchema testTable False) $ do
               atomicModifyIORef' violationsRef (\count -> (count + 1, ()))
 
           forM_ allClaimed $ \job -> void $ runSimpleDb env (HL.ackJob job)
-          let drain = do
-                claimed <- runSimpleDb env (HL.claimNextVisibleJobs 100 60) :: IO [JobRead TestPayload]
-                if null claimed
-                  then pure ()
-                  else do
-                    forM_ claimed $ \job -> void $ runSimpleDb env (HL.ackJob job)
-                    drain
-          drain
+          drainAll
+            (runSimpleDb env (HL.claimNextVisibleJobs 100 60) :: IO [JobRead TestPayload])
+            (void . runSimpleDb env . HL.ackJob)
 
         violations <- readIORef violationsRef
         violations `shouldBe` 0
 
       it "out-of-order inserts do not cause HOL violations" $ \env -> do
-        withConn env $ \conn -> installHolDetector conn testSchema testTable
+        withResource sharedPool $ \conn -> installHolDetector conn testSchema testTable
 
         doneRef <- newIORef False
         let inserter = do
@@ -131,13 +116,10 @@ spec connStr = beforeAll (setupOnce connStr testSchema testTable False) $ do
             replicate 5 inserter <> replicate 10 claimer
 
         -- Drain stragglers
-        let drain = do
-              claimed <- runSimpleDb env (HL.claimNextVisibleJobs 100 60) :: IO [JobRead TestPayload]
-              if null claimed
-                then pure ()
-                else do forM_ claimed $ \job -> void $ runSimpleDb env (HL.ackJob job); drain
-        drain
+        drainAll
+          (runSimpleDb env (HL.claimNextVisibleJobs 100 60) :: IO [JobRead TestPayload])
+          (void . runSimpleDb env . HL.ackJob)
 
-        withConn env $ \conn -> do
-          countHolViolations conn testSchema testTable >>= (`shouldBe` 0)
+        withResource sharedPool $ \conn -> do
+          holViolations conn testSchema testTable >>= (`shouldBe` [])
           removeHolDetector conn testSchema testTable

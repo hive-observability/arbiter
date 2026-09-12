@@ -21,9 +21,9 @@ import Arbiter.Core.Job.Types
 import Arbiter.Core.MonadArbiter (JobHandler)
 import Arbiter.Core.Operations qualified as Ops
 import Arbiter.Core.QueueRegistry (Queue)
-import Arbiter.Simple (SimpleDb, createSimpleEnvWithPool, runSimpleDb)
+import Arbiter.Simple (SimpleDb, runSimpleDb)
 import Arbiter.Test.Poll (waitUntil, withLinkedAsync)
-import Arbiter.Test.Setup (cleanupData, createSharedPool, setupOnce)
+import Arbiter.Test.Setup (createSharedPool, setupOnce)
 import Control.Concurrent (threadDelay)
 import Control.Monad (void)
 import Control.Monad.IO.Class (liftIO)
@@ -31,7 +31,6 @@ import Data.Aeson (FromJSON, ToJSON)
 import Data.ByteString (ByteString)
 import Data.IORef (atomicModifyIORef', newIORef, readIORef)
 import Data.Int (Int64)
-import Data.Pool (withResource)
 import Data.Proxy (Proxy (..))
 import Data.Text qualified as T
 import Database.PostgreSQL.Simple qualified as PG
@@ -40,6 +39,7 @@ import Test.Hspec (Spec, beforeAll, describe, it, runIO, shouldBe, shouldContain
 
 import Arbiter.Worker (runWorkerPool)
 import Arbiter.Worker.Config (WorkerConfig (..), transactionalWorkerConfig)
+import Test.Arbiter.Worker.SharedPool (withPool)
 
 -- | Test schema name
 testSchema :: T.Text
@@ -63,10 +63,7 @@ testTable = "arbiter_worker_concurrency_test"
 spec :: ByteString -> Spec
 spec connStr = beforeAll (setupOnce connStr testSchema testTable True) $ do
   sharedPool <- runIO $ createSharedPool connStr
-  let getEnv = do
-        env <- createSimpleEnvWithPool (Proxy @WorkerConcurrencyTestRegistry) sharedPool testSchema
-        withResource sharedPool $ \conn -> cleanupData testSchema testTable conn
-        pure env
+  let getEnv = withPool (Proxy @WorkerConcurrencyTestRegistry) testSchema testTable sharedPool pure
 
   describe "Job Reclaim During Processing" $ do
     it "gracefully skips retry when job is reclaimed by another worker" $ do

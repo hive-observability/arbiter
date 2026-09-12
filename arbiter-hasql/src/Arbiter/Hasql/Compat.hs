@@ -11,7 +11,6 @@ module Arbiter.Hasql.Compat
   ) where
 
 import Arbiter.Core.Exceptions (throwInternal)
-import Control.Monad.IO.Class (liftIO)
 import Data.ByteString (ByteString)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
@@ -19,7 +18,6 @@ import Data.Text.Encoding.Error qualified as TE
 import Database.PostgreSQL.LibPQ qualified as LibPQ
 import Hasql.Connection qualified as Hasql
 import Hasql.Session qualified as Session
-import UnliftIO (MonadUnliftIO)
 
 #if MIN_VERSION_hasql(1,10,0)
 import Hasql.Connection.Settings qualified as Settings
@@ -29,9 +27,9 @@ import Hasql.Connection.Setting.Connection qualified as ConnSetting
 #endif
 
 -- | Run a bare SQL command, such as @BEGIN@ or @COMMIT@.
-runSQL :: (MonadUnliftIO m) => Hasql.Connection -> ByteString -> m ()
+runSQL :: Hasql.Connection -> ByteString -> IO ()
 runSQL conn sql =
-  liftIO (Hasql.use conn (runScript (TE.decodeUtf8With TE.lenientDecode sql)))
+  Hasql.use conn (runScript (TE.decodeUtf8With TE.lenientDecode sql))
     >>= either (\err -> throwInternal $ "hasql runSQL error: " <> T.pack (show err)) pure
 
 #if MIN_VERSION_hasql(1,10,0)

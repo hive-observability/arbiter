@@ -20,7 +20,7 @@ import Arbiter.Simple
   )
 import Arbiter.Test.Fixtures (WorkerTestPayload (..))
 import Arbiter.Test.Poll (waitUntil, withLinkedAsync)
-import Arbiter.Test.Setup (cleanupData, setupOnce)
+import Arbiter.Test.Setup (cleanupOnce, createPoolOf, setupOnce)
 import Arbiter.Worker (runWorkerPool)
 import Arbiter.Worker.BackoffStrategy (Jitter (NoJitter))
 import Arbiter.Worker.Config (WorkerConfig (..), transactionalWorkerConfig)
@@ -29,10 +29,8 @@ import Control.Monad (void)
 import Control.Monad.IO.Class (liftIO)
 import Data.ByteString (ByteString)
 import Data.IORef (atomicModifyIORef', newIORef, readIORef)
-import Data.Pool (defaultPoolConfig, newPool, setNumStripes)
 import Data.Proxy (Proxy (..))
 import Data.Text (Text)
-import Database.PostgreSQL.Simple (close, connectPostgreSQL)
 import Test.Hspec (Spec, beforeAll, describe, it, shouldBe)
 
 import Arbiter.Worker.TestKit (listenerSpec)
@@ -42,12 +40,6 @@ type ListenTestRegistry = '[Queue "arbiter_worker_listen_test" WorkerTestPayload
 testSchema :: Text
 testSchema = "arbiter_worker_listen_test"
 
-cleanup :: ByteString -> IO ()
-cleanup connStr = do
-  conn <- connectPostgreSQL connStr
-  cleanupData testSchema testSchema conn
-  close conn
-
 spec :: ByteString -> Spec
 spec connStr =
   beforeAll (setupOnce connStr testSchema testSchema True) $ do
@@ -55,19 +47,21 @@ spec connStr =
       testSchema
       connStr
       SimpleTask
-      (cleanup connStr >> createSimpleEnv (Proxy @ListenTestRegistry) connStr testSchema)
-      (cleanup connStr >> (disableListener <$> createSimpleEnv (Proxy @ListenTestRegistry) connStr testSchema))
+      (cleanup >> createSimpleEnv (Proxy @ListenTestRegistry) connStr testSchema)
+      (cleanup >> (disableListener <$> createSimpleEnv (Proxy @ListenTestRegistry) connStr testSchema))
       destroySimpleEnv
       (\handler _conn job -> handler job)
       runSimpleDb
     dedicatedListenerSpec connStr
+  where
+    cleanup = cleanupOnce connStr testSchema testSchema
 
 dedicatedListenerSpec :: ByteString -> Spec
 dedicatedListenerSpec connStr =
   describe "dedicated listener" $
     it "wakes the dispatcher on a size-1 pool the pool listener would starve" $ do
-      cleanup connStr
-      pool <- newPool $ setNumStripes (Just 1) $ defaultPoolConfig (connectPostgreSQL connStr) close 60 1
+      cleanupOnce connStr testSchema testSchema
+      pool <- createPoolOf 1 connStr
       env <- useDedicatedListener connStr =<< createSimpleEnvWithPool (Proxy @ListenTestRegistry) pool testSchema
       ref <- newIORef (0 :: Int)
       let handler :: JobHandler (SimpleDb ListenTestRegistry IO) WorkerTestPayload ()

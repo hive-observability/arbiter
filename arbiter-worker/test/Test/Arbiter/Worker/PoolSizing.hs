@@ -19,7 +19,7 @@ import Arbiter.Simple
   )
 import Arbiter.Test.Fixtures (WorkerTestPayload (..))
 import Arbiter.Test.Poll (waitUntil)
-import Arbiter.Test.Setup (cleanupData, setupOnce)
+import Arbiter.Test.Setup (cleanupOnce, setupOnce)
 import Control.Monad (forM_, void)
 import Control.Monad.IO.Class (liftIO)
 import Data.ByteString (ByteString)
@@ -28,7 +28,6 @@ import Data.IORef (atomicModifyIORef', newIORef, readIORef)
 import Data.Proxy (Proxy (..))
 import Data.Text (Text)
 import Data.Text qualified as T
-import Database.PostgreSQL.Simple (close, connectPostgreSQL)
 import Test.Hspec (Spec, beforeAll, describe, it, shouldBe, shouldSatisfy)
 import UnliftIO.Async (withAsync)
 
@@ -45,12 +44,6 @@ type SizingTestRegistry = '[Queue "arbiter_worker_sizing_test" WorkerTestPayload
 
 testSchema :: Text
 testSchema = "arbiter_worker_sizing_test"
-
-cleanup :: ByteString -> IO ()
-cleanup connStr = do
-  conn <- connectPostgreSQL connStr
-  cleanupData testSchema testSchema conn
-  close conn
 
 spec :: ByteString -> Spec
 spec connStr = do
@@ -76,7 +69,7 @@ spec connStr = do
   beforeAll (setupOnce connStr testSchema testSchema True) $
     describe "pool sizing" $
       it "sizes the pool for the workers and processes jobs" $ do
-        cleanup connStr
+        cleanupOnce connStr testSchema testSchema
         ref <- newIORef (0 :: Int)
         let handler :: JobHandler (SimpleDb SizingTestRegistry IO) WorkerTestPayload ()
             handler _conn _job = liftIO $ atomicModifyIORef' ref $ \count -> (count + 1, ())

@@ -19,16 +19,14 @@ import Arbiter.Core.Job.Schema (SchemaName, TableName, jobQueueDLQTable, jobQueu
 import Arbiter.Core.Queues (arbiterQueuesTable)
 import Arbiter.Core.Sql.Jobs (jobStatusCaseSQL, unionAllOverQueueTables)
 import Arbiter.Core.Sql.QQ (sql)
-import Arbiter.Core.Sql.Query (Query, rawRows, rows)
+import Arbiter.Core.Sql.Query (Query, rawRows)
 import Arbiter.Core.SqlLiterals (textLiteral)
 import Arbiter.Core.Worker (arbiterWorkersTable)
 
 -- | Per-status queue counts plus the age of the oldest @ready@ and @in_flight@ job.
 -- Counts follow the 'jobStatusCaseSQL' taxonomy and sum to @total_jobs@.
 getQueueStatsSQL :: RowCodec a -> SchemaName -> TableName -> [Text] -> Query a
-getQueueStatsSQL codec schema tableName kinds =
-  let stats = queueStatsSelect schema tableName kinds
-   in rows codec [sql|${stats}|]
+getQueueStatsSQL codec schema tableName kinds = rawRows codec (queueStatsSelect schema tableName kinds)
 
 -- | One queue's stats row. The classified rows are aggregated once per kind and once
 -- over the whole table in one pass. @total_row@ marks the whole-table row.

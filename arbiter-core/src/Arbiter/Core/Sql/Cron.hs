@@ -8,7 +8,6 @@ module Arbiter.Core.Sql.Cron
   , listCronSchedulesSQL
   , getCronScheduleByNameSQL
   , updateCronScheduleSQL
-  , touchCronLastFiredSQL
   , touchCronCheckedSQL
   , tryFireCronGateSQL
   , tryAcquireCronLeaderSQL
@@ -21,10 +20,11 @@ module Arbiter.Core.Sql.Cron
 import Control.Monad (join)
 import Data.Maybe (isJust)
 import Data.Text (Text)
+import Data.Text qualified as T
 import Data.Time (UTCTime)
 import NeatInterpolation (text)
 
-import Arbiter.Core.Codec (cronScheduleRowCodec)
+import Arbiter.Core.Codec (codecColumns, cronScheduleRowCodec)
 import Arbiter.Core.CronSchedule (CronScheduleRow, CronScheduleUpdate (..), cronSchedulesTable)
 import Arbiter.Core.Job.Schema (cronRunNotifyChannel)
 import Arbiter.Core.Sql.QQ (sql)
@@ -33,12 +33,7 @@ import Arbiter.Core.SqlLiterals (textLiteral)
 
 -- | The @cron_schedules@ read columns, in codec order.
 allCronColumns :: Text
-allCronColumns =
-  [text|
-    name, queue_name, default_expression, default_overlap, default_timezone,
-    override_expression, override_overlap, override_timezone, enabled,
-    last_fired_at, last_checked_at, run_requested_at, last_manual_run_at, created_at, updated_at
-  |]
+allCronColumns = T.intercalate ", " (codecColumns cronScheduleRowCodec)
 
 -- | 'allCronColumns' with an expired @run_requested_at@ read back as NULL.
 cronReadColumns :: Text
@@ -121,12 +116,6 @@ updateCronScheduleSQL schemaName name (CronScheduleUpdate mExpression mOverlap m
               updated_at = NOW()
           WHERE name = #{name :: CText}
         |]
-
--- | Set @last_fired_at@ to NOW() for a schedule.
-touchCronLastFiredSQL :: Text -> Text -> Query ()
-touchCronLastFiredSQL schemaName name =
-  let tbl = cronSchedulesTable schemaName
-   in [sql|UPDATE ${tbl} SET last_fired_at = NOW() WHERE name = #{name :: CText}|]
 
 -- | Set @last_checked_at@ to the caller-supplied watermark for the given
 -- schedule names. The watermark is the minute boundary the scheduler finished

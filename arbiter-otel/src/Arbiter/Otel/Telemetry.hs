@@ -206,11 +206,6 @@ summarize service notes =
 serviceName :: MaterializedResources -> Maybe Text
 serviceName res = lookupAttributeByKey (getMaterializedResourcesAttributes res) ("service.name" :: AttributeKey Text)
 
--- | 'withTelemetry' when the flag is set. An inert handle when the flag is off.
-withTelemetryIf :: Bool -> (Telemetry -> IO a) -> IO a
-withTelemetryIf True action = withTelemetry action
-withTelemetryIf False action = action inertTelemetry
-
 -- | A handle that uses the API no-op providers.
 inertTelemetry :: Telemetry
 inertTelemetry = baseTelemetry noopMeterProvider
@@ -230,11 +225,15 @@ baseTelemetry meterProvider =
 refreshFor :: PeriodicMetricReaderOptions -> NominalDiffTime
 refreshFor opts = fromIntegral (periodicIntervalMicros opts) / 1_000_000
 
--- | 'withTelemetryIf' on @OTEL_SDK_DISABLED@, the spec's own switch.
+-- | 'withTelemetry' unless @OTEL_SDK_DISABLED@, the spec's own switch, is set. An inert
+-- handle when it is.
 withTelemetryFromEnv :: (Telemetry -> IO a) -> IO a
-withTelemetryFromEnv action = do
-  disabled <- lookupBooleanEnv "OTEL_SDK_DISABLED"
-  withTelemetryIf (not disabled) action
+withTelemetryFromEnv action = lookupBooleanEnv "OTEL_SDK_DISABLED" >>= \disabled -> withTelemetryIf (not disabled) action
+
+-- | 'withTelemetry' when the flag is set. An inert handle when the flag is off.
+withTelemetryIf :: Bool -> (Telemetry -> IO a) -> IO a
+withTelemetryIf True action = withTelemetry action
+withTelemetryIf False action = action inertTelemetry
 
 -- | Send log output to the configured destination and this handle's destination.
 telemetryLogConfig :: Telemetry -> LogConfig -> LogConfig

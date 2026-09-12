@@ -31,6 +31,7 @@ import NeatInterpolation (text)
 
 import Arbiter.Core.Job.Schema
   ( createMaintenanceTriggersSQL
+  , indexSQL
   , jobQueueGroupsTable
   , jobQueueTable
   , maintenanceFunctionNames
@@ -42,42 +43,44 @@ import Arbiter.Core.SqlLiterals (quoteIdentifier)
 -- @in_flight_until@.
 createJobQueueGroupKeyIndexSQL :: Text -> Text -> Text
 createJobQueueGroupKeyIndexSQL schemaName tableName =
-  T.unlines
-    [ "CREATE INDEX IF NOT EXISTS " <> quoteIdentifier ("idx_" <> tableName <> "_group_key")
-    , "ON " <> jobQueueTable schemaName tableName <> " (group_key, priority ASC, id ASC)"
-    , "WHERE group_key IS NOT NULL;"
-    ]
+  indexSQL
+    ("idx_" <> tableName <> "_group_key")
+    (jobQueueTable schemaName tableName)
+    "group_key, priority ASC, id ASC"
+    (Just "group_key IS NOT NULL")
 
 -- | Partial index over @(group_key, attempts DESC, priority, id)@ for retried rows,
 -- read by the claim's group head gate. Retried rows rank ahead of the rest. The
 -- gate merges this run with the @(group_key, priority, id)@ scan.
 createJobQueueGroupRetriedIndexSQL :: Text -> Text -> Text
 createJobQueueGroupRetriedIndexSQL schemaName tableName =
-  T.unlines
-    [ "CREATE INDEX IF NOT EXISTS " <> quoteIdentifier ("idx_" <> tableName <> "_group_retried")
-    , "ON " <> jobQueueTable schemaName tableName <> " (group_key, attempts DESC, priority ASC, id ASC)"
-    , "WHERE group_key IS NOT NULL AND attempts > 0;"
-    ]
+  indexSQL
+    ("idx_" <> tableName <> "_group_retried")
+    (jobQueueTable schemaName tableName)
+    "group_key, attempts DESC, priority ASC, id ASC"
+    (Just "group_key IS NOT NULL AND attempts > 0")
 
 -- | Scheduled grouped jobs by due time. Group maintenance uses this index to
 -- replace @next_due@ with one point lookup.
 createJobQueueGroupedDueIndexSQL :: Text -> Text -> Text
 createJobQueueGroupedDueIndexSQL schemaName tableName =
-  T.unlines
-    [ "CREATE INDEX IF NOT EXISTS " <> quoteIdentifier ("idx_" <> tableName <> "_grouped_due")
-    , "ON " <> jobQueueTable schemaName tableName <> " (group_key, not_visible_until ASC)"
-    , "WHERE group_key IS NOT NULL AND not_visible_until IS NOT NULL AND NOT suspended;"
-    ]
+  indexSQL
+    ("idx_" <> tableName <> "_grouped_due")
+    (jobQueueTable schemaName tableName)
+    "group_key, not_visible_until ASC"
+    (Just "group_key IS NOT NULL AND not_visible_until IS NOT NULL AND NOT suspended")
 
 -- | Possible in-flight grouped jobs by descending lease deadline. The query
 -- applies the time-dependent part of the predicate at runtime.
 createJobQueueGroupInFlightIndexSQL :: Text -> Text -> Text
 createJobQueueGroupInFlightIndexSQL schemaName tableName =
-  T.unlines
-    [ "CREATE INDEX IF NOT EXISTS " <> quoteIdentifier ("idx_" <> tableName <> "_group_in_flight")
-    , "ON " <> jobQueueTable schemaName tableName <> " (group_key, not_visible_until DESC NULLS LAST)"
-    , "WHERE group_key IS NOT NULL AND not_visible_until IS NOT NULL AND NOT suspended AND (attempts > 0 OR throttled_until IS NOT NULL);"
-    ]
+  indexSQL
+    ("idx_" <> tableName <> "_group_in_flight")
+    (jobQueueTable schemaName tableName)
+    "group_key, not_visible_until DESC NULLS LAST"
+    ( Just
+        "group_key IS NOT NULL AND not_visible_until IS NOT NULL AND NOT suspended AND (attempts > 0 OR throttled_until IS NOT NULL)"
+    )
 
 -- | Create a queue's groups table, one summary row per @group_key@ carrying the group's
 -- precomputed minima, counts and @in_flight_until@. Maintained by the statement-level
@@ -131,11 +134,11 @@ migrateGroupsReadyRankingSQL schemaName tableName =
 -- | Index over the summary rows the maintenance triggers emptied in place.
 createGroupsEmptiedIndexSQL :: Text -> Text -> Text
 createGroupsEmptiedIndexSQL schemaName tableName =
-  T.unlines
-    [ "CREATE INDEX IF NOT EXISTS " <> quoteIdentifier ("idx_" <> tableName <> "_groups_emptied")
-    , "ON " <> jobQueueGroupsTable schemaName tableName <> " (group_key)"
-    , "WHERE job_count = 0;"
-    ]
+  indexSQL
+    ("idx_" <> tableName <> "_groups_emptied")
+    (jobQueueGroupsTable schemaName tableName)
+    "group_key"
+    (Just "job_count = 0")
 
 -- | The @ON CONFLICT@ merge of newly grouped rows into an existing group summary.
 -- The head is whichever side ranks first as a whole @(min_priority, min_id)@ pair.

@@ -16,8 +16,8 @@
 module Main (main) where
 
 import Arbiter.Core.QueueRegistry (Queue)
-import Arbiter.Core.RateLimit.Schema (PolicyRow (..), arbiterRateLimitsTableName)
-import Arbiter.Core.RateLimit.Spec (Durability (Durable))
+import Arbiter.Core.RateLimit.Schema (arbiterRateLimitsTableName)
+import Arbiter.Core.RateLimit.Spec (Durability (Durable), Policy (..))
 import Control.Concurrent.Async (mapConcurrently)
 import Control.Exception (bracket, bracket_)
 import Control.Monad (void)
@@ -84,7 +84,7 @@ conflictTests =
       conflictingPolicyPrefixes [row "a" 1 1 1, row "a" 2 1 1] @?= ["a"]
   ]
   where
-    row prefix tokens refill every = PolicyRow {prefixId = prefix, maxTokens = tokens, refillAmt = refill, interval = every}
+    row = Policy
 
 registryNameTests :: [TestTree]
 registryNameTests =

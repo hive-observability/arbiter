@@ -25,7 +25,7 @@ import Arbiter.Core.MonadArbiter (JobHandler)
 import Arbiter.Core.QueueRegistry (Queue, QueueSpec (..))
 import Arbiter.Simple (SimpleDb, createSimpleEnv, destroySimpleEnv, runSimpleDb)
 import Arbiter.Test.Poll (waitUntil, withLinkedAsync)
-import Arbiter.Test.Setup (addQueueTable, cleanupData, setupOnce)
+import Arbiter.Test.Setup (addQueueTable, cleanupData, setupOnce, withConn)
 import Arbiter.Worker (mergedChildResults, runWorkerPool)
 import Arbiter.Worker.BackoffStrategy (Jitter (NoJitter))
 import Arbiter.Worker.Config
@@ -46,7 +46,6 @@ import Data.Map.Strict qualified as Map
 import Data.Maybe (isJust)
 import Data.Proxy (Proxy (..))
 import Data.Text (Text)
-import Database.PostgreSQL.Simple (close, connectPostgreSQL)
 import GHC.Generics (Generic)
 import Test.Hspec (Spec, beforeAll, describe, it, shouldBe, shouldMatchList, shouldReturn)
 import UnliftIO (bracket)
@@ -74,11 +73,8 @@ resultTable :: Text
 resultTable = "plain_result"
 
 cleanup :: ByteString -> IO ()
-cleanup connStr = do
-  conn <- connectPostgreSQL connStr
-  cleanupData testSchema noResultTable conn
-  cleanupData testSchema resultTable conn
-  close conn
+cleanup connStr =
+  withConn connStr $ \conn -> cleanupData testSchema noResultTable conn *> cleanupData testSchema resultTable conn
 
 spec :: ByteString -> Spec
 spec connStr =

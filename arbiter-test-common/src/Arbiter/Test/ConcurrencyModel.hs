@@ -35,7 +35,6 @@ import Data.List.NonEmpty qualified as NE
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe)
-import Data.Proxy (Proxy (..))
 import Data.Set qualified as Set
 import Data.String (fromString)
 import Data.Text (Text)
@@ -307,7 +306,7 @@ prop_groupedDrain run withConn schema = withTests 40 $ property $ do
         | groupKey <- Set.toList (Set.fromList (map fst tagged))
         , all ((/= hotPool) . snd) (filter ((== groupKey) . fst) tagged)
         ]
-      statements = Ops.mkJobStatements (Proxy :: Proxy CLPayload) schema concurrencyTable batchSize 0 60 worker
+      statements = Ops.mkJobStatements @CLPayload schema concurrencyTable batchSize 0 60 worker
       round_ =
         run
           ( do

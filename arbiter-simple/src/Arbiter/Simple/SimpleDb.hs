@@ -11,8 +11,13 @@
 -- @
 module Arbiter.Simple.SimpleDb
   ( -- * Database Monad
-    SimpleDb (..)
-  , SimpleEnv (..)
+    SimpleDb
+  , SimpleEnv
+  , Simple (..)
+  , Db (..)
+  , Env (..)
+  , PoolState (..)
+  , HasPoolState (..)
   , runSimpleDb
   , inTransaction
 
@@ -25,65 +30,51 @@ module Arbiter.Simple.SimpleDb
   , useDedicatedListener
   ) where
 
+import Arbiter.Core.Backend
+  ( Db (..)
+  , Env (..)
+  , HasPoolState (..)
+  , PoolState (..)
+  , createEnvWithConfig
+  , createEnvWithPool
+  , destroyEnv
+  , disableListener
+  , runDb
+  , useDedicatedListener
+  )
+import Arbiter.Core.Backend qualified as Backend
 import Arbiter.Core.Job.Schema (SchemaName)
-import Arbiter.Core.Listen (Listener, dedicatedListener, newDedicatedListen, newPoolListener)
 import Arbiter.Core.MonadArbiter (MonadArbiter (..))
-import Arbiter.Core.PoolConfig (PoolConfig (..))
+import Arbiter.Core.PoolConfig (PoolConfig)
 import Arbiter.Core.PoolConfig qualified as PC
-import Arbiter.Core.QueueRegistry (JobPayloadRegistry)
-import Control.Monad.Catch (MonadCatch, MonadMask, MonadThrow)
-import Control.Monad.IO.Class (MonadIO, liftIO)
-import Control.Monad.Reader (MonadReader, asks, local)
-import Control.Monad.Trans.Reader (ReaderT (..), runReaderT)
+import Control.Monad.IO.Class (MonadIO)
+import Control.Monad.Reader (asks)
 import Data.ByteString (ByteString)
-import Data.Foldable (traverse_)
-import Data.Pool (Pool, defaultPoolConfig, destroyAllResources, newPool, setNumStripes, withResource)
+import Data.Pool (Pool)
 import Data.Proxy (Proxy (..))
 import Database.PostgreSQL.Simple (Connection, close, connectPostgreSQL)
 import Database.PostgreSQL.Simple.Internal (withConnection)
 import UnliftIO (MonadUnliftIO)
 
 import Arbiter.Simple.MonadArbiter
-  ( HasSimplePool (..)
-  , SimpleConnectionPool (..)
-  , simpleExecuteQuery
+  ( simpleExecuteQuery
   , simpleExecuteStatement
   , simpleRunHandlerWithConnection
   , simpleWithDbTransaction
   )
 
+-- | The postgresql-simple backend tag.
+data Simple = Simple
+
 -- | Schema name and connection pool for 'SimpleDb'.
-data SimpleEnv (registry :: JobPayloadRegistry) = SimpleEnv
-  { schema :: SchemaName
-  -- ^ Schema name
-  , simplePool :: SimpleConnectionPool
-  -- ^ The connection pool state
-  , listener :: Maybe Listener
-  -- ^ Resolved LISTEN source. 'Nothing' runs poll-only.
-  }
+type SimpleEnv = Env Connection Simple
 
 -- | The postgresql-simple database monad.
-newtype SimpleDb (registry :: JobPayloadRegistry) m a = SimpleDb {unSimpleDb :: ReaderT (SimpleEnv registry) m a}
-  deriving newtype
-    ( Applicative
-    , Functor
-    , Monad
-    , MonadCatch
-    , MonadFail
-    , MonadIO
-    , MonadMask
-    , MonadReader (SimpleEnv registry)
-    , MonadThrow
-    , MonadUnliftIO
-    )
+type SimpleDb = Db Connection Simple
 
-instance (Monad m) => HasSimplePool (SimpleDb registry m) where
-  getSimplePool = asks simplePool
-  localSimplePool adjust = local (\env -> env {simplePool = adjust (simplePool env)})
-
-instance (MonadUnliftIO m) => MonadArbiter (SimpleDb registry m) where
-  type RegistryOf (SimpleDb registry m) = registry
-  type Handler (SimpleDb registry m) job result = Connection -> job -> SimpleDb registry m result
+instance (MonadUnliftIO m) => MonadArbiter (Db Connection Simple registry m) where
+  type RegistryOf (Db Connection Simple registry m) = registry
+  type Handler (Db Connection Simple registry m) job result = Connection -> job -> Db Connection Simple registry m result
   getSchema = asks schema
   executeQuery = simpleExecuteQuery
   executeStatement = simpleExecuteStatement
@@ -93,27 +84,11 @@ instance (MonadUnliftIO m) => MonadArbiter (SimpleDb registry m) where
 
 -- | Release the env's connection pool, closing its open connections.
 destroySimpleEnv :: (MonadIO m) => SimpleEnv registry -> m ()
-destroySimpleEnv env =
-  liftIO $ traverse_ destroyAllResources (connectionPool (simplePool env))
-
--- | Turn off the shared LISTEN listener for an env, running poll-only.
-disableListener :: SimpleEnv registry -> SimpleEnv registry
-disableListener env = env {listener = Nothing}
-
--- | Give the env a dedicated LISTEN connection opened from a connection string.
--- The listener takes no pool slot.
-useDedicatedListener :: (MonadIO m) => ByteString -> SimpleEnv registry -> m (SimpleEnv registry)
-useDedicatedListener connStr env = do
-  dedicated <- newDedicatedListen connStr
-  pure env {listener = Just (dedicatedListener dedicated)}
-
--- | A listener that borrows one pool connection for the hub's lifetime.
-poolListener :: Pool Connection -> IO Listener
-poolListener pool = newPoolListener (\action -> withResource pool (`withConnection` action))
+destroySimpleEnv = destroyEnv
 
 -- | Run a 'SimpleDb' action in its env.
 runSimpleDb :: SimpleEnv registry -> SimpleDb registry m a -> m a
-runSimpleDb env action = runReaderT (unSimpleDb action) env
+runSimpleDb = runDb
 
 -- | Run a 'SimpleDb' action on one connection without a pool or env. The connection is
 -- pinned as an open transaction. 'Arbiter.Core.MonadArbiter.withDbTransaction' nests
@@ -132,19 +107,7 @@ inTransaction
   -- ^ Schema name
   -> SimpleDb registry m a
   -> m a
-inTransaction conn schemaName action =
-  let env =
-        SimpleEnv
-          { schema = schemaName
-          , simplePool =
-              SimpleConnectionPool
-                { connectionPool = Nothing
-                , activeConn = Just conn
-                , transactionDepth = 1
-                }
-          , listener = Nothing
-          }
-   in runSimpleDb env action
+inTransaction = Backend.inTransaction Simple
 
 -- | Create a 'SimpleEnv' with default pool settings. Size worker pools with
 -- 'createSimpleEnvWithConfig' and @poolConfigForWorkers@.
@@ -183,23 +146,8 @@ createSimpleEnvWithConfig
   -> PoolConfig
   -- ^ Pool configuration
   -> m (SimpleEnv registry)
-createSimpleEnvWithConfig _proxy connStr schemaName config = liftIO $ do
-  let stripes = poolStripes config
-  connPool <-
-    newPool
-      $ setNumStripes stripes
-      $ defaultPoolConfig
-        (connectPostgreSQL connStr)
-        close
-        (fromIntegral $ poolIdleTimeout config) -- idle time (seconds)
-        (poolSize config)
-  lstn <- poolListener connPool
-  pure
-    SimpleEnv
-      { schema = schemaName
-      , simplePool = SimpleConnectionPool {connectionPool = Just connPool, activeConn = Nothing, transactionDepth = 0}
-      , listener = Just lstn
-      }
+createSimpleEnvWithConfig _proxy connStr =
+  createEnvWithConfig withConnection Simple (connectPostgreSQL connStr) close
 
 -- | Create a 'SimpleEnv' over a caller's own connection pool. The shared listener
 -- holds one pool connection for the env's lifetime. Size the pool for the worker
@@ -215,11 +163,4 @@ createSimpleEnvWithPool
   -> SchemaName
   -- ^ Schema name
   -> m (SimpleEnv registry)
-createSimpleEnvWithPool _proxy connPool schemaName = liftIO $ do
-  lstn <- poolListener connPool
-  pure
-    SimpleEnv
-      { schema = schemaName
-      , simplePool = SimpleConnectionPool {connectionPool = Just connPool, activeConn = Nothing, transactionDepth = 0}
-      , listener = Just lstn
-      }
+createSimpleEnvWithPool _proxy = createEnvWithPool withConnection Simple

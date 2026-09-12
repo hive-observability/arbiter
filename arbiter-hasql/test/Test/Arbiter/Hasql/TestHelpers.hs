@@ -2,14 +2,10 @@
 
 module Test.Arbiter.Hasql.TestHelpers
   ( createHasqlPool
-  , cleanupHasqlTest
   ) where
 
-import Arbiter.Test.Setup (cleanupData)
 import Data.ByteString (ByteString)
 import Data.Pool (Pool, defaultPoolConfig, newPool, setNumStripes)
-import Data.Text (Text)
-import Database.PostgreSQL.Simple (close, connectPostgreSQL)
 import Hasql.Connection qualified as Hasql
 
 import Arbiter.Hasql.HasqlDb (hasqlSettings)
@@ -28,9 +24,3 @@ createHasqlPool numConnections connStr =
       Hasql.release
       60
       numConnections
-
-cleanupHasqlTest :: ByteString -> Text -> Text -> IO ()
-cleanupHasqlTest connStr schemaName tableName = do
-  conn <- connectPostgreSQL connStr
-  cleanupData schemaName tableName conn
-  close conn

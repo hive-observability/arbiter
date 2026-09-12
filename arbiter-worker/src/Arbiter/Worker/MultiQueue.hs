@@ -29,6 +29,7 @@ import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.Cont (ContT (..), evalContT)
 import Data.Foldable (traverse_)
 import Data.Maybe (fromMaybe)
+import Data.Proxy (Proxy (..))
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -42,7 +43,7 @@ import Arbiter.Worker.Config
   , validateWorkerConfig
   , workerStateVar
   )
-import Arbiter.Worker.EnabledQueues (enabledQueuesForMonad, requestedQueuesForMonad)
+import Arbiter.Worker.EnabledQueues (getEnabledQueues, requestedQueues)
 import Arbiter.Worker.Logger (LogConfig (..), (.=))
 import Arbiter.Worker.Pool (runWorkerPool)
 import Arbiter.Worker.WorkerState (WorkerState (ShuttingDown))
@@ -85,7 +86,7 @@ runWorkerPools
   => [NamedWorkerPool m]
   -> m ()
 runWorkerPools pools = do
-  requested <- liftIO $ requestedQueuesForMonad @m
+  requested <- liftIO $ requestedQueues (Proxy @(RegistryOf m))
   runSelectedWorkerPools (fromMaybe [name | NamedWorkerPool name _ <- pools] requested) pools
 
 -- | Signal graceful shutdown to every pool atomically.
@@ -136,7 +137,7 @@ poolConfigForWorkers
   => [NamedWorkerPool m]
   -> IO PoolConfig
 poolConfigForWorkers pools = do
-  enabled <- enabledQueuesForMonad @m
+  enabled <- getEnabledQueues (Proxy @(RegistryOf m))
   traverse_ (validateSelected enabled) pools
   let enabledWorkers = sum [workerCount cfg | NamedWorkerPool name cfg <- pools, name `elem` enabled]
   pure defaultPoolConfig {poolSize = max 2 (2 * enabledWorkers) + 1}

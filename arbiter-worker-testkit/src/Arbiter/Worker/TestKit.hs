@@ -57,6 +57,7 @@ import Arbiter.Core.JobTree qualified as JT
 import Arbiter.Core.Listen qualified as Listen
 import Arbiter.Core.MonadArbiter (JobHandler, RegistryOf, ResultOf, getListener, withDbTransaction)
 import Arbiter.Core.QueueRegistry (RegistryTables)
+import Arbiter.Test.Poll (waitUntil)
 import Arbiter.Worker (childResults, runWorkerPool)
 import Arbiter.Worker.BackoffStrategy (BackoffStrategy (Constant), Jitter (NoJitter))
 import Arbiter.Worker.Config
@@ -76,8 +77,8 @@ import Arbiter.Worker.Config
   , transactionalWorkerConfig
   )
 import Control.Concurrent (threadDelay)
-import Control.Monad (join, unless, void, when)
-import Control.Monad.IO.Class (liftIO)
+import Control.Monad (join, void, when)
+import Control.Monad.IO.Class (MonadIO, liftIO)
 import Data.Aeson (toJSON)
 import Data.ByteString (ByteString)
 import Data.Foldable (for_, toList, traverse_)
@@ -191,9 +192,9 @@ workerSpec mkSimple mkFailing mkHandler runM = do
 
       withAsync (runM env $ runWorkerPool config {workerCount = 1, pollInterval = 0.1}) $ \_ -> do
         waitUntil 10_000 $ do
-          dlqJobs <- runM env (HL.listDLQJobs 10 0) :: IO [DLQ.DLQJob payload]
+          dlqJobs <- dlqAll env
           pure (length dlqJobs == 1)
-        dlqJobs <- runM env (HL.listDLQJobs 10 0) :: IO [DLQ.DLQJob payload]
+        dlqJobs <- dlqAll env
         length dlqJobs `shouldBe` 1
         let dlqJob = head dlqJobs
         payload (DLQ.jobSnapshot dlqJob) `shouldBe` mkSimple "Doomed"
@@ -206,10 +207,8 @@ workerSpec mkSimple mkFailing mkHandler runM = do
         $ HL.insertJob (setArchiveFor (Just dayRetention) $ setGroupKey (Just "g1") $ defaultJob (mkSimple "arch-done"))
 
       withAsync (runM env $ runWorkerPool config {workerCount = 1, pollInterval = 0.1}) $ \_ -> do
-        waitUntil 10_000 $ do
-          arch <- runM env $ HL.listArchiveJobs @payload 100 0
-          pure (any ((== mkSimple "arch-done") . payload . Archive.jobSnapshot) arch)
-        arch <- runM env $ HL.listArchiveJobs @payload 100 0
+        waitUntil 10_000 $ isJust <$> archivedNamed env "arch-done"
+        arch <- archived env
         map (payload . Archive.jobSnapshot) arch `shouldBe` [mkSimple "arch-done"]
         map (jobKind . payloadKeys . Archive.jobSnapshot) arch
           `shouldBe` [kindOf (mkSimple "arch-done" :: payload)]
@@ -221,10 +220,8 @@ workerSpec mkSimple mkFailing mkHandler runM = do
         $ HL.insertJob (setArchiveFor (Just dayRetention) $ setGroupKey (Just "gk") $ defaultJob (mkSimple "arch-byid"))
 
       withAsync (runM env $ runWorkerPool config {workerCount = 1, pollInterval = 0.1}) $ \_ -> do
-        waitUntil 10_000 $ do
-          arch <- runM env $ HL.listArchiveJobs @payload 100 0
-          pure (any ((== mkSimple "arch-byid") . payload . Archive.jobSnapshot) arch)
-        arch <- runM env $ HL.listArchiveJobs @payload 100 0
+        waitUntil 10_000 $ isJust <$> archivedNamed env "arch-byid"
+        arch <- archived env
         let jid = primaryKey (Archive.jobSnapshot (head arch))
         found <- runM env $ HL.getArchivedJobById @payload jid
         fmap (payload . Archive.jobSnapshot) found `shouldBe` Just (mkSimple "arch-byid")
@@ -255,7 +252,7 @@ workerSpec mkSimple mkFailing mkHandler runM = do
       withAsync (runM env $ runWorkerPool config {workerCount = 1, pollInterval = 0.1}) $ \_ -> do
         waitUntil 10_000 $ readIORef doneRef
         threadDelay 300_000
-        arch <- runM env $ HL.listArchiveJobs @payload 100 0
+        arch <- archived env
         map (payload . Archive.jobSnapshot) arch `shouldBe` []
 
     it "reaper purges archived jobs past their archiveFor window" $ \env -> do
@@ -266,12 +263,8 @@ workerSpec mkSimple mkFailing mkHandler runM = do
         (runM env $ runWorkerPool config {workerCount = 1, pollInterval = 0.1, reaperInterval = 0.5})
         $ \_ -> do
           -- First archived, then purged once it ages past the 1s window.
-          waitUntil 10_000 $ do
-            arch <- runM env $ HL.listArchiveJobs @payload 100 0
-            pure (any ((== mkSimple "arch-purge") . payload . Archive.jobSnapshot) arch)
-          waitUntil 15_000 $ do
-            arch <- runM env $ HL.listArchiveJobs @payload 100 0
-            pure (not (any ((== mkSimple "arch-purge") . payload . Archive.jobSnapshot) arch))
+          waitUntil 10_000 $ isJust <$> archivedNamed env "arch-purge"
+          waitUntil 15_000 $ isNothing <$> archivedNamed env "arch-purge"
 
     it "re-enqueues an archived job, keeping the archive row" $ \env -> do
       config <- mkConfig $ \_job -> pure ()
@@ -282,15 +275,15 @@ workerSpec mkSimple mkFailing mkHandler runM = do
       withAsync (runM env $ runWorkerPool config {workerCount = 1, pollInterval = 0.1}) $ \_ -> do
         let countReJob arch = length (filter ((== mkSimple "re-job") . payload . Archive.jobSnapshot) arch)
         waitUntil 10_000 $ do
-          arch <- runM env $ HL.listArchiveJobs @payload 100 0
+          arch <- archived env
           pure (countReJob arch == 1)
-        arch <- runM env $ HL.listArchiveJobs @payload 100 0
+        arch <- archived env
         let archiveId = Archive.archivePrimaryKey (head arch)
         reEnq <- runM env $ HL.reEnqueueFromArchive @payload archiveId
         (payload <$> reEnq) `shouldBe` Just (mkSimple "re-job")
         -- Original archive row is kept. The re-run is processed and archived too.
         waitUntil 10_000 $ do
-          arch2 <- runM env $ HL.listArchiveJobs @payload 100 0
+          arch2 <- archived env
           pure (countReJob arch2 == 2)
 
     it "purges an archived job by id" $ \env -> do
@@ -300,14 +293,12 @@ workerSpec mkSimple mkFailing mkHandler runM = do
         $ HL.insertJob (setArchiveFor (Just dayRetention) $ setGroupKey (Just "pg") $ defaultJob (mkSimple "purge-one"))
 
       withAsync (runM env $ runWorkerPool config {workerCount = 1, pollInterval = 0.1}) $ \_ -> do
-        waitUntil 10_000 $ do
-          arch <- runM env $ HL.listArchiveJobs @payload 100 0
-          pure (any ((== mkSimple "purge-one") . payload . Archive.jobSnapshot) arch)
-        arch <- runM env $ HL.listArchiveJobs @payload 100 0
+        waitUntil 10_000 $ isJust <$> archivedNamed env "purge-one"
+        arch <- archived env
         let archiveId = Archive.archivePrimaryKey (head arch)
         deleted <- runM env $ HL.deleteArchiveJob @payload archiveId
         deleted `shouldBe` 1
-        arch2 <- runM env $ HL.listArchiveJobs @payload 100 0
+        arch2 <- archived env
         map (payload . Archive.jobSnapshot) arch2 `shouldBe` []
 
     it "bulk-purges archived jobs" $ \env -> do
@@ -320,13 +311,13 @@ workerSpec mkSimple mkFailing mkHandler runM = do
 
       withAsync (runM env $ runWorkerPool config {workerCount = 1, pollInterval = 0.1}) $ \_ -> do
         waitUntil 10_000 $ do
-          arch <- runM env $ HL.listArchiveJobs @payload 100 0
+          arch <- archived env
           pure (length arch == 2)
-        arch <- runM env $ HL.listArchiveJobs @payload 100 0
+        arch <- archived env
         let pks = map Archive.archivePrimaryKey arch
         deleted <- runM env $ HL.deleteArchiveJobsBatch @payload pks
         deleted `shouldBe` 2
-        arch2 <- runM env $ HL.listArchiveJobs @payload 100 0
+        arch2 <- archived env
         map (payload . Archive.jobSnapshot) arch2 `shouldBe` []
 
     it "DLQ-retried job retains archiveFor and is archived on later success" $ \env -> do
@@ -341,15 +332,13 @@ workerSpec mkSimple mkFailing mkHandler runM = do
 
       withAsync (runM env $ runWorkerPool config {workerCount = 1, pollInterval = 0.1}) $ \_ -> do
         waitUntil 10_000 $ do
-          dlq <- runM env (HL.listDLQJobs 10 0) :: IO [DLQ.DLQJob payload]
+          dlq <- dlqAll env
           pure (any ((== mkSimple "dlq-arch") . payload . DLQ.jobSnapshot) dlq)
-        dlq <- runM env (HL.listDLQJobs 10 0) :: IO [DLQ.DLQJob payload]
+        dlq <- dlqAll env
         let dlqId = DLQ.dlqPrimaryKey (head dlq)
         void $ runM env $ HL.retryFromDLQ @payload dlqId
         -- On the retry it succeeds. archive_for survived the DLQ round-trip. The job is archived.
-        waitUntil 10_000 $ do
-          arch <- runM env $ HL.listArchiveJobs @payload 100 0
-          pure (any ((== mkSimple "dlq-arch") . payload . Archive.jobSnapshot) arch)
+        waitUntil 10_000 $ isJust <$> archivedNamed env "dlq-arch"
 
     it "archives the row but stores no result for a Nothing result" $ \env -> do
       cfg :: WorkerConfig m payload <-
@@ -357,11 +346,8 @@ workerSpec mkSimple mkFailing mkHandler runM = do
       void $ runM env $ HL.insertJob (setArchiveFor (Just dayRetention) $ defaultJob (mkSimple "null-result"))
 
       withAsync (runM env $ runWorkerPool cfg {workerCount = 1, pollInterval = 0.1}) $ \_ -> do
-        waitUntil 10_000 $ do
-          arch <- runM env $ HL.listArchiveJobs @payload 100 0
-          pure (any ((== mkSimple "null-result") . payload . Archive.jobSnapshot) arch)
-        arch <- runM env $ HL.listArchiveJobs @payload 100 0
-        let mine = find ((== mkSimple "null-result") . payload . Archive.jobSnapshot) arch
+        waitUntil 10_000 $ isJust <$> archivedNamed env "null-result"
+        mine <- archivedNamed env "null-result"
         (Archive.archivedResult =<< mine) `shouldBe` Nothing
 
     it "stores the wrapped value for a Just result" $ \env -> do
@@ -370,11 +356,8 @@ workerSpec mkSimple mkFailing mkHandler runM = do
       void $ runM env $ HL.insertJob (setArchiveFor (Just dayRetention) $ defaultJob (mkSimple "just-result"))
 
       withAsync (runM env $ runWorkerPool cfg {workerCount = 1, pollInterval = 0.1}) $ \_ -> do
-        waitUntil 10_000 $ do
-          arch <- runM env $ HL.listArchiveJobs @payload 100 0
-          pure (any ((== mkSimple "just-result") . payload . Archive.jobSnapshot) arch)
-        arch <- runM env $ HL.listArchiveJobs @payload 100 0
-        let mine = find ((== mkSimple "just-result") . payload . Archive.jobSnapshot) arch
+        waitUntil 10_000 $ isJust <$> archivedNamed env "just-result"
+        mine <- archivedNamed env "just-result"
         (Archive.archivedResult =<< mine) `shouldBe` Just (toJSON ["kept" :: Text])
 
     it "does not archive a result when archiveFor is unset" $ \env -> do
@@ -388,7 +371,7 @@ workerSpec mkSimple mkFailing mkHandler runM = do
       withAsync (runM env $ runWorkerPool cfg {workerCount = 1, pollInterval = 0.1}) $ \_ -> do
         waitUntil 10_000 $ readIORef doneRef
         threadDelay 300_000
-        arch <- runM env $ HL.listArchiveJobs @payload 100 0
+        arch <- archived env
         map (payload . Archive.jobSnapshot) arch `shouldBe` []
 
     it "stores a child's result in the tree and leaves its archive row bare" $ \env -> do
@@ -398,11 +381,8 @@ workerSpec mkSimple mkFailing mkHandler runM = do
       void $ runM env $ HL.insertJobTree $ defaultJob (mkSimple "arch-root") <~~ (child :| [])
 
       withAsync (runM env $ runWorkerPool cfg {workerCount = 2, pollInterval = 0.1}) $ \_ -> do
-        waitUntil 10_000 $ do
-          arch <- runM env $ HL.listArchiveJobs @payload 100 0
-          pure (any ((== mkSimple "arch-child") . payload . Archive.jobSnapshot) arch)
-        arch <- runM env $ HL.listArchiveJobs @payload 100 0
-        let childRow = find ((== mkSimple "arch-child") . payload . Archive.jobSnapshot) arch
+        waitUntil 10_000 $ isJust <$> archivedNamed env "arch-child"
+        childRow <- archivedNamed env "arch-child"
         (Archive.archivedResult =<< childRow) `shouldBe` Nothing
 
     it "preserves the attempt count on the archived row" $ \env -> do
@@ -420,11 +400,8 @@ workerSpec mkSimple mkFailing mkHandler runM = do
           )
 
       withAsync (runM env $ runWorkerPool config {workerCount = 1, pollInterval = 0.1, jitter = NoJitter}) $ \_ -> do
-        waitUntil 15_000 $ do
-          arch <- runM env $ HL.listArchiveJobs @payload 100 0
-          pure (any ((== mkSimple "arch-attempts") . payload . Archive.jobSnapshot) arch)
-        arch <- runM env $ HL.listArchiveJobs @payload 100 0
-        let mine = find ((== mkSimple "arch-attempts") . payload . Archive.jobSnapshot) arch
+        waitUntil 15_000 $ isJust <$> archivedNamed env "arch-attempts"
+        mine <- archivedNamed env "arch-attempts"
         -- Claimed twice, one retryable failure and then success. The ack-copy
         -- carries attempts = 2.
         fmap (attempts . Archive.jobSnapshot) mine `shouldBe` Just 2
@@ -439,9 +416,9 @@ workerSpec mkSimple mkFailing mkHandler runM = do
       withAsync (runM env $ runWorkerPool cfg {workerCount = 2, pollInterval = 0.1}) $ \_ -> do
         let snap name arch = Archive.jobSnapshot <$> find ((== mkSimple name) . payload . Archive.jobSnapshot) arch
         waitUntil 10_000 $ do
-          arch <- runM env $ HL.listArchiveJobs @payload 100 0
+          arch <- archived env
           pure (isJust (snap "pl-child" arch) && isJust (snap "pl-root" arch))
-        arch <- runM env $ HL.listArchiveJobs @payload 100 0
+        arch <- archived env
         -- The child's archived parent_id points at the root's original job id.
         (parentId =<< snap "pl-child" arch) `shouldBe` (primaryKey <$> snap "pl-root" arch)
 
@@ -457,12 +434,12 @@ workerSpec mkSimple mkFailing mkHandler runM = do
       withAsync (runM env $ runWorkerPool config {workerCount = 1, pollInterval = 0.1, reaperInterval = 0.5}) $ \_ -> do
         let has name arch = any ((== mkSimple name) . payload . Archive.jobSnapshot) arch
         waitUntil 10_000 $ do
-          arch <- runM env $ HL.listArchiveJobs @payload 100 0
+          arch <- archived env
           pure (has "purge-expired" arch && has "purge-kept" arch)
         waitUntil 15_000 $ do
-          arch <- runM env $ HL.listArchiveJobs @payload 100 0
+          arch <- archived env
           pure (not (has "purge-expired" arch))
-        arch <- runM env $ HL.listArchiveJobs @payload 100 0
+        arch <- archived env
         has "purge-kept" arch `shouldBe` True
 
     it "does not archive a job whose archiveFor is zero" $ \env -> do
@@ -473,7 +450,7 @@ workerSpec mkSimple mkFailing mkHandler runM = do
       withAsync (runM env $ runWorkerPool config {workerCount = 1, pollInterval = 0.1}) $ \_ -> do
         waitUntil 10_000 $ readIORef doneRef
         threadDelay 300_000
-        arch <- runM env $ HL.listArchiveJobs @payload 100 0
+        arch <- archived env
         map (payload . Archive.jobSnapshot) arch `shouldBe` []
 
     it "processes all jobs from different groups" $ \env -> do
@@ -515,11 +492,11 @@ workerSpec mkSimple mkFailing mkHandler runM = do
         (runM env $ runWorkerPool config {workerCount = 1, pollInterval = 0.1, jitter = NoJitter, observabilityHooks = hooks})
         $ \_ -> do
           waitUntil 10_000 $ (== 1) <$> readIORef retryRef
-          dlqAfterFirst <- runM env (HL.listDLQJobs 10 0) :: IO [DLQ.DLQJob payload]
+          dlqAfterFirst <- dlqAll env
           length dlqAfterFirst `shouldBe` 0
 
           waitUntil 10_000 $ (== 1) <$> readIORef dlqRef
-          dlqJobs <- runM env (HL.listDLQJobs 10 0) :: IO [DLQ.DLQJob payload]
+          dlqJobs <- dlqAll env
           length dlqJobs `shouldBe` 1
           attempts (DLQ.jobSnapshot (head dlqJobs)) `shouldBe` 2
           readIORef attemptsRef `shouldReturn` 2
@@ -541,7 +518,7 @@ workerSpec mkSimple mkFailing mkHandler runM = do
         waitUntil 10_000 $ (== 1) <$> readIORef dlqCalls
         retryCount <- readIORef retryCalls
         retryCount `shouldBe` 0
-        dlqJobs <- runM env (HL.listDLQJobs 10 0) :: IO [DLQ.DLQJob payload]
+        dlqJobs <- dlqAll env
         length dlqJobs `shouldBe` 1
         payload (DLQ.jobSnapshot (head dlqJobs)) `shouldBe` mkSimple "PermanentFail"
         attempts (DLQ.jobSnapshot (head dlqJobs)) `shouldBe` 1
@@ -624,7 +601,7 @@ workerSpec mkSimple mkFailing mkHandler runM = do
       withAsync (runM env $ runWorkerPool config {pollInterval = 0.1, jitter = NoJitter}) $ \_ ->
         waitUntil 10_000 $ (== 0) <$> runM env (HL.countJobs @payload)
 
-      arch <- runM env $ HL.listArchiveJobs @payload 100 0
+      arch <- archived env
       let resultFor name = Archive.archivedResult =<< find ((== mkSimple name) . payload . Archive.jobSnapshot) arch
       resultFor "aw-1" `shouldBe` Just (toJSON ["first" :: Text])
       resultFor "aw-2" `shouldBe` Just (toJSON ["rest" :: Text])
@@ -893,9 +870,9 @@ workerSpec mkSimple mkFailing mkHandler runM = do
 
       withAsync (runM env $ runWorkerPool batchedConfig) $ \_ -> do
         waitUntil 10_000 $ do
-          dlqJobs <- runM env (HL.listDLQJobs 10 0) :: IO [DLQ.DLQJob payload]
+          dlqJobs <- dlqAll env
           pure (length dlqJobs == 2)
-        dlqJobs <- runM env (HL.listDLQJobs 10 0) :: IO [DLQ.DLQJob payload]
+        dlqJobs <- dlqAll env
         length dlqJobs `shouldBe` 2
         map (payload . DLQ.jobSnapshot) dlqJobs `shouldMatchList` [mkSimple "G1-1", mkSimple "G1-2"]
 
@@ -912,13 +889,13 @@ workerSpec mkSimple mkFailing mkHandler runM = do
 
       withAsync (runM env $ runWorkerPool batchedConfig) $ \_ -> do
         waitUntil 15_000 $ do
-          dlqJobs <- runM env (HL.listDLQJobs 10 0) :: IO [DLQ.DLQJob payload]
+          dlqJobs <- dlqAll env
           pure (length dlqJobs == 2)
-        dlqJobs <- runM env (HL.listDLQJobs 10 0) :: IO [DLQ.DLQJob payload]
+        dlqJobs <- dlqAll env
         length dlqJobs `shouldBe` 2
-        let dlqFor name = head $ filter ((== mkSimple name) . payload . DLQ.jobSnapshot) dlqJobs
-        attempts (DLQ.jobSnapshot (dlqFor "G1-1")) `shouldBe` 2
-        attempts (DLQ.jobSnapshot (dlqFor "G1-2")) `shouldBe` 3
+        let dlqFor name = find ((== mkSimple name) . payload . DLQ.jobSnapshot) dlqJobs
+        fmap (attempts . DLQ.jobSnapshot) (dlqFor "G1-1") `shouldBe` Just 2
+        fmap (attempts . DLQ.jobSnapshot) (dlqFor "G1-2") `shouldBe` Just 3
 
     it "completed jobs survive a throwNack while the rest reprocess" $ \env -> do
       callCountRef <- newIORef (0 :: Int)
@@ -967,7 +944,7 @@ workerSpec mkSimple mkFailing mkHandler runM = do
         (runM env $ runWorkerPool config {workerCount = 1, pollInterval = 0.1, visibilityTimeout = 2, jobHeartbeatInterval = 1})
         $ \_ -> do
           waitUntil 15_000 $ (>= 2) <$> readIORef callsRef
-          dlq <- runM env (HL.listDLQJobs 100 0) :: IO [DLQ.DLQJob payload]
+          dlq <- dlqAll env
           filter (== mkSimple "tn-single") (map (payload . DLQ.jobSnapshot) dlq) `shouldBe` []
 
     it "calls heartbeat for all jobs in batch" $ \env -> do
@@ -1097,7 +1074,7 @@ workerSpec mkSimple mkFailing mkHandler runM = do
 
       withAsync (runM env $ runWorkerPool config {pollInterval = 0.05, observabilityHooks = hooks}) $ \_ -> do
         waitUntil 10_000 $ (== 2) . length <$> readIORef successRef
-        dlq <- runM env (HL.listDLQJobs 100 0) :: IO [DLQ.DLQJob payload]
+        dlq <- dlqAll env
         filter (== mkSimple "fp-bad") (map (payload . DLQ.jobSnapshot) dlq) `shouldBe` [mkSimple "fp-bad"]
         successes <- readIORef successRef
         successes `shouldMatchList` [mkSimple "fp-good1", mkSimple "fp-good2"]
@@ -1113,11 +1090,10 @@ workerSpec mkSimple mkFailing mkHandler runM = do
 
       withAsync (runM env $ runWorkerPool config {pollInterval = 0.05, jitter = NoJitter}) $ \_ -> do
         waitUntil 15_000 $ do
-          dlq <- runM env (HL.listDLQJobs 100 0) :: IO [DLQ.DLQJob payload]
+          dlq <- dlqAll env
           pure (any ((== mkSimple "fr-job") . payload . DLQ.jobSnapshot) dlq)
-        dlq <- runM env (HL.listDLQJobs 100 0) :: IO [DLQ.DLQJob payload]
-        let mine = filter ((== mkSimple "fr-job") . payload . DLQ.jobSnapshot) dlq
-        attempts (DLQ.jobSnapshot (head mine)) `shouldBe` 2
+        dlq <- dlqAll env
+        fmap (attempts . DLQ.jobSnapshot) (find ((== mkSimple "fr-job") . payload . DLQ.jobSnapshot) dlq) `shouldBe` Just 2
         calls <- readIORef callsRef
         calls `shouldBe` 2
 
@@ -1134,7 +1110,7 @@ workerSpec mkSimple mkFailing mkHandler runM = do
         (runM env $ runWorkerPool config {pollInterval = 0.1, visibilityTimeout = 2, jobHeartbeatInterval = 1})
         $ \_ -> do
           waitUntil 15_000 $ (>= 2) <$> readIORef callsRef
-          dlq <- runM env (HL.listDLQJobs 100 0) :: IO [DLQ.DLQJob payload]
+          dlq <- dlqAll env
           filter (== mkSimple "nk-job") (map (payload . DLQ.jobSnapshot) dlq) `shouldBe` []
 
     it "nack hands back the attempt the claim consumed" $ \env -> do
@@ -1404,7 +1380,7 @@ workerSpec mkSimple mkFailing mkHandler runM = do
           -- it. It never lands in the DLQ.
           waitUntil 15_000 $ (>= 2) <$> readIORef callsRef
           waitUntil 15_000 $ (== 0) <$> runM env (HL.countJobs @payload)
-          dlq <- runM env (HL.listDLQJobs 100 0) :: IO [DLQ.DLQJob payload]
+          dlq <- dlqAll env
           filter (== mkSimple "stolen-job") (map (payload . DLQ.jobSnapshot) dlq) `shouldBe` []
 
     it "an outer rollback after ack reprocesses the job" $ \env -> do
@@ -1649,7 +1625,7 @@ workerSpec mkSimple mkFailing mkHandler runM = do
 
       withAsync (runM env $ runWorkerPool config {pollInterval = 0.05}) $ \_ ->
         waitUntil 15_000 $ readIORef finalizedRef
-      dlq <- runM env (HL.listDLQJobs 10 0) :: IO [DLQ.DLQJob payload]
+      dlq <- dlqAll env
       map (payload . DLQ.jobSnapshot) dlq `shouldBe` [mkSimple "sp4-child"]
 
     it "a DLQ move reads the rollup state the spawn wrote, not the claim's" $ \env -> do
@@ -1673,7 +1649,7 @@ workerSpec mkSimple mkFailing mkHandler runM = do
 
       withAsync (runM env $ runWorkerPool config {pollInterval = 0.05}) $ \_ ->
         waitUntil 20_000 $ (== 0) <$> runM env (HL.countJobs @payload)
-      dlq <- runM env (HL.listDLQJobs 10 0) :: IO [DLQ.DLQJob payload]
+      dlq <- dlqAll env
       map (payload . DLQ.jobSnapshot) dlq
         `shouldMatchList` [mkSimple "sp16-root", mkSimple "sp16-child"]
       runM env $ void $ HL.deleteDLQJobsBatch @payload (map DLQ.dlqPrimaryKey dlq)
@@ -1694,7 +1670,7 @@ workerSpec mkSimple mkFailing mkHandler runM = do
       withAsync (runM env $ runWorkerPool config {pollInterval = 0.05}) $ \_ ->
         waitUntil 20_000 $ (== 0) <$> runM env (HL.countJobs @payload)
       readIORef roundsRef `shouldReturn` 1
-      dlq <- runM env (HL.listDLQJobs 10 0) :: IO [DLQ.DLQJob payload]
+      dlq <- dlqAll env
       map (payload . DLQ.jobSnapshot) dlq `shouldBe` []
 
     it "an ack or a second spawn after a spawn is ignored" $ \env -> do
@@ -1741,13 +1717,13 @@ workerSpec mkSimple mkFailing mkHandler runM = do
       config <- mkBatchedConfig 1 2 batchHandler
 
       let settled = do
-            dlq <- runM env (HL.listDLQJobs 10 0) :: IO [DLQ.DLQJob payload]
+            dlq <- dlqAll env
             jobs <- runM env (HL.listJobs 10 0) :: IO [JobRead payload]
             pure (not (null dlq) && all (isNothing . claimedBy) [job | job <- jobs, payload job == mkSimple "sp12-sib"])
       dlq <-
         withAsync (runM env $ runWorkerPool config {pollInterval = 0.05}) $ \_ -> do
           waitUntil 20_000 settled
-          runM env (HL.listDLQJobs 10 0) :: IO [DLQ.DLQJob payload]
+          dlqAll env
       map (payload . DLQ.jobSnapshot) dlq `shouldBe` [mkSimple "sp12-spawner"]
       remaining <- runM env (HL.listJobs 10 0) :: IO [JobRead payload]
       let byName name = [job | job <- remaining, payload job == mkSimple name]
@@ -1862,7 +1838,7 @@ workerSpec mkSimple mkFailing mkHandler runM = do
         ( takeMVar spawnHeld
             >> void (runM env (HL.moveToDLQ "operator pulled the tree" job))
         )
-      dlq <- runM env (HL.listDLQJobs 10 0) :: IO [DLQ.DLQJob payload]
+      dlq <- dlqAll env
       map (payload . DLQ.jobSnapshot) dlq
         `shouldMatchList` [mkSimple "sp18-root", mkSimple "sp18-child"]
       runM env (HL.countJobs @payload) `shouldReturn` 0
@@ -1893,8 +1869,8 @@ workerSpec mkSimple mkFailing mkHandler runM = do
 
       dlq <-
         withAsync (runM env $ runWorkerPool config {pollInterval = 0.05}) $ \_ -> do
-          waitUntil 20_000 $ not . null <$> (runM env (HL.listDLQJobs 10 0) :: IO [DLQ.DLQJob payload])
-          runM env (HL.listDLQJobs 10 0) :: IO [DLQ.DLQJob payload]
+          waitUntil 20_000 $ not . null <$> dlqAll env
+          dlqAll env
       map (payload . DLQ.jobSnapshot) dlq `shouldBe` [mkSimple "sp20-root"]
       runM env $ void $ HL.deleteDLQJobsBatch @payload (map DLQ.dlqPrimaryKey dlq)
 
@@ -1915,7 +1891,7 @@ workerSpec mkSimple mkFailing mkHandler runM = do
       withAsync (runM env $ runWorkerPool config {pollInterval = 0.05}) $ \_ ->
         waitUntil 20_000 $ (== 0) <$> runM env (HL.countJobs @payload)
       readIORef childrenRef `shouldReturn` 1
-      dlq <- runM env (HL.listDLQJobs 10 0) :: IO [DLQ.DLQJob payload]
+      dlq <- dlqAll env
       map (payload . DLQ.jobSnapshot) dlq `shouldBe` []
 
     it "refuses a second spawn on a job whose round is uncommitted" $ \env -> do
@@ -1959,7 +1935,7 @@ workerSpec mkSimple mkFailing mkHandler runM = do
             ]
       jobs <- runM env $ HL.listJobs @payload 100 0
       traverse_ (\treePayload -> map payload jobs `shouldNotContain` [treePayload]) treePayloads
-      dlqJobs <- runM env $ HL.listDLQJobs @payload 100 0
+      dlqJobs <- dlqAll env
       traverse_ (\treePayload -> map (payload . DLQ.jobSnapshot) dlqJobs `shouldNotContain` [treePayload]) treePayloads
 
     it "reports each job of a force-cancelled batch exactly once" $ \env -> do
@@ -2016,12 +1992,18 @@ workerSpec mkSimple mkFailing mkHandler runM = do
         waitUntil 10_000 $ readIORef rootProcessedRef
 
       readIORef rootProcessedRef `shouldReturn` True
-      dlqJobs <- runM env $ HL.listDLQJobs @payload 100 0
+      dlqJobs <- dlqAll env
       let allPayloads = [mkSimple "bc-root", mkSimple "bc-mid", mkSimple "bc-leaf1", mkSimple "bc-leaf2"]
       traverse_ (\treePayload -> map (payload . DLQ.jobSnapshot) dlqJobs `shouldNotContain` [treePayload]) allPayloads
   where
     mkConfig :: (JobRead payload -> m ()) -> IO (WorkerConfig m payload)
     mkConfig action = transactionalWorkerConfig 10 (mkHandler (\job -> action job >> pure (Nothing :: Maybe [Text])))
+    archived :: env -> IO [Archive.ArchiveJob payload]
+    archived env = runM env (HL.listArchiveJobs 100 0)
+    archivedNamed :: env -> Text -> IO (Maybe (Archive.ArchiveJob payload))
+    archivedNamed env name = find ((== mkSimple name) . payload . Archive.jobSnapshot) <$> archived env
+    dlqAll :: env -> IO [DLQ.DLQJob payload]
+    dlqAll env = runM env (HL.listDLQJobs 100 0)
     mkBatchedConfig
       :: Int
       -> Int
@@ -2061,7 +2043,7 @@ listenerSpec schema connStr mkPayload mkEnv mkEnvPollOnly destroyEnv mkHandler r
     around (bracket mkEnv destroyEnv) $ do
       it "wakes the dispatcher on NOTIFY under a high poll interval" $ \env -> do
         ref <- newIORef (0 :: Int)
-        config :: WorkerConfig m payload <- runM env $ transactionalWorkerConfig 1 (mkHandler (counting ref))
+        config :: WorkerConfig m payload <- runM env $ transactionalWorkerConfig 1 (mkHandler (bumping ref))
         let workerConfig = config {workerCount = 1, pollInterval = 300, jitter = NoJitter}
         withAsync (runM env $ runWorkerPool workerConfig) $ \_ -> do
           threadDelay 1_000_000
@@ -2071,7 +2053,7 @@ listenerSpec schema connStr mkPayload mkEnv mkEnvPollOnly destroyEnv mkHandler r
 
       it "re-subscribes after a reconnect under a high poll interval" $ \env -> do
         ref <- newIORef (0 :: Int)
-        config :: WorkerConfig m payload <- runM env $ transactionalWorkerConfig 1 (mkHandler (counting ref))
+        config :: WorkerConfig m payload <- runM env $ transactionalWorkerConfig 1 (mkHandler (bumping ref))
         let workerConfig = config {workerCount = 1, pollInterval = 300, jitter = NoJitter}
         withAsync (runM env $ runWorkerPool workerConfig) $ \_ -> do
           threadDelay 1_000_000
@@ -2082,7 +2064,7 @@ listenerSpec schema connStr mkPayload mkEnv mkEnvPollOnly destroyEnv mkHandler r
           readIORef ref >>= (`shouldBe` 1)
 
       it "shares one listener connection across registrants on the same env" $ \env ->
-        withSharedListener env $ \listener -> do
+        withSharedListener (runM env getListener) $ \listener -> do
           let chanA = TE.encodeUtf8 (schema <> "_dedup_a")
               chanB = TE.encodeUtf8 (schema <> "_dedup_b")
           Listen.withChannels listener quietHubLog [(chanA, ignoreNotif)] $ \readyA ->
@@ -2092,7 +2074,7 @@ listenerSpec schema connStr mkPayload mkEnv mkEnvPollOnly destroyEnv mkHandler r
               listenerConnectionCount connStr schema >>= (`shouldBe` 1)
 
       it "keeps a shared channel live after an overlapping registrant leaves" $ \env ->
-        withSharedListener env $ \listener -> do
+        withSharedListener (runM env getListener) $ \listener -> do
           ref <- newIORef (0 :: Int)
           let sharedName = schema <> "_shrink_shared"
               extraName = schema <> "_shrink_extra"
@@ -2109,7 +2091,7 @@ listenerSpec schema connStr mkPayload mkEnv mkEnvPollOnly destroyEnv mkHandler r
             readIORef ref >>= (`shouldBe` 1)
 
       it "isolates a throwing channel handler from the others" $ \env ->
-        withSharedListener env $ \listener -> do
+        withSharedListener (runM env getListener) $ \listener -> do
           good <- newIORef (0 :: Int)
           warned <- newIORef (0 :: Int)
           let hubLog = quietHubLog {Listen.hubWarn = \_ -> bumpRef warned}
@@ -2130,20 +2112,17 @@ listenerSpec schema connStr mkPayload mkEnv mkEnvPollOnly destroyEnv mkHandler r
     around (bracket mkEnvPollOnly destroyEnv) $
       it "processes jobs poll-only when the listener is disabled" $ \env -> do
         ref <- newIORef (0 :: Int)
-        config :: WorkerConfig m payload <- runM env $ transactionalWorkerConfig 1 (mkHandler (counting ref))
+        config :: WorkerConfig m payload <- runM env $ transactionalWorkerConfig 1 (mkHandler (bumping ref))
         let workerConfig = config {workerCount = 1, pollInterval = 0.2, jitter = NoJitter}
         withAsync (runM env $ runWorkerPool workerConfig) $ \_ -> do
           runM env $ void $ HL.insertJob $ setGroupKey (Just "g1") $ defaultJob (mkPayload "poll")
           waitUntil 10_000 $ (== 1) <$> readIORef ref
           readIORef ref >>= (`shouldBe` 1)
-  where
-    counting :: IORef Int -> JobRead payload -> m ()
-    counting ref _job = liftIO (bumpRef ref)
-    withSharedListener env continue = do
-      mListener <- runM env getListener
-      case mListener of
-        Nothing -> expectationFailure "expected a shared listener, got poll-only"
-        Just listener -> continue listener
+
+-- | Run against the env's shared listener, failing when the env is poll-only.
+withSharedListener :: IO (Maybe Listen.Listener) -> (Listen.Listener -> IO ()) -> IO ()
+withSharedListener getShared continue =
+  getShared >>= maybe (expectationFailure "expected a shared listener, got poll-only") continue
 
 -- | A hub logger that swallows warn and error output.
 quietHubLog :: Listen.HubLog
@@ -2165,6 +2144,10 @@ bumpNotif ref = const (bumpRef ref)
 
 bumpRef :: IORef Int -> IO ()
 bumpRef ref = atomicModifyIORef' ref (\count -> (count + 1, ()))
+
+-- | Job action that bumps a counter.
+bumping :: (MonadIO m) => IORef Int -> JobRead p -> m ()
+bumping ref _job = liftIO (bumpRef ref)
 
 -- | Count distinct backends holding a LISTEN on any of this schema's channels.
 listenerConnectionCount :: ByteString -> Text -> IO Int
@@ -2253,45 +2236,26 @@ multiQueueListenerSpec tableA tableB connStr mkPayloadA mkPayloadB mkEnv destroy
             threadDelay 500_000
             readIORef refA >>= (`shouldBe` 1)
 
-      it "routes a NOTIFY only to the owning queue's channel handler" $ \env -> do
-        mListener <- runM env getListener
-        case mListener of
-          Nothing -> expectationFailure "expected a shared listener, got poll-only"
-          Just listener -> do
-            refA <- newIORef (0 :: Int)
-            refB <- newIORef (0 :: Int)
-            let chanA = TE.encodeUtf8 (Schema.notificationChannelForTable tableA)
-                chanB = TE.encodeUtf8 (Schema.notificationChannelForTable tableB)
-                handlers =
-                  [ (chanA, bumpNotif refA)
-                  , (chanB, bumpNotif refB)
-                  ]
-            Listen.withChannels listener quietHubLog handlers $ \ready -> do
-              waitUntil 5_000 (atomically ready)
-              notifyChannel connStr (Schema.notificationChannelForTable tableA)
-              waitUntil 5_000 $ (== 1) <$> readIORef refA
-              threadDelay 500_000
-              readIORef refA >>= (`shouldBe` 1)
-              readIORef refB >>= (`shouldBe` 0)
-  where
-    bumping :: IORef Int -> JobRead p -> m ()
-    bumping ref _job = liftIO (bumpRef ref)
+      it "routes a NOTIFY only to the owning queue's channel handler" $ \env ->
+        withSharedListener (runM env getListener) $ \listener -> do
+          refA <- newIORef (0 :: Int)
+          refB <- newIORef (0 :: Int)
+          let chanA = TE.encodeUtf8 (Schema.notificationChannelForTable tableA)
+              chanB = TE.encodeUtf8 (Schema.notificationChannelForTable tableB)
+              handlers =
+                [ (chanA, bumpNotif refA)
+                , (chanB, bumpNotif refB)
+                ]
+          Listen.withChannels listener quietHubLog handlers $ \ready -> do
+            waitUntil 5_000 (atomically ready)
+            notifyChannel connStr (Schema.notificationChannelForTable tableA)
+            waitUntil 5_000 $ (== 1) <$> readIORef refA
+            threadDelay 500_000
+            readIORef refA >>= (`shouldBe` 1)
+            readIORef refB >>= (`shouldBe` 0)
 
 -- | Issue a raw @NOTIFY@ on a channel over a throwaway connection.
 notifyChannel :: ByteString -> Text -> IO ()
 notifyChannel connStr chan =
   bracket (connectPostgreSQL connStr) close $ \conn ->
     void $ PG.execute conn "NOTIFY ?" (Only (Identifier chan))
-
--- | Poll every 100 ms until the predicate returns 'True'.
--- Fails with 'expectationFailure' after @timeoutMs@ milliseconds.
-waitUntil :: (HasCallStack) => Int -> IO Bool -> IO ()
-waitUntil timeoutMs check = go (max 1 (timeoutMs `div` 100))
-  where
-    go :: (HasCallStack) => Int -> IO ()
-    go 0 = expectationFailure "waitUntil: timed out waiting for condition"
-    go remaining = do
-      satisfied <- check
-      unless satisfied $ do
-        threadDelay 100_000
-        go (remaining - 1)

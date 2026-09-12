@@ -24,7 +24,6 @@ module Arbiter.Core.RateLimit.Spec
   , globalLimit
   , chooseWhen
   , limitByCase
-  , runRateLimitFor
   , collectPolicies
 
     -- * Registry reflection
@@ -50,7 +49,7 @@ import Arbiter.Core.Admission
   , selectBy
   , selectNone
   )
-import Arbiter.Core.Selector (Selector, chooseWhen, collectPolicies, runSelector, selectByCase)
+import Arbiter.Core.Selector (Selector, chooseWhen, collectPolicies, selectByCase)
 
 -- | Whether the rate-limit bucket table is WAL-logged. Set at migration time.
 data Durability = Durable | Unlogged
@@ -114,10 +113,6 @@ globalLimit pol suffix = limitBy pol (const suffix)
 -- 'Bounded'\/'Enum' and the selector must be total over @k@.
 limitByCase :: (Bounded k, Enum k, Eq k) => (payload -> k) -> (k -> RateLimitFor payload) -> RateLimitFor payload
 limitByCase = selectByCase
-
--- | Run a selector against a concrete job to get its key.
-runRateLimitFor :: payload -> RateLimitFor payload -> Maybe RateLimitKey
-runRateLimitFor = runSelector
 
 -- | A payload's per-job key selection. Defaults to unlimited. Only limited
 -- payloads need an instance.

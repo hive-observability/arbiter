@@ -54,7 +54,8 @@ import Arbiter.Worker.ChannelHandlers
   , handlePauseNotif
   )
 import Arbiter.Worker.Config
-import Arbiter.Worker.Cron (CronJob (..), runCronScheduler)
+import Arbiter.Worker.Cron.Scheduler (runCronScheduler)
+import Arbiter.Worker.Cron.Types (CronJob (..))
 import Arbiter.Worker.Dispatcher
 import Arbiter.Worker.Heartbeat (newHeartbeatGuard, runHeartbeatGuard)
 import Arbiter.Worker.Logger
@@ -123,16 +124,12 @@ runWorkerPool config = do
       cancelChannel = TE.encodeUtf8 (Schema.cancelNotifyChannel schemaName queueName)
       cronRunChannel = TE.encodeUtf8 (Schema.cronRunNotifyChannel schemaName)
       cronNames = Set.fromList (map name (cronJobs config))
-      cronHandlers =
-        if null (cronJobs config)
-          then []
-          else [(cronRunChannel, handleCronRunNotif cronNames cronRunVar)]
       handlers =
         [ (createChannel, atomically . STM.writeTVar dispatcherNotifVar . Just)
         , (pauseChannel, handlePauseNotif config)
         , (cancelChannel, handleCancelNotif config runningJobs)
         ]
-          <> cronHandlers
+          <> [(cronRunChannel, handleCronRunNotif cronNames cronRunVar) | not (null (cronJobs config))]
 
   evalContT $ do
     withLivenessFile config
@@ -160,9 +157,11 @@ runWorkerPool config = do
         $ spawn "Worker thread"
         $ workerLoop config runningJobs guard mode effectsFor workQueue
     crons <-
-      unlessNull (cronJobs config)
-        $ spawn "Cron scheduler"
-        $ runCronScheduler (workerStateVar config) cronRunVar (logConfig config) schemaName queueName (cronJobs config)
+      sequence
+        [ spawn "Cron scheduler" $
+            runCronScheduler (workerStateVar config) cronRunVar (logConfig config) schemaName queueName (cronJobs config)
+        | not (null (cronJobs config))
+        ]
     reaper <-
       spawn "Reaper" $
         reaperLoop (logConfig config) (onMaintenance config) (reaperPace config) (reaperTimeout config)
@@ -219,6 +218,10 @@ shutdownPool config schemaName workQueue = do
   drainPool logCfg (gracefulShutdownTimeout config) workQueue
   tryWarn logCfg "Failed to deregister worker" (Ops.deregisterWorker schemaName wid)
 
+-- | How often an unbounded drain logs its progress.
+drainProgressInterval :: NominalDiffTime
+drainProgressInterval = 10
+
 -- | Wait for the work queue to drain and all worker threads to go idle,
 -- optionally bounded by a timeout. Logs the entry, periodic progress (every
 -- 10s) when no timeout is set, and the result.
@@ -240,7 +243,7 @@ drainPool logCfg mTimeout workQueue = do
   where
     waitForDrain = atomically (inFlight workQueue >>= checkSTM . (== 0))
     drainLoop = do
-      drainOrTick <- Async.race (threadDelay 10_000_000) waitForDrain
+      drainOrTick <- Async.race (threadDelay (Ops.micros drainProgressInterval)) waitForDrain
       case drainOrTick of
         Right () -> pure ()
         Left () -> do
@@ -298,7 +301,3 @@ heartbeatLoop config schemaName queueName = do
       STM.atomically $ do
         shutting <- readShuttingDown
         unless shutting $ writePauseIfCurrent config epoch registryPaused
-
--- | @[]@ when the list is empty, else a singleton holding @act@'s result.
-unlessNull :: (Applicative f) => [a] -> f b -> f [b]
-unlessNull items act = if null items then pure [] else (: []) <$> act

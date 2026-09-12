@@ -4,14 +4,13 @@ module Arbiter.Worker.NotificationListener
   ) where
 
 import Arbiter.Core.Listen (Notification)
+import Arbiter.Core.Operations qualified as Ops
 import Control.Monad (when)
 import Data.Time (NominalDiffTime)
 import UnliftIO (MonadUnliftIO)
 import UnliftIO.STM qualified as STM
 
 import Arbiter.Worker.WorkerState (WorkerState (..))
-
-type Action m a = Maybe Notification -> m a
 
 -- | Loop until 'ShuttingDown'. Per iteration wait on notification, poll timer,
 -- wake trigger, or state change. Fires @action Nothing@ once at startup if the
@@ -21,15 +20,15 @@ runNotificationConsumer
   => STM.STM WorkerState
   -> NominalDiffTime
   -> STM.TVar (Maybe Notification)
-  -> Maybe (STM.STM ())
-  -> Action m ()
+  -> STM.STM ()
+  -> (Maybe Notification -> m ())
   -> m ()
-runNotificationConsumer readState pollDelay notifVar mWakeTrigger action = do
+runNotificationConsumer readState pollDelay notifVar wakeTrigger action = do
   state <- STM.atomically readState
   when (state == Running) (action Nothing)
   loop
   where
-    pollMicros = round (pollDelay * 1_000_000)
+    pollMicros = Ops.micros pollDelay
 
     loop = do
       command <- nextCommand
@@ -53,7 +52,7 @@ runNotificationConsumer readState pollDelay notifVar mWakeTrigger action = do
           Running ->
             consumeNotification
               `STM.orElse` timerExpired delayVar
-              `STM.orElse` waitWakeTrigger
+              `STM.orElse` (TimerExpired <$ wakeTrigger)
               `STM.orElse` watchStateChange
 
     awaitUnpause =
@@ -75,10 +74,6 @@ runNotificationConsumer readState pollDelay notifVar mWakeTrigger action = do
     timerExpired delayVar = do
       isExpired <- STM.readTVar delayVar
       if isExpired then pure TimerExpired else STM.retrySTM
-
-    waitWakeTrigger = case mWakeTrigger of
-      Nothing -> STM.retrySTM
-      Just trigger -> trigger >> pure TimerExpired
 
     watchStateChange = do
       state <- readState

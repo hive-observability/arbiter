@@ -30,7 +30,6 @@ import Arbiter.Core.Concurrency.Spec
   , concurrencyByCase
   , concurrencyPool
   , registryConcurrencyPolicies
-  , runConcurrencyFor
   )
 import Arbiter.Core.Concurrency.Stats (ConcurrencyPolicyUpdate (..))
 import Arbiter.Core.HighLevel qualified as HL
@@ -48,6 +47,7 @@ import Arbiter.Core.Job.Types
 import Arbiter.Core.MonadArbiter (HasRegistry, getSchema, withDbTransaction)
 import Arbiter.Core.MonadArbiter qualified as MA
 import Arbiter.Core.QueueRegistry (Queue)
+import Arbiter.Core.Selector (runSelector)
 import Arbiter.Core.Sql.Concurrency qualified as Tmpl
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
@@ -247,8 +247,8 @@ concurrencyLimitSpec runM = do
         sel :: ConcurrencyFor Bool
         sel = chooseWhen id (concurrencyBy policyA (const "x")) (concurrencyBy policyB (const "y"))
     Set.toList (collectPolicies sel) `shouldMatchList` [policyA, policyB]
-    (ckPrefix <$> runConcurrencyFor True sel) `shouldBe` Just "ca"
-    (ckPrefix <$> runConcurrencyFor False sel) `shouldBe` Just "cb"
+    (ckPrefix <$> runSelector True sel) `shouldBe` Just "ca"
+    (ckPrefix <$> runSelector False sel) `shouldBe` Just "cb"
 
   it "frees a slot on ack" $ \env -> do
     seed env 3

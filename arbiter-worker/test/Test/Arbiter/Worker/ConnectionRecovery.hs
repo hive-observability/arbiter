@@ -17,16 +17,15 @@ import Arbiter.Core.Job.Types
   )
 import Arbiter.Core.MonadArbiter (JobHandler)
 import Arbiter.Core.QueueRegistry (Queue)
-import Arbiter.Simple (SimpleDb, SimpleEnv, createSimpleEnvWithPool, inTransaction, runSimpleDb)
+import Arbiter.Simple (SimpleDb, SimpleEnv, inTransaction, runSimpleDb)
 import Arbiter.Test.Fixtures (WorkerTestPayload (..))
 import Arbiter.Test.Poll (waitUntil)
-import Arbiter.Test.Setup (cleanupData, createSharedPool, setupOnce)
+import Arbiter.Test.Setup (createSharedPool, setupOnce)
 import Control.Concurrent (threadDelay)
 import Control.Monad (forM_, void, when)
 import Control.Monad.IO.Class (liftIO)
 import Data.ByteString (ByteString)
 import Data.IORef (atomicModifyIORef', newIORef, readIORef)
-import Data.Pool (Pool, withResource)
 import Data.Proxy (Proxy (..))
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -38,6 +37,7 @@ import UnliftIO.Async (withAsync)
 import Arbiter.Worker (runWorkerPool)
 import Arbiter.Worker.BackoffStrategy (Jitter (NoJitter))
 import Arbiter.Worker.Config (WorkerConfig (..), transactionalWorkerConfig)
+import Test.Arbiter.Worker.SharedPool (withPool)
 
 type WorkerTestRegistry = '[Queue "arbiter_worker_recovery_test" WorkerTestPayload]
 
@@ -47,16 +47,10 @@ testSchema = "arbiter_worker_recovery_test"
 testTable :: Text
 testTable = "arbiter_worker_recovery_test"
 
-withPool :: Pool PG.Connection -> (SimpleEnv WorkerTestRegistry -> IO a) -> IO a
-withPool sharedPool action = do
-  env <- createSimpleEnvWithPool (Proxy @WorkerTestRegistry) sharedPool testSchema
-  withResource sharedPool $ \conn -> cleanupData testSchema testTable conn
-  action env
-
 spec :: ByteString -> Spec
 spec connStr = beforeAll (setupOnce connStr testSchema testTable True) $ do
   sharedPool <- runIO (createSharedPool connStr)
-  around (withPool sharedPool) $ do
+  around (withPool (Proxy @WorkerTestRegistry) testSchema testTable sharedPool) $ do
     describe "Connection Recovery" $ do
       it "processes jobs inserted before and after a connection kill" $ \env -> do
         completedRef <- newIORef (0 :: Int)
@@ -91,7 +85,7 @@ spec connStr = beforeAll (setupOnce connStr testSchema testTable True) $ do
           -- Kill all connections from our test schema (dispatcher, listener)
           killSchemaConnections connStr testSchema
 
-          -- Wait for retryOnException to reconnect (5s delay + reconnect)
+          -- Wait for spawnRetried to reconnect (5s delay + reconnect)
           threadDelay 7_000_000
 
           -- Insert more jobs on a fresh connection. The pool may still hold

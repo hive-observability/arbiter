@@ -20,14 +20,10 @@ import Arbiter.Core.Codec
   , JobWriteSource (..)
   , ParamType (..)
   , SomeParam (..)
-  , archiveRowCodec
   , cScalar
   , codecColumns
-  , cronScheduleRowCodec
-  , dlqRowCodec
   , jobCodec
   , jobRowCodec
-  , queueRowCodec
   , workerRowWithHealthCodec
   , writeColumnNames
   )
@@ -36,13 +32,10 @@ import Arbiter.Core.Job.Kind (HasKind (..), constructorKind, constructorKinds)
 import Arbiter.Core.Job.Status (JobStatus (Ready), jobStatusFromText)
 import Arbiter.Core.Job.Types (PayloadColumns (..), defaultJob)
 import Arbiter.Core.Operations (QueueStats, buildWhereClause, statsRowCodec)
-import Arbiter.Core.Sql.Archive (allArchiveColumns)
 import Arbiter.Core.Sql.Claim (ClaimAdmission (..), claimJobsBatchedSQL)
-import Arbiter.Core.Sql.Cron (allCronColumns)
-import Arbiter.Core.Sql.Jobs (JobFilter (..), allDLQColumns, dedupUpdateSet, jobColumns)
+import Arbiter.Core.Sql.Jobs (JobFilter (..))
 import Arbiter.Core.Sql.QQ (sql)
 import Arbiter.Core.Sql.Query (Query (..), sepBy)
-import Arbiter.Core.Sql.Queues (queueColumnList)
 import Arbiter.Core.Sql.Stats (getQueueStatsSQL)
 import Arbiter.Core.Sql.Tree (lockJobTreesFromRootSQL)
 import Arbiter.Core.Sql.Workers (workerColumnList)
@@ -334,28 +327,8 @@ main = hspec $ do
     it "rolls up nothing for a payload that declares no label" $
       squished (statsSQL (kindsFor @PlainPayload)) `shouldSatisfy` T.isInfixOf "NULL::text AS kind"
 
-    it "selects the job columns in codec order" $
-      squish jobColumns `shouldBe` T.intercalate ", " (codecColumns (jobRowCodec "jobs"))
-
-    it "selects the DLQ columns in codec order" $
-      squish allDLQColumns `shouldBe` T.intercalate ", " (codecColumns (dlqRowCodec "jobs"))
-
-    it "selects the archive columns in codec order" $
-      squish allArchiveColumns `shouldBe` T.intercalate ", " (codecColumns (archiveRowCodec "jobs"))
-
-    it "selects the cron columns in codec order" $
-      squish allCronColumns `shouldBe` T.intercalate ", " (codecColumns cronScheduleRowCodec)
-
-    it "selects the queue columns in codec order" $
-      squish queueColumnList `shouldBe` T.intercalate ", " (codecColumns queueRowCodec)
-
     it "selects the worker columns in codec order" $
       map (last . T.words) (T.splitOn "," workerColumnList) `shouldBe` codecColumns workerRowWithHealthCodec
-
-    it "copies every writable column on a replace" $ do
-      let rendered = dedupUpdateSet "jobs"
-          copied = filter (`notElem` ["dedup_key", "attempts", "claim_seq", "last_error"]) writeColumnNames
-      copied `shouldSatisfy` all (\column -> T.isInfixOf (column <> " = EXCLUDED." <> column) rendered)
 
     it "selects stats columns in the decoder's own order" $ do
       let cols = codecColumns statsRowCodec

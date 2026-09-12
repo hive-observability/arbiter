@@ -2,11 +2,9 @@
 
 -- | Schema setup, teardown, and connection helpers for the arbiter test suites.
 module Arbiter.Test.Setup
-  ( SetupConfig (..)
-  , defaultSetupConfig
-  , setupDDL
-  , setupDDLWithNotify
-  , cleanupData
+  ( cleanupData
+  , cleanupOnce
+  , withConn
   , execute_
   , execStatement
   , execQuery
@@ -14,6 +12,7 @@ module Arbiter.Test.Setup
   , addQueueTable
   , disableNoticeReporting
   , createSharedPool
+  , createPoolOf
   , truncateToMicros
   , seedConcurrencyPoolSQL
   , drainWith
@@ -35,7 +34,7 @@ import Arbiter.Migrations
   , schemaLevelMigrations
   )
 import Control.Concurrent (threadDelay)
-import Control.Exception (throwIO, try)
+import Control.Exception (bracket, throwIO, try)
 import Control.Monad (void, when)
 import Data.ByteString (ByteString)
 import Data.Foldable (traverse_)
@@ -52,48 +51,19 @@ import Database.PostgreSQL.Simple.Internal qualified as PGS
 import Database.PostgreSQL.Simple.Migration (MigrationCommand (..))
 import Database.PostgreSQL.Simple.Types (Query (..))
 
--- | Configuration for test setup
-data SetupConfig = SetupConfig
-  { setupEnableNotifications :: Bool
-  -- ^ Whether to create LISTEN/NOTIFY triggers
-  , setupEnableRankingIndexes :: Bool
-  -- ^ Whether to create ranking indexes for optimized claim queries
-  }
-  deriving stock (Eq, Show)
-
--- | Default test setup configuration
-defaultSetupConfig :: SetupConfig
-defaultSetupConfig =
-  SetupConfig
-    { setupEnableNotifications = True
-    , setupEnableRankingIndexes = True
-    }
-
--- | Rebuild the schema without notification triggers.
-setupDDL :: Text -> Text -> Connection -> IO ()
-setupDDL = setupDDLWithConfig defaultSetupConfig {setupEnableNotifications = False}
-
--- | Rebuild the schema with notification triggers.
-setupDDLWithNotify :: Text -> Text -> Connection -> IO ()
-setupDDLWithNotify = setupDDLWithConfig defaultSetupConfig
-
 -- | Rebuild the schema with the shipped migration scripts.
-setupDDLWithConfig :: SetupConfig -> Text -> Text -> Connection -> IO ()
-setupDDLWithConfig config schemaName tableName conn = do
-  void $ execute_ conn $ "DROP SCHEMA IF EXISTS " <> schemaName <> " CASCADE"
-  void $ execute_ conn $ Schema.createSchemaSQL schemaName
-  traverse_ runScript $
+setupDDLWithConfig :: Bool -> Text -> Text -> Connection -> IO ()
+setupDDLWithConfig withNotify schemaName tableName conn = do
+  execute_ conn $ "DROP SCHEMA IF EXISTS " <> schemaName <> " CASCADE"
+  execute_ conn $ Schema.createSchemaSQL schemaName
+  traverse_ (runScript conn) $
     schemaLevelMigrations schemaName
       <> jobQueueMigrationsForTable schemaName tableName allTableAdmission
-  createNotifyObjects (setupEnableNotifications config) schemaName tableName conn
-  where
-    skipped
-      | setupEnableRankingIndexes config = []
-      | otherwise = map ((T.unpack tableName <> "-") <>) ["create-group-key-index", "migrate-ungrouped-ready-split-indexes"]
-    runScript (MigrationScript name sql)
-      | name `elem` skipped = pure ()
-      | otherwise = void $ execute conn (Query sql) ()
-    runScript _ = pure ()
+  createNotifyObjects withNotify schemaName tableName conn
+
+runScript :: Connection -> MigrationCommand -> IO ()
+runScript conn (MigrationScript _ sql) = void $ execute conn (Query sql) ()
+runScript _ _ = pure ()
 
 -- | Truncate the queue's tables between tests.
 cleanupData :: Text -> Text -> Connection -> IO ()
@@ -121,6 +91,14 @@ cleanupData schemaName tableName conn = do
   execute_ conn "RESET lock_timeout"
   execute_ conn "SET client_min_messages = NOTICE"
 
+-- | 'cleanupData' on a fresh connection.
+cleanupOnce :: ByteString -> Text -> Text -> IO ()
+cleanupOnce connStr schemaName tableName = withConn connStr (cleanupData schemaName tableName)
+
+-- | Run an action on a fresh connection that is closed afterwards.
+withConn :: ByteString -> (Connection -> IO a) -> IO a
+withConn connStr = bracket (connectPostgreSQL connStr) close
+
 -- | Run a statement with no parameters (test setup only).
 execute_ :: Connection -> Text -> IO ()
 execute_ conn sql = void $ execute conn (fromString (T.unpack sql) :: Query) ()
@@ -141,24 +119,16 @@ placeholderPieces = intersperse Hole . map Lit . T.splitOn "?"
 
 -- | Connect and rebuild the schema once, for a suite's outer bracket.
 setupOnce :: ByteString -> Text -> Text -> Bool -> IO ()
-setupOnce connStr schemaName tableName withNotify = do
-  conn <- connectPostgreSQL connStr
+setupOnce connStr schemaName tableName withNotify = withConn connStr $ \conn -> do
   disableNoticeReporting conn
-  let config = defaultSetupConfig {setupEnableNotifications = withNotify}
-  setupDDLWithConfig config schemaName tableName conn
-  close conn
+  setupDDLWithConfig withNotify schemaName tableName conn
 
 -- | Add one more job-queue table to an existing schema.
 addQueueTable :: ByteString -> Text -> Text -> Bool -> IO ()
-addQueueTable connStr schemaName tableName withNotify = do
-  conn <- connectPostgreSQL connStr
+addQueueTable connStr schemaName tableName withNotify = withConn connStr $ \conn -> do
   disableNoticeReporting conn
   traverse_ (runScript conn) (jobQueueMigrationsForTable schemaName tableName allTableAdmission)
   createNotifyObjects withNotify schemaName tableName conn
-  close conn
-  where
-    runScript conn (MigrationScript _ sql) = void $ execute conn (Query sql) ()
-    runScript _ _ = pure ()
 
 -- | Install the notification function and trigger the reconciler would.
 createNotifyObjects :: Bool -> Text -> Text -> Connection -> IO ()
@@ -172,10 +142,20 @@ disableNoticeReporting :: Connection -> IO ()
 disableNoticeReporting conn =
   PGS.withConnection conn LibPQ.disableNoticeReporting
 
--- | A single-stripe pool of 5 connections for tests.
+-- | A single-stripe pool of the default size for tests.
 createSharedPool :: ByteString -> IO (Pool Connection)
-createSharedPool connStr =
-  newPool $ setNumStripes (Just 1) $ defaultPoolConfig (connectPostgreSQL connStr) close 60 5
+createSharedPool = createPoolOf sharedPoolSize
+
+-- | A single-stripe pool of the given size for tests.
+createPoolOf :: Int -> ByteString -> IO (Pool Connection)
+createPoolOf size connStr =
+  newPool $ setNumStripes (Just 1) $ defaultPoolConfig (connectPostgreSQL connStr) close sharedPoolIdleSeconds size
+
+sharedPoolSize :: Int
+sharedPoolSize = 5
+
+sharedPoolIdleSeconds :: Double
+sharedPoolIdleSeconds = 60
 
 -- | Seed a concurrency pool's default limit and clear any override, as SQL statements.
 seedConcurrencyPoolSQL :: Text -> Text -> Int32 -> [Text]

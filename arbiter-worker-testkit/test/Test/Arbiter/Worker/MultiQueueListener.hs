@@ -7,12 +7,11 @@ module Test.Arbiter.Worker.MultiQueueListener (spec) where
 
 import Arbiter.Core.QueueRegistry (Queue)
 import Arbiter.Simple (createSimpleEnv, destroySimpleEnv, runSimpleDb)
-import Arbiter.Test.Setup (addQueueTable, cleanupData, setupOnce)
+import Arbiter.Test.Setup (addQueueTable, cleanupData, setupOnce, withConn)
 import Data.Aeson (FromJSON, ToJSON)
 import Data.ByteString (ByteString)
 import Data.Proxy (Proxy (..))
 import Data.Text (Text)
-import Database.PostgreSQL.Simple (close, connectPostgreSQL)
 import GHC.Generics (Generic)
 import Test.Hspec (Spec, beforeAll)
 
@@ -55,8 +54,5 @@ spec connStr =
       runSimpleDb
   where
     mkEnv = do
-      conn <- connectPostgreSQL connStr
-      cleanupData schemaName tableA conn
-      cleanupData schemaName tableB conn
-      close conn
+      withConn connStr $ \conn -> cleanupData schemaName tableA conn *> cleanupData schemaName tableB conn
       createSimpleEnv (Proxy @MultiQRegistry) connStr schemaName

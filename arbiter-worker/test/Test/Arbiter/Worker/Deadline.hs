@@ -23,10 +23,10 @@ import Arbiter.Core.Job.Types
 import Arbiter.Core.MonadArbiter (JobHandler)
 import Arbiter.Core.QueueRegistry (Queue)
 import Arbiter.Core.Trace (capturingContextIO)
-import Arbiter.Simple (SimpleDb, SimpleEnv, createSimpleEnvWithPool, runSimpleDb)
+import Arbiter.Simple (SimpleDb, SimpleEnv, runSimpleDb)
 import Arbiter.Test.Fixtures (WorkerTestPayload (..))
 import Arbiter.Test.Poll (waitUntil)
-import Arbiter.Test.Setup (cleanupData, createSharedPool, setupOnce)
+import Arbiter.Test.Setup (createSharedPool, setupOnce)
 import Control.Concurrent (threadDelay)
 import Control.Exception (SomeException, fromException, uninterruptibleMask_)
 import Control.Monad (void, when)
@@ -39,7 +39,6 @@ import Data.Int (Int64)
 import Data.List (partition)
 import Data.List.NonEmpty (NonEmpty ((:|)))
 import Data.Maybe (fromMaybe, isJust)
-import Data.Pool (Pool, withResource)
 import Data.Proxy (Proxy (..))
 import Data.String (fromString)
 import Data.Text (Text)
@@ -61,9 +60,10 @@ import Arbiter.Worker.Config
   , defaultBatchedWorkerConfig
   , transactionalWorkerConfig
   )
-import Arbiter.Worker.Heartbeat (HeartbeatGuard, newHeartbeatGuard, runHeartbeatGuard)
-import Arbiter.Worker.Heartbeat.Guard (Batch (..), guardBatch, leaseExpiredReason, reclaimedReason)
+import Arbiter.Worker.Heartbeat (HeartbeatGuard, newHeartbeatGuard)
+import Arbiter.Worker.Heartbeat.Guard (Batch (..), guardBatch, leaseExpiredReason, reclaimedReason, runHeartbeatGuard)
 import Arbiter.Worker.Logger (LogConfig (..), LogDestination (..), defaultLogConfig, silentLogConfig)
+import Test.Arbiter.Worker.SharedPool (withPool)
 
 type WorkerTestRegistry = '[Queue "arbiter_worker_deadline_test" WorkerTestPayload]
 
@@ -167,23 +167,17 @@ withJobsHeartbeat guard startTime jobs pending action = do
   inherit <- capturingContextIO
   withRunInIO $ \run -> guardBatch guard (Batch jobs (run pending) startTime inherit) (run action)
 
-withPool :: Pool PG.Connection -> (SimpleEnv WorkerTestRegistry -> IO a) -> IO a
-withPool sharedPool action = do
-  env <- createSimpleEnvWithPool (Proxy @WorkerTestRegistry) sharedPool testSchema
-  withResource sharedPool $ \conn -> cleanupData testSchema testTable conn
-  action env
-
 spec :: ByteString -> Spec
 spec connStr = beforeAll (setupOnce connStr testSchema testTable True) $ do
   sharedPool <- runIO (createSharedPool connStr)
-  around (withPool sharedPool) $ do
+  around (withPool (Proxy @WorkerTestRegistry) testSchema testTable sharedPool) $ do
     describe "Guard registration" $ do
       it "returns once a signal in flight meets the unregister" $ \env -> do
         job <- inserted env (defaultJob (SlowTask 1))
         config <- transactionalWorkerConfig 1 idleHandler
         guard <- runSimpleDb env (newHeartbeatGuard config {maxJobDuration = Just 1, logConfig = silentLogConfig})
         startTime <- getCurrentTime
-        withAsync (runSimpleDb env (runHeartbeatGuard guard)) $ \_ -> do
+        withAsync (runHeartbeatGuard guard) $ \_ -> do
           registration <-
             async . runSimpleDb env . mask_ $ do
               withJobsHeartbeat guard startTime (job :| []) (pure []) (liftIO (uninterruptibleMask_ (threadDelay maskedMicros)))
@@ -252,7 +246,7 @@ spec connStr = beforeAll (setupOnce connStr testSchema testTable True) $ do
         reclaimed <- runSimpleDb env (HL.claimNextVisibleJobsAs @WorkerTestPayload 1 20 (workerId config)) >>= single
         guard <- runSimpleDb env (newHeartbeatGuard guardConfig)
         startTime <- getCurrentTime
-        withAsync (runSimpleDb env (runHeartbeatGuard guard)) $ \_ -> do
+        withAsync (runHeartbeatGuard guard) $ \_ -> do
           keeper <-
             async . runSimpleDb env $
               withJobsHeartbeat guard startTime (handed :| [kept]) (pure [kept]) (liftIO (threadDelay siblingRunMicros))

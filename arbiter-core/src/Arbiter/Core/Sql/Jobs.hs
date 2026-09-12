@@ -14,16 +14,11 @@ module Arbiter.Core.Sql.Jobs
   , sortDirSql
   , throttledPredicateSQL
   , jobStatusCaseSQL
-  , jobsWithStatusSubquery
   , listJobsFilteredSQL
   , listJobsWithStatusSQL
   , countJobsFilteredSQL
   , getJobByIdWithStatusSQL
   , listDLQFilteredSQL
-  , NullsBehavior (..)
-  , nullsClause
-  , jobColumnNulls
-  , dlqColumnNulls
   , buildJobsOrderBy
   , buildDLQOrderBy
   , buildArchiveOrderBy
@@ -39,7 +34,6 @@ module Arbiter.Core.Sql.Jobs
   , insertJobReplaceSQL
   , insertJobsBatchSQL
   , insertJobsBatchSQL_
-  , insertJobsBatchBase
   , getJobByIdSQL
   , getJobByDedupKeySQL
   , cancelJobSQL
@@ -55,7 +49,8 @@ import Data.Time (UTCTime)
 import Data.UUID.Types (UUID)
 import NeatInterpolation (text)
 
-import Arbiter.Core.Codec (dlqRowCodec, jobRowCodec)
+import Arbiter.Core.Admission (excludedAssignment)
+import Arbiter.Core.Codec (codecColumns, dlqRowCodec, jobRowCodec, writeColumnNames)
 import Arbiter.Core.Job.Schema
   ( SchemaName
   , TableName
@@ -331,34 +326,16 @@ countDLQFilteredSQL schema tableName whereFrag =
 
 -- | The job read columns, in codec order, for SELECT and RETURNING.
 jobColumns :: Text
-jobColumns =
-  [text|
-    id, payload, group_key, inserted_at, updated_at, attempts, last_error, priority,
-    last_attempted_at, not_visible_until, dedup_key, dedup_strategy, max_attempts,
-    parent_id, parent_state, traceparent, tracestate, suspended, claimed_by, claim_seq,
-    archive_for, kind, rate_limit_key, rate_limit_prefix, concurrency_key, concurrency_prefix
-  |]
+jobColumns = T.intercalate ", " (codecColumns (jobRowCodec ""))
 
 -- | The DLQ read columns, in codec order. The DLQ uses @job_id@ for the main-table @id@.
 allDLQColumns :: Text
-allDLQColumns =
-  [text|
-    id, failed_at, job_id, payload, group_key, inserted_at, updated_at, attempts, last_error, priority,
-    last_attempted_at, not_visible_until, dedup_key, dedup_strategy, max_attempts,
-    parent_id, parent_state, traceparent, tracestate, suspended, claimed_by, claim_seq,
-    archive_for, kind, rate_limit_key, rate_limit_prefix, concurrency_key, concurrency_prefix
-  |]
+allDLQColumns = T.intercalate ", " (codecColumns (dlqRowCodec ""))
 
 -- | The job read columns except @id@. The archive INSERT copies them with the main
 -- table's @id@ as @job_id@.
 jobColsExceptId :: Text
-jobColsExceptId =
-  [text|
-    payload, group_key, inserted_at, updated_at, attempts, last_error, priority,
-    last_attempted_at, not_visible_until, dedup_key, dedup_strategy, max_attempts,
-    parent_id, parent_state, traceparent, tracestate, suspended, claimed_by, claim_seq,
-    archive_for, kind, rate_limit_key, rate_limit_prefix, concurrency_key, concurrency_prefix
-  |]
+jobColsExceptId = T.intercalate ", " (drop 1 (codecColumns (jobRowCodec "")))
 
 -- | Job columns carried through a DLQ round-trip. The read columns except @id@ and
 -- @last_error@, plus write-only @rate_limit_cost@.
@@ -394,25 +371,9 @@ enqueuedAgainCols =
 -- from the excluded row, then re-arms the replaced job for a fresh run.
 dedupUpdateSet :: Text -> Text
 dedupUpdateSet tbl =
-  [text|
-    payload = EXCLUDED.payload,
-    group_key = EXCLUDED.group_key,
-    priority = EXCLUDED.priority,
-    not_visible_until = EXCLUDED.not_visible_until,
-    dedup_strategy = EXCLUDED.dedup_strategy,
-    max_attempts = EXCLUDED.max_attempts,
-    parent_id = EXCLUDED.parent_id,
-    parent_state = EXCLUDED.parent_state,
-    traceparent = EXCLUDED.traceparent,
-    tracestate = EXCLUDED.tracestate,
-    suspended = EXCLUDED.suspended,
-    archive_for = EXCLUDED.archive_for,
-    kind = EXCLUDED.kind,
-    rate_limit_key = EXCLUDED.rate_limit_key,
-    rate_limit_prefix = EXCLUDED.rate_limit_prefix,
-    concurrency_key = EXCLUDED.concurrency_key,
-    concurrency_prefix = EXCLUDED.concurrency_prefix,
-    rate_limit_cost = EXCLUDED.rate_limit_cost,
+  let copied = T.intercalate ", " (map excludedAssignment (filter (`notElem` dedupResetColumns) writeColumnNames))
+   in [text|
+    ${copied},
     attempts = 0,
     claim_seq = ${tbl}.claim_seq + 1,
     last_error = NULL,
@@ -421,6 +382,10 @@ dedupUpdateSet tbl =
     last_attempted_at = NULL,
     claimed_by = NULL
   |]
+
+-- | Writable columns a replace re-arms instead of copying.
+dedupResetColumns :: [Text]
+dedupResetColumns = ["dedup_key", "attempts", "last_error"]
 
 -- | An existing row is replaceable when idle, unflagged, childless and same-parent.
 replaceableGuard :: Text -> Text -> Text

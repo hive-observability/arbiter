@@ -4,7 +4,6 @@
 -- | Workers SQL templates.
 module Arbiter.Core.Sql.Workers
   ( workerColumnList
-  , workerHealthCaseSQL
   , upsertWorkerSQL
   , heartbeatWorkerSQL
   , setWorkerPausedSQL

@@ -31,7 +31,6 @@ module Arbiter.Core.Codec
 
     -- * Bidirectional job write codec
   , Codec
-  , cDecode
   , cColumns
   , cScalar
   , cArray
@@ -170,6 +169,7 @@ data Codec s a = Codec
   -- ^ The read side.
   , cWrite :: [WriteCol s]
   }
+  deriving stock (Functor)
 
 -- | One writable column: its name, 'Col', and accessor. Split by nullability.
 data WriteCol s where
@@ -203,9 +203,6 @@ lmap project (Codec decode writes) = Codec decode (map retarget writes)
   where
     retarget (WCol name colType get) = WCol name colType (get . project)
     retarget (WNCol name colType get) = WNCol name colType (get . project)
-
-instance Functor (Codec s) where
-  fmap mapper (Codec decode writes) = Codec (fmap mapper decode) writes
 
 instance Applicative (Codec s) where
   pure value = Codec (pure value) []

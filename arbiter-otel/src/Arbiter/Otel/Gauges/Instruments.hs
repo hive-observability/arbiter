@@ -3,6 +3,7 @@
 -- | OpenTelemetry instruments backed by the gauge snapshot cache.
 module Arbiter.Otel.Gauges.Instruments
   ( registerInstruments
+  , riseSince
   ) where
 
 import Arbiter.Core.Concurrency.Stats qualified as Conc (ConcurrencyPolicyView (..))
@@ -19,7 +20,8 @@ import Control.Monad (void)
 import Data.Bifunctor (first)
 import Data.Foldable (toList, traverse_)
 import Data.HashMap.Strict (HashMap)
-import Data.IORef (IORef, atomicModifyIORef')
+import Data.HashMap.Strict qualified as HM
+import Data.IORef (IORef, atomicModifyIORef', newIORef)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
@@ -35,14 +37,11 @@ import OpenTelemetry.Metric.Core
   )
 
 import Arbiter.Otel.Gauges.Cache
-  ( Baseline
-  , Cached (..)
+  ( Cached (..)
   , GaugeCache (..)
-  , SeriesKey
   , Snapshot (..)
   , lastScan
   , live
-  , riseSince
   )
 import Arbiter.Otel.MetricNames qualified as Name
 import Arbiter.Otel.Metrics (attrs, concurrencyKind, rateLimitKind)
@@ -51,6 +50,7 @@ import Arbiter.Otel.Metrics (attrs, concurrencyKind, rateLimitKind)
 -- that carries a freshly published reading onto the counters.
 registerInstruments :: Meter -> GaugeCache -> IO (Cached -> IO ())
 registerInstruments meter cache = do
+  baselines <- newIORef HM.empty
   let withCached emit = [\res -> readTVarIO (export cache) >>= traverse_ (emit res) . live]
       callback emit = withCached (\res -> emit res . reading)
       -- Every replica exports the winner's reading. Aggregate with max.
@@ -75,7 +75,7 @@ registerInstruments meter cache = do
             defaultAdvisoryParameters
         pure $ \cached ->
           traverse_
-            (addRise (counterBaselines cache) (Name.metricName name) counter (takenAt cached))
+            (addRise baselines (Name.metricName name) counter (takenAt cached))
             (series (reading cached))
 
   reg Name.QueueDepth "{job}" "Jobs in a queue by status" $
@@ -202,6 +202,31 @@ registerInstruments meter cache = do
         (over queues (\overview -> [([("queue", overviewQueue overview)], fromMaybe 0 (field (overviewStats overview)))]))
     perDb = observed . dbTotal
     perDbBy label = observed . perDbTotals label
+
+-- | One counter series: its instrument and attributes.
+type SeriesKey = (Text, [(Text, Text)])
+
+-- | The scan a counter series was last counted from, and the total it stood at.
+data Baseline = Baseline
+  { countedFrom :: !Double
+  , countedTotal :: !Double
+  }
+
+-- | What a total scanned at @scannedAt@ adds to its series. The first reading and an
+-- already counted reading add nothing. A reset counter adds the whole total. Any other
+-- reading adds the difference.
+riseSince
+  :: SeriesKey
+  -> Double
+  -> Double
+  -> HashMap SeriesKey Baseline
+  -> (HashMap SeriesKey Baseline, Double)
+riseSince key scannedAt total seen = case HM.lookup key seen of
+  Just base | countedFrom base >= scannedAt -> (seen, 0)
+  Just base -> (counted, if total < countedTotal base then total else total - countedTotal base)
+  Nothing -> (counted, 0)
+  where
+    counted = HM.insert key (Baseline scannedAt total) seen
 
 -- | Count an absolute total's rise since the scan it was last counted from.
 addRise

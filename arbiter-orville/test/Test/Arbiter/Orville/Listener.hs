@@ -7,12 +7,11 @@
 module Test.Arbiter.Orville.Listener (listenerSpec, multiQueueSpec) where
 
 import Arbiter.Core.QueueRegistry (Queue)
-import Arbiter.Test.Setup (addQueueTable, cleanupData, setupOnce)
+import Arbiter.Test.Setup (addQueueTable, cleanupOnce, setupOnce)
 import Arbiter.Worker.TestKit qualified as TestKit
 import Data.Aeson (FromJSON, ToJSON)
 import Data.ByteString (ByteString)
 import Data.Text (Text)
-import Database.PostgreSQL.Simple (close, connectPostgreSQL)
 import GHC.Generics (Generic)
 import Test.Hspec (Spec, beforeAll)
 
@@ -40,8 +39,8 @@ listenerSpec connStr =
       listenSchema
       connStr
       ListenPayload
-      (cleanup connStr listenSchema listenSchema >> createOrvilleTestEnv connStr listenSchema listenSchema 10)
-      ( cleanup connStr listenSchema listenSchema
+      (cleanupOnce connStr listenSchema listenSchema >> createOrvilleTestEnv connStr listenSchema listenSchema 10)
+      ( cleanupOnce connStr listenSchema listenSchema
           >> (disableOrvilleListener <$> createOrvilleTestEnv connStr listenSchema listenSchema 10)
       )
       destroyOrvilleTestEnv
@@ -85,12 +84,6 @@ multiQueueSpec connStr =
       runOrvilleTest
   where
     mkEnv = do
-      cleanup connStr mqSchema mqTableA
-      cleanup connStr mqSchema mqTableB
+      cleanupOnce connStr mqSchema mqTableA
+      cleanupOnce connStr mqSchema mqTableB
       createOrvilleTestEnv connStr mqSchema mqTableA 10
-
-cleanup :: ByteString -> Text -> Text -> IO ()
-cleanup connStr schema table = do
-  conn <- connectPostgreSQL connStr
-  cleanupData schema table conn
-  close conn

@@ -9,7 +9,6 @@ module Arbiter.Core.Job.Schema
 
     -- * Schema Creation
   , createSchemaSQL
-  , defaultSchemaName
 
     -- * Table Creation SQL
   , createJobQueueTableSQL
@@ -22,8 +21,7 @@ module Arbiter.Core.Job.Schema
   , setMaxAttemptsDefaultSQL
 
     -- * Index Creation SQL
-  , createJobQueueUngroupedReadyRankingIndexSQL
-  , createJobQueueUngroupedDueIndexSQL
+  , indexSQL
   , migrateUngroupedReadySplitIndexesSQL
   , createDLQGroupKeyIndexSQL
   , createDLQFailedAtIndexSQL
@@ -39,14 +37,11 @@ module Arbiter.Core.Job.Schema
     -- * NOTIFY Trigger SQL
   , createNotifyFunctionSQL
   , createNotifyTriggerSQL
-  , dropNotifyTriggerSQL
-  , dropNotifyFunctionSQL
 
     -- * Event Streaming Trigger SQL
   , createEventStreamingFunctionSQL
   , createEventStreamingTriggersSQL
   , dropEventStreamingFunctionSQL
-  , dropEventStreamingTriggersSQL
 
     -- * Notification Channel Helpers
   , notificationChannelForTable
@@ -54,7 +49,6 @@ module Arbiter.Core.Job.Schema
   , pauseNotifyChannel
   , pauseNotifyChannelPrefix
   , cancelNotifyChannel
-  , cancelNotifyChannelPrefix
   , cronRunNotifyChannel
 
     -- * Trigger / Function Name Helpers
@@ -88,23 +82,18 @@ module Arbiter.Core.Job.Schema
   , statementTriggerSQL
   ) where
 
-import Data.Bool (bool)
 import Data.Text (Text)
 import Data.Text qualified as T
 import NeatInterpolation (text)
 
 import Arbiter.Core.Job.Types (defaultMaxAttempts)
-import Arbiter.Core.SqlLiterals (quoteIdentifier)
+import Arbiter.Core.SqlLiterals (quoteIdentifier, textLiteral)
 
 -- | PostgreSQL schema name, e.g. @"arbiter"@.
 type SchemaName = Text
 
 -- | Unqualified table name within a schema, e.g. @"email_jobs"@.
 type TableName = Text
-
--- | The schema arbiter's tables live in by default.
-defaultSchemaName :: SchemaName
-defaultSchemaName = "arbiter"
 
 -- | A table's own job-arrival NOTIFY channel: @\"email_jobs\"@ -> @\"email_jobs_created\"@.
 notificationChannelForTable :: TableName -> Text
@@ -353,66 +342,78 @@ createJobQueueArchiveTableSQL schemaName tableName =
     , ");"
     ]
 
+-- | @CREATE INDEX IF NOT EXISTS@ on the named table, partial under a predicate.
+indexSQL :: Text -> Text -> Text -> Maybe Text -> Text
+indexSQL = indexSQLWith "CREATE INDEX IF NOT EXISTS "
+
+-- | 'indexSQL' for a unique index.
+uniqueIndexSQL :: Text -> Text -> Text -> Maybe Text -> Text
+uniqueIndexSQL = indexSQLWith "CREATE UNIQUE INDEX IF NOT EXISTS "
+
+indexSQLWith :: Text -> Text -> Text -> Text -> Maybe Text -> Text
+indexSQLWith create name tbl columns predicate =
+  T.unlines (create <> quoteIdentifier name : body)
+  where
+    body = case predicate of
+      Nothing -> ["ON " <> tbl <> " (" <> columns <> ");"]
+      Just filterText -> ["ON " <> tbl <> " (" <> columns <> ")", "WHERE " <> filterText <> ";"]
+
 -- | Index on archive @completed_at@ for the most-recent-first history listing.
 createArchiveCompletedAtIndexSQL :: Text -> Text -> Text
 createArchiveCompletedAtIndexSQL schemaName tableName =
-  T.unlines
-    [ "CREATE INDEX IF NOT EXISTS " <> quoteIdentifier ("idx_" <> tableName <> "_archive_completed_at")
-    , "ON " <> jobQueueArchiveTable schemaName tableName <> " (completed_at DESC);"
-    ]
+  indexSQL
+    ("idx_" <> tableName <> "_archive_completed_at")
+    (jobQueueArchiveTable schemaName tableName)
+    "completed_at DESC"
+    Nothing
 
 -- | Index on archive @archive_expires_at@. Drives the retention purge sweep.
 createArchiveExpiresAtIndexSQL :: Text -> Text -> Text
 createArchiveExpiresAtIndexSQL schemaName tableName =
-  T.unlines
-    [ "CREATE INDEX IF NOT EXISTS " <> quoteIdentifier ("idx_" <> tableName <> "_archive_expires_at")
-    , "ON " <> jobQueueArchiveTable schemaName tableName <> " (archive_expires_at);"
-    ]
+  indexSQL
+    ("idx_" <> tableName <> "_archive_expires_at")
+    (jobQueueArchiveTable schemaName tableName)
+    "archive_expires_at"
+    Nothing
 
 -- | Index on archive @job_id@ for by-id lookups (@getArchivedJobById@).
 createArchiveJobIdIndexSQL :: Text -> Text -> Text
 createArchiveJobIdIndexSQL schemaName tableName =
-  T.unlines
-    [ "CREATE INDEX IF NOT EXISTS " <> quoteIdentifier ("idx_" <> tableName <> "_archive_job_id")
-    , "ON " <> jobQueueArchiveTable schemaName tableName <> " (job_id);"
-    ]
+  indexSQL ("idx_" <> tableName <> "_archive_job_id") (jobQueueArchiveTable schemaName tableName) "job_id" Nothing
 
 -- | Index on archive @parent_id@ for per-tree history lookups.
 createArchiveParentIdIndexSQL :: Text -> Text -> Text
 createArchiveParentIdIndexSQL schemaName tableName =
-  T.unlines
-    [ "CREATE INDEX IF NOT EXISTS " <> quoteIdentifier ("idx_" <> tableName <> "_archive_parent_id")
-    , "ON " <> jobQueueArchiveTable schemaName tableName <> " (parent_id)"
-    , "WHERE parent_id IS NOT NULL;"
-    ]
+  indexSQL
+    ("idx_" <> tableName <> "_archive_parent_id")
+    (jobQueueArchiveTable schemaName tableName)
+    "parent_id"
+    (Just "parent_id IS NOT NULL")
 
 -- | Index on archive @group_key@ for per-group history lookups.
 createArchiveGroupKeyIndexSQL :: Text -> Text -> Text
 createArchiveGroupKeyIndexSQL schemaName tableName =
-  T.unlines
-    [ "CREATE INDEX IF NOT EXISTS " <> quoteIdentifier ("idx_" <> tableName <> "_archive_group_key")
-    , "ON " <> jobQueueArchiveTable schemaName tableName <> " (group_key);"
-    ]
+  indexSQL ("idx_" <> tableName <> "_archive_group_key") (jobQueueArchiveTable schemaName tableName) "group_key" Nothing
 
 -- | Ranking index over ready ungrouped jobs (@not_visible_until IS NULL AND NOT
 -- suspended@). The claim's ordered @LIMIT@ stops the scan at the first ready rows.
 createJobQueueUngroupedReadyRankingIndexSQL :: Text -> Text -> Text
 createJobQueueUngroupedReadyRankingIndexSQL schemaName tableName =
-  T.unlines
-    [ "CREATE INDEX IF NOT EXISTS " <> quoteIdentifier ("idx_" <> tableName <> "_ungrouped_ready_ranking")
-    , "ON " <> jobQueueTable schemaName tableName <> " (priority ASC, id ASC)"
-    , "WHERE group_key IS NULL AND not_visible_until IS NULL AND NOT suspended;"
-    ]
+  indexSQL
+    ("idx_" <> tableName <> "_ungrouped_ready_ranking")
+    (jobQueueTable schemaName tableName)
+    "priority ASC, id ASC"
+    (Just "group_key IS NULL AND not_visible_until IS NULL AND NOT suspended")
 
 -- | Due-finder for ungrouped parked rows. The claim range-scans it by
 -- @not_visible_until <= NOW()@ for due scheduled, backoff and expired-lease jobs.
 createJobQueueUngroupedDueIndexSQL :: Text -> Text -> Text
 createJobQueueUngroupedDueIndexSQL schemaName tableName =
-  T.unlines
-    [ "CREATE INDEX IF NOT EXISTS " <> quoteIdentifier ("idx_" <> tableName <> "_ungrouped_due")
-    , "ON " <> jobQueueTable schemaName tableName <> " (not_visible_until ASC)"
-    , "WHERE group_key IS NULL AND not_visible_until IS NOT NULL AND NOT suspended;"
-    ]
+  indexSQL
+    ("idx_" <> tableName <> "_ungrouped_due")
+    (jobQueueTable schemaName tableName)
+    "not_visible_until ASC"
+    (Just "group_key IS NULL AND not_visible_until IS NOT NULL AND NOT suspended")
 
 -- | Replace the full ungrouped ranking index with the ready-only ranking index
 -- plus the due-finder.
@@ -431,45 +432,39 @@ migrateUngroupedReadySplitIndexesSQL schemaName tableName =
 -- | Index on DLQ @group_key@, for per-group failure listings.
 createDLQGroupKeyIndexSQL :: Text -> Text -> Text
 createDLQGroupKeyIndexSQL schemaName tableName =
-  T.unlines
-    [ "CREATE INDEX IF NOT EXISTS " <> quoteIdentifier ("idx_" <> tableName <> "_dlq_group_key")
-    , "ON " <> jobQueueDLQTable schemaName tableName <> " (group_key);"
-    ]
+  indexSQL ("idx_" <> tableName <> "_dlq_group_key") (jobQueueDLQTable schemaName tableName) "group_key" Nothing
 
 -- | Index on DLQ @failed_at@, for the most-recent-first listing.
 createDLQFailedAtIndexSQL :: Text -> Text -> Text
 createDLQFailedAtIndexSQL schemaName tableName =
-  T.unlines
-    [ "CREATE INDEX IF NOT EXISTS " <> quoteIdentifier ("idx_" <> tableName <> "_dlq_failed_at")
-    , "ON " <> jobQueueDLQTable schemaName tableName <> " (failed_at DESC);"
-    ]
+  indexSQL ("idx_" <> tableName <> "_dlq_failed_at") (jobQueueDLQTable schemaName tableName) "failed_at DESC" Nothing
 
 -- | Index on DLQ @parent_id@, for per-parent child lookups and counts.
 createDLQParentIdIndexSQL :: Text -> Text -> Text
 createDLQParentIdIndexSQL schemaName tableName =
-  T.unlines
-    [ "CREATE INDEX IF NOT EXISTS " <> quoteIdentifier ("idx_" <> tableName <> "_dlq_parent_id")
-    , "ON " <> jobQueueDLQTable schemaName tableName <> " (parent_id)"
-    , "WHERE parent_id IS NOT NULL;"
-    ]
+  indexSQL
+    ("idx_" <> tableName <> "_dlq_parent_id")
+    (jobQueueDLQTable schemaName tableName)
+    "parent_id"
+    (Just "parent_id IS NOT NULL")
 
 -- | Unique index on @dedup_key@. The dedup @ON CONFLICT@ resolves against it.
 createDedupKeyIndexSQL :: Text -> Text -> Text
 createDedupKeyIndexSQL schemaName tableName =
-  T.unlines
-    [ "CREATE UNIQUE INDEX IF NOT EXISTS " <> quoteIdentifier ("idx_" <> tableName <> "_dedup_key")
-    , "ON " <> jobQueueTable schemaName tableName <> " (dedup_key)"
-    , "WHERE dedup_key IS NOT NULL;"
-    ]
+  uniqueIndexSQL
+    ("idx_" <> tableName <> "_dedup_key")
+    (jobQueueTable schemaName tableName)
+    "dedup_key"
+    (Just "dedup_key IS NOT NULL")
 
 -- | Partial index on @parent_id@, for per-parent child lookups.
 createParentIdIndexSQL :: Text -> Text -> Text
 createParentIdIndexSQL schemaName tableName =
-  T.unlines
-    [ "CREATE INDEX IF NOT EXISTS " <> quoteIdentifier ("idx_" <> tableName <> "_parent_id")
-    , "ON " <> jobQueueTable schemaName tableName <> " (parent_id)"
-    , "WHERE parent_id IS NOT NULL;"
-    ]
+  indexSQL
+    ("idx_" <> tableName <> "_parent_id")
+    (jobQueueTable schemaName tableName)
+    "parent_id"
+    (Just "parent_id IS NOT NULL")
 
 -- | Create a queue's results table, one row per child keyed by @(parent_id, child_id)@.
 -- Its foreign key cascades. Acking the parent clears them.
@@ -530,14 +525,13 @@ createMaintenanceTriggersSQL schemaName tbl baseName =
 createNotifyFunctionSQL :: Text -> Text -> Text
 createNotifyFunctionSQL schemaName tableName =
   let functionName = notifyFunctionName tableName
-      channelName = notificationChannelForTable tableName
-      quotedChannel = T.replace "'" "''" channelName -- Escape single quotes for string literal
+      channel = textLiteral (notificationChannelForTable tableName)
    in T.unlines
         [ "CREATE OR REPLACE FUNCTION " <> quoteIdentifier schemaName <> "." <> quoteIdentifier functionName <> "()"
         , "RETURNS TRIGGER AS $$"
         , "BEGIN"
         , "  IF EXISTS (SELECT 1 FROM new_table) THEN"
-        , "    PERFORM pg_notify('" <> quotedChannel <> "', '');"
+        , "    PERFORM pg_notify(" <> channel <> ", '');"
         , "  END IF;"
         , "  RETURN NULL;"
         , "END;"
@@ -567,21 +561,6 @@ createNotifyTriggerSQL schemaName tableName =
         , "EXECUTE FUNCTION " <> quoteIdentifier schemaName <> "." <> quoteIdentifier functionName <> "();"
         , "COMMENT ON TRIGGER " <> trigName <> " ON " <> tbl <> " IS '" <> notifyObjectComment <> "';"
         ]
-
--- | Drop a table's job-arrival NOTIFY trigger.
-dropNotifyTriggerSQL :: Text -> Text -> Text
-dropNotifyTriggerSQL schemaName tableName =
-  "DROP TRIGGER IF EXISTS "
-    <> quoteIdentifier (notifyTriggerName tableName)
-    <> " ON "
-    <> jobQueueTable schemaName tableName
-    <> ";"
-
--- | Drop a table's job-arrival NOTIFY function.
-dropNotifyFunctionSQL :: Text -> Text -> Text
-dropNotifyFunctionSQL schemaName tableName =
-  let functionName = notifyFunctionName tableName
-   in "DROP FUNCTION IF EXISTS " <> quoteIdentifier schemaName <> "." <> quoteIdentifier functionName <> "();"
 
 -- ---------------------------------------------------------------------------
 -- Event Streaming Triggers (for admin UI / SSE)
@@ -644,9 +623,9 @@ createEventStreamingTriggersSQL schemaName tableName =
         "FOR EACH ROW EXECUTE FUNCTION "
           <> funcName
           <> "("
-          <> quoteLiteral tableName
+          <> textLiteral tableName
           <> ", "
-          <> quoteLiteral isDLQ
+          <> textLiteral isDLQ
           <> ");"
       triggerComment trigger tableRef =
         "COMMENT ON TRIGGER "
@@ -654,7 +633,7 @@ createEventStreamingTriggersSQL schemaName tableName =
           <> " ON "
           <> tableRef
           <> " IS "
-          <> quoteLiteral eventStreamingObjectComment
+          <> textLiteral eventStreamingObjectComment
           <> ";"
    in dropEventStreamingTriggersSQL schemaName tableName
         <> T.unlines
@@ -668,8 +647,6 @@ createEventStreamingTriggersSQL schemaName tableName =
           , triggerCall "true"
           , triggerComment (eventStreamingDLQTriggerName tableName) dlqTbl
           ]
-  where
-    quoteLiteral = ("'" <>) . (<> "'") . T.replace "'" "''"
 
 -- | Drop current and legacy event-streaming triggers for a queue and its DLQ.
 -- The shared function is dropped separately after every queue is detached.
@@ -679,7 +656,7 @@ dropEventStreamingTriggersSQL schemaName tableName =
       dlqTbl = jobQueueDLQTable schemaName tableName
       dropTrigger name tableRef = "DROP TRIGGER IF EXISTS " <> quoteIdentifier name <> " ON " <> tableRef <> ";"
    in T.unlines $
-        map (\(name, isDLQ) -> dropTrigger name (bool tbl dlqTbl isDLQ)) legacyEventStreamingTriggers
+        map (\(name, isDLQ) -> dropTrigger name (if isDLQ then dlqTbl else tbl)) legacyEventStreamingTriggers
           <> [ dropTrigger (eventStreamingTriggerName tableName) tbl
              , dropTrigger (eventStreamingDLQTriggerName tableName) dlqTbl
              ]

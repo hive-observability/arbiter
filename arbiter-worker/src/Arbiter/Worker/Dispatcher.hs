@@ -36,12 +36,9 @@ runDispatcher
 runDispatcher config workerCapacity statements workQueue notifVar = do
   claimGate <- newFailureGate
   let
-    calcFreeWorkers :: STM.STM Int
-    calcFreeWorkers = (workerCapacity -) <$> inFlight workQueue
-
     getFreeWorkers :: STM.STM (Maybe Int)
     getFreeWorkers = do
-      free <- calcFreeWorkers
+      free <- (workerCapacity -) <$> inFlight workQueue
       pure $ if free > 0 then Just free else Nothing
 
     claimAndEnqueue :: Int -> m ()
@@ -57,13 +54,11 @@ runDispatcher config workerCapacity statements workQueue notifVar = do
       STM.atomically (pulseHeartbeat config)
 
     claimOnWakeup :: m ()
-    claimOnWakeup = do
-      mFree <- STM.atomically getFreeWorkers
-      traverse_ claimAndEnqueue mFree
+    claimOnWakeup = STM.atomically getFreeWorkers >>= traverse_ claimAndEnqueue
 
   runNotificationConsumer
     (readEffectiveState config)
     (pollInterval config)
     notifVar
-    (Just (awaitFinished workQueue))
+    (awaitFinished workQueue)
     (const claimOnWakeup)

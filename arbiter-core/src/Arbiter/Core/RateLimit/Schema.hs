@@ -4,12 +4,8 @@
 -- | Conversion of declared 'Policy' values to upsertable rows, plus DDL for the
 -- policies table, bucket table, and job columns. No database execution here.
 module Arbiter.Core.RateLimit.Schema
-  ( -- * Policy rows
-    PolicyRow (..)
-  , toPolicyRow
-
-    -- * Table name helpers
-  , arbiterRateLimitPoliciesTable
+  ( -- * Table name helpers
+    arbiterRateLimitPoliciesTable
   , arbiterRateLimitPoliciesTableName
   , arbiterRateLimitsTable
   , arbiterRateLimitsTableName
@@ -35,6 +31,7 @@ import Arbiter.Core.Admission (effectivePolicyCol, policyUpsertSQL)
 import Arbiter.Core.Job.Schema
   ( SchemaName
   , TableName
+  , indexSQL
   , jobQueueDLQTable
   , jobQueueTable
   , maintenanceFunctionNames
@@ -42,20 +39,6 @@ import Arbiter.Core.Job.Schema
   )
 import Arbiter.Core.RateLimit.Spec (Durability (..), Policy (..))
 import Arbiter.Core.SqlLiterals (doubleLiteral, quoteIdentifier, textLiteral)
-
--- | A token-bucket policy as upsertable row fields.
-data PolicyRow = PolicyRow
-  { prefixId :: Text
-  , maxTokens :: Double
-  , refillAmt :: Double
-  , interval :: Double
-  }
-  deriving stock (Eq, Show)
-
--- | A policy in its stored form.
-toPolicyRow :: Policy -> PolicyRow
-toPolicyRow (Policy prefix burst refill period) =
-  PolicyRow {prefixId = prefix, maxTokens = burst, refillAmt = refill, interval = realToFrac period}
 
 -- | Qualified name of the app-global policies table.
 arbiterRateLimitPoliciesTable :: SchemaName -> Text
@@ -116,14 +99,14 @@ alterRateLimitsDurabilitySQL dur schemaName =
       Unlogged -> " SET UNLOGGED"
 
 -- | Upsert a policy's @default_*@ params. Any operator @override_*@ is left untouched.
-upsertPolicyRowSQL :: SchemaName -> PolicyRow -> Text
-upsertPolicyRowSQL schemaName row =
+upsertPolicyRowSQL :: SchemaName -> Policy -> Text
+upsertPolicyRowSQL schemaName policy =
   policyUpsertSQL
     (arbiterRateLimitPoliciesTable schemaName)
-    (textLiteral (prefixId row))
-    [ ("default_max_tokens", doubleLiteral (maxTokens row))
-    , ("default_refill_amount", doubleLiteral (refillAmt row))
-    , ("default_interval", doubleLiteral (interval row))
+    (textLiteral (policyPrefix policy))
+    [ ("default_max_tokens", doubleLiteral (policyMax policy))
+    , ("default_refill_amount", doubleLiteral (policyRefill policy))
+    , ("default_interval", doubleLiteral (realToFrac (policyInterval policy)))
     ]
 
 -- | Migration adding the rate-limit columns to a queue's job and DLQ tables. All
@@ -253,8 +236,8 @@ createRateLimitBucketTriggersSQL schemaName tableName =
 -- prefix leads and @rate_limit_key@ trails.
 createThrottledIndexSQL :: SchemaName -> TableName -> Text
 createThrottledIndexSQL schemaName tableName =
-  T.unlines
-    [ "CREATE INDEX IF NOT EXISTS " <> quoteIdentifier ("idx_" <> tableName <> "_throttled")
-    , "ON " <> jobQueueTable schemaName tableName <> " (rate_limit_prefix, rate_limit_key)"
-    , "WHERE throttled_until IS NOT NULL;"
-    ]
+  indexSQL
+    ("idx_" <> tableName <> "_throttled")
+    (jobQueueTable schemaName tableName)
+    "rate_limit_prefix, rate_limit_key"
+    (Just "throttled_until IS NOT NULL")

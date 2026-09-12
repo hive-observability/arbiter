@@ -4,14 +4,12 @@
 -- | Concurrency SQL templates.
 module Arbiter.Core.Sql.Concurrency
   ( updateConcurrencyPolicyOverrideSQL
-  , liveConcurrencyKeysUnion
   , lockDeadConcurrencyKeysSQL
   , pruneLockedConcurrencyKeysSQL
   , tryLockDeadConcurrencyAdvisorySQL
   , lockConcurrencyCountsSQL
   , reconcileConcurrencyCountsSQL
-  , listConcurrencyPoliciesSQL
-  , getConcurrencyPolicySQL
+  , concurrencyPoliciesSQL
   , listConcurrencyKeysSQL
   , concurrencyHasAnyKeySQL
   , concurrencyCountsStaleSQL
@@ -144,15 +142,6 @@ reconcileConcurrencyCountsSQL schema tableNames heldKeys =
         )
         SELECT ((SELECT COUNT(*) FROM fixed) + (SELECT COUNT(*) FROM seeded))::int8 AS @{reconciled :: CInt8}
       |]
-
--- | List every concurrency pool with its default/override limit and live key and
--- in-flight aggregates.
-listConcurrencyPoliciesSQL :: SchemaName -> Query ConcurrencyPolicyView
-listConcurrencyPoliciesSQL schema = concurrencyPoliciesSQL schema Nothing
-
--- | Single-prefix variant of 'listConcurrencyPoliciesSQL'.
-getConcurrencyPolicySQL :: SchemaName -> Text -> Query ConcurrencyPolicyView
-getConcurrencyPolicySQL schema prefix = concurrencyPoliciesSQL schema (Just prefix)
 
 -- | The policy views, every pool or the one a prefix names.
 concurrencyPoliciesSQL :: SchemaName -> Maybe Text -> Query ConcurrencyPolicyView

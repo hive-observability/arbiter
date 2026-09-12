@@ -23,7 +23,6 @@ module Arbiter.Core.Concurrency.Spec
   , globalConcurrency
   , concurrencyByCase
   , chooseWhen
-  , runConcurrencyFor
   , collectPolicies
 
     -- * Registry reflection
@@ -49,7 +48,7 @@ import Arbiter.Core.Admission
   , selectBy
   , selectNone
   )
-import Arbiter.Core.Selector (Selector, chooseWhen, collectPolicies, runSelector, selectByCase)
+import Arbiter.Core.Selector (Selector, chooseWhen, collectPolicies, selectByCase)
 
 -- | A resolved concurrency key with a pool prefix and per-key suffix. The
 -- stored form is @prefix:suffix@. The separate prefix supports policy lookup.
@@ -106,10 +105,6 @@ globalConcurrency pol suffix = concurrencyBy pol (const suffix)
 concurrencyByCase
   :: (Bounded k, Enum k, Eq k) => (payload -> k) -> (k -> ConcurrencyFor payload) -> ConcurrencyFor payload
 concurrencyByCase = selectByCase
-
--- | Run a selector against a concrete job to get its key.
-runConcurrencyFor :: payload -> ConcurrencyFor payload -> Maybe ConcurrencyKey
-runConcurrencyFor = runSelector
 
 -- | A payload's per-job pool selection. Defaults to unbounded. Only capped
 -- payloads need an instance.

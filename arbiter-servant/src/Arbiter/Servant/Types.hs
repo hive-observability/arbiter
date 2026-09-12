@@ -28,14 +28,7 @@ import Arbiter.Core.CronSchedule (CronScheduleRow (..), CronScheduleUpdate (..))
 import Arbiter.Core.Health (PgDbHealth (..))
 import Arbiter.Core.Job.Archive qualified as Archive
 import Arbiter.Core.Job.DLQ qualified as DLQ
-import Arbiter.Core.Job.Types
-  ( JobRead
-  , JobStatus
-  , JobWrite
-  , isRollup
-  , traceparent
-  , tracestate
-  )
+import Arbiter.Core.Job.Types (JobRead, JobStatus, JobWrite, jobReadPairs)
 import Arbiter.Core.Job.Types qualified as Arb
 import Arbiter.Core.Operations (QueueOverview (..), QueueStats)
 import Arbiter.Core.Queues (QueueRow (..))
@@ -67,10 +60,6 @@ import Data.Time.Clock (UTCTime)
 import Data.UUID.Types (UUID)
 import GHC.Generics (Generic)
 
--- | A job in its JSON wire shape.
-newtype ApiJob payload = ApiJob {unApiJob :: JobRead payload}
-  deriving stock (Eq, Show)
-
 -- | A job row plus its SQL-derived status, for the list endpoint.
 data ApiJobWithStatus payload = ApiJobWithStatus
   { ajwsJob :: JobRead payload
@@ -86,50 +75,11 @@ data ApiJobWithStatus payload = ApiJobWithStatus
 newtype ApiJobWrite payload = ApiJobWrite {unApiJobWrite :: JobWrite payload}
   deriving newtype (Eq, Show)
 
--- | Shared JSON field list for a job row. 'ApiJobWithStatus' appends @status@.
-apiJobPairs :: (ToJSON payload) => JobRead payload -> [Pair]
-apiJobPairs job =
-  [ "primaryKey" .= Arb.primaryKey job
-  , "payload" .= Arb.payload job
-  , "queueName" .= Arb.queueName job
-  , "groupKey" .= Arb.groupKey job
-  , "insertedAt" .= Arb.insertedAt job
-  , "updatedAt" .= Arb.updatedAt job
-  , "attempts" .= Arb.attempts job
-  , "lastError" .= Arb.lastError job
-  , "priority" .= Arb.priority job
-  , "lastAttemptedAt" .= Arb.lastAttemptedAt job
-  , "notVisibleUntil" .= Arb.notVisibleUntil job
-  , "dedupKey" .= Arb.dedupKey job
-  , "maxAttempts" .= Arb.maxAttempts job
-  , "parentId" .= Arb.parentId job
-  , "parentState" .= Arb.parentState job
-  , "isRollup" .= isRollup job
-  , "traceparent" .= (traceparent <$> Arb.traceContext job)
-  , "tracestate" .= (tracestate =<< Arb.traceContext job)
-  , "suspended" .= Arb.suspended job
-  , "claimedBy" .= Arb.claimedBy job
-  , "claimSeq" .= Arb.claimSeq job
-  , "archiveFor" .= Arb.archiveFor job
-  , "kind" .= Arb.jobKind (Arb.payloadKeys job)
-  , "rateLimit" .= Arb.jobRateLimitKey (Arb.payloadKeys job)
-  , "concurrency" .= Arb.jobConcurrencyKey (Arb.payloadKeys job)
-  ]
-
-instance (ToJSON payload) => ToJSON (ApiJob payload) where
-  toJSON (ApiJob job) = object (apiJobPairs job)
-
 instance (ToJSON payload) => ToJSON (ApiJobWithStatus payload) where
-  toJSON (ApiJobWithStatus job status) = object (apiJobPairs job <> ["status" .= status])
-
-instance (FromJSON payload) => FromJSON (ApiJob payload) where
-  parseJSON value = ApiJob <$> parseJSON value
+  toJSON (ApiJobWithStatus job status) = object (jobReadPairs job <> ["status" .= status])
 
 instance (FromJSON payload) => FromJSON (ApiJobWithStatus payload) where
-  parseJSON value = do
-    ApiJob job <- parseJSON value
-    status <- withObject "JobWithStatus" (.: "status") value
-    pure $ ApiJobWithStatus job status
+  parseJSON value = ApiJobWithStatus <$> parseJSON value <*> withObject "JobWithStatus" (.: "status") value
 
 instance (ToJSON payload) => ToJSON (ApiJobWrite payload) where
   toJSON (ApiJobWrite job) =
@@ -161,55 +111,9 @@ instance (FromJSON payload) => FromJSON (ApiJobWrite payload) where
       $ Arb.setGroupKey group
       $ Arb.defaultJob payload
 
--- | A DLQ entry in its JSON wire shape.
-newtype ApiDLQJob payload = ApiDLQJob {unApiDLQJob :: DLQ.DLQJob payload}
-  deriving stock (Eq, Show)
-
-instance (ToJSON payload) => ToJSON (ApiDLQJob payload) where
-  toJSON (ApiDLQJob dlq) =
-    object
-      [ "dlqPrimaryKey" .= DLQ.dlqPrimaryKey dlq
-      , "failedAt" .= DLQ.failedAt dlq
-      , "jobSnapshot" .= ApiJob (DLQ.jobSnapshot dlq)
-      ]
-
-instance (FromJSON payload) => FromJSON (ApiDLQJob payload) where
-  parseJSON = withObject "DLQJob" $ \obj -> do
-    apiJob <- obj .: "jobSnapshot"
-    dlq <-
-      DLQ.DLQJob
-        <$> obj .: "dlqPrimaryKey"
-        <*> obj .: "failedAt"
-        <*> pure (unApiJob apiJob)
-    pure $ ApiDLQJob dlq
-
--- | An archived job in its JSON wire shape.
-newtype ApiArchiveJob payload = ApiArchiveJob {unApiArchiveJob :: Archive.ArchiveJob payload}
-  deriving stock (Eq, Show)
-
-instance (ToJSON payload) => ToJSON (ApiArchiveJob payload) where
-  toJSON (ApiArchiveJob archived) =
-    object
-      [ "archivePrimaryKey" .= Archive.archivePrimaryKey archived
-      , "completedAt" .= Archive.completedAt archived
-      , "jobSnapshot" .= ApiJob (Archive.jobSnapshot archived)
-      , "result" .= Archive.archivedResult archived
-      ]
-
-instance (FromJSON payload) => FromJSON (ApiArchiveJob payload) where
-  parseJSON = withObject "ArchiveJob" $ \obj -> do
-    apiJob <- obj .: "jobSnapshot"
-    archived <-
-      Archive.ArchiveJob
-        <$> obj .: "archivePrimaryKey"
-        <*> obj .: "completedAt"
-        <*> pure (unApiJob apiJob)
-        <*> obj .:? "result"
-    pure $ ApiArchiveJob archived
-
 -- | Response wrapper for archived jobs.
 data ArchiveResponse payload = ArchiveResponse
-  { archiveJobs :: [ApiArchiveJob payload]
+  { archiveJobs :: [Archive.ArchiveJob payload]
   , archiveTotal :: Int
   , archiveOffset :: Int
   , archiveLimit :: Int
@@ -218,7 +122,7 @@ data ArchiveResponse payload = ArchiveResponse
   deriving anyclass (FromJSON, ToJSON)
 
 -- | Single-job response envelope, parameterized over the job representation
--- ('ApiJob' for insert, 'ApiJobWithStatus' for the detail endpoint).
+-- ('JobRead' for insert, 'ApiJobWithStatus' for the detail endpoint).
 newtype JobResponse a = JobResponse
   { job :: a
   }
@@ -240,28 +144,17 @@ data JobsResponse payload = JobsResponse
 
 -- | A consumer's request to lease visible jobs.
 data ClaimRequest = ClaimRequest
-  { crMaxJobs :: Maybe Int
-  , crLeaseSeconds :: Maybe Double
+  { maxJobs :: Maybe Int
+  , leaseSeconds :: Maybe Double
   }
-  deriving stock (Eq, Show)
-
-instance FromJSON ClaimRequest where
-  parseJSON = withObject "ClaimRequest" $ \obj ->
-    ClaimRequest <$> obj .:? "maxJobs" <*> obj .:? "leaseSeconds"
-
-instance ToJSON ClaimRequest where
-  toJSON req = object ["maxJobs" .= crMaxJobs req, "leaseSeconds" .= crLeaseSeconds req]
+  deriving stock (Eq, Generic, Show)
+  deriving anyclass (FromJSON, ToJSON)
 
 -- | Jobs returned by one claim. Each job contains the lease fields required for
 -- finalization.
-newtype ClaimResponse payload = ClaimResponse {claimedJobs :: [ApiJob payload]}
-  deriving stock (Eq, Show)
-
-instance (ToJSON payload) => ToJSON (ClaimResponse payload) where
-  toJSON (ClaimResponse claimed) = object ["jobs" .= claimed]
-
-instance (FromJSON payload) => FromJSON (ClaimResponse payload) where
-  parseJSON = withObject "ClaimResponse" $ \obj -> ClaimResponse <$> obj .: "jobs"
+newtype ClaimResponse payload = ClaimResponse {jobs :: [JobRead payload]}
+  deriving stock (Eq, Generic, Show)
+  deriving anyclass (FromJSON, ToJSON)
 
 -- | Proof that the caller still holds a claimed job.
 data JobLease = JobLease
@@ -326,7 +219,7 @@ instance FromJSON MaintenanceResponse where
 
 -- | Response wrapper for DLQ jobs.
 data DLQResponse payload = DLQResponse
-  { dlqJobs :: [ApiDLQJob payload]
+  { dlqJobs :: [DLQ.DLQJob payload]
   , dlqTotal :: Int
   , dlqOffset :: Int
   , dlqLimit :: Int
@@ -365,7 +258,7 @@ newtype BatchInsertRequest payload = BatchInsertRequest
 
 -- | Response body for batch job insert.
 data BatchInsertResponse payload = BatchInsertResponse
-  { inserted :: [ApiJob payload]
+  { inserted :: [JobRead payload]
   , insertedCount :: Int
   }
   deriving stock (Eq, Generic, Show)
@@ -461,7 +354,7 @@ data ConcurrencyReconcileResponse = ConcurrencyReconcileResponse
 
 -- | Whether the API can reach its database.
 data HealthStatus = Ok | Down
-  deriving stock (Eq, Generic, Show)
+  deriving stock (Bounded, Enum, Eq, Generic, Show)
 
 instance ToJSON HealthStatus where
   toJSON = toJSON . healthStatusToText

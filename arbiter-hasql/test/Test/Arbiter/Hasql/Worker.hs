@@ -5,7 +5,7 @@
 module Test.Arbiter.Hasql.Worker (spec, listenerSpec, multiQueueSpec) where
 
 import Arbiter.Core.QueueRegistry (Queue, QueueSpec (..))
-import Arbiter.Test.Setup (addQueueTable, setupOnce)
+import Arbiter.Test.Setup (addQueueTable, cleanupOnce, setupOnce)
 import Arbiter.Worker.TestKit (workerSpec)
 import Arbiter.Worker.TestKit qualified as TestKit
 import Data.Aeson (FromJSON, ToJSON)
@@ -22,7 +22,7 @@ import Arbiter.Hasql.HasqlDb
   , disableListener
   , runHasqlDb
   )
-import Test.Arbiter.Hasql.TestHelpers (cleanupHasqlTest, createHasqlPool)
+import Test.Arbiter.Hasql.TestHelpers (createHasqlPool)
 
 workerTestSchemaName :: Text
 workerTestSchemaName = "arbiter_hasql_worker_test"
@@ -40,16 +40,15 @@ testTable = "arbiter_hasql_worker_test"
 
 spec :: ByteString -> Spec
 spec connStr =
-  beforeAll (setupOnce connStr workerTestSchemaName testTable False >> createHasqlPool 10 connStr) $
-    beforeWith (\pool -> cleanupHasqlTest connStr workerTestSchemaName testTable >> pure pool) $ do
-      let runM pool act = do
-            env <- createHasqlEnvWithPool (Proxy @HasqlWorkerTestRegistry) pool workerTestSchemaName
-            runHasqlDb env act
+  beforeAll (setupOnce connStr workerTestSchemaName testTable False) $ do
+    sharedPool <- runIO (createHasqlPool 10 connStr)
+    sharedEnv <- runIO (createHasqlEnvWithPool (Proxy @HasqlWorkerTestRegistry) sharedPool workerTestSchemaName)
+    around (\action -> cleanupOnce connStr workerTestSchemaName testTable >> action sharedEnv) $
       workerSpec @HasqlWorkerTestPayload
         SimpleTask
         FailingTask
         (\handler _conn job -> handler job)
-        runM
+        runHasqlDb
 
 listenSchema :: Text
 listenSchema = "arbiter_hasql_listen_test"
@@ -63,8 +62,8 @@ listenerSpec connStr =
       listenSchema
       connStr
       SimpleTask
-      (cleanupHasqlTest connStr listenSchema listenSchema >> createHasqlEnv (Proxy @HasqlListenRegistry) connStr listenSchema)
-      ( cleanupHasqlTest connStr listenSchema listenSchema
+      (cleanupOnce connStr listenSchema listenSchema >> createHasqlEnv (Proxy @HasqlListenRegistry) connStr listenSchema)
+      ( cleanupOnce connStr listenSchema listenSchema
           >> (disableListener <$> createHasqlEnv (Proxy @HasqlListenRegistry) connStr listenSchema)
       )
       destroyHasqlEnv
@@ -108,6 +107,6 @@ multiQueueSpec connStr =
       runHasqlDb
   where
     mkEnv = do
-      cleanupHasqlTest connStr mqSchema mqTableA
-      cleanupHasqlTest connStr mqSchema mqTableB
+      cleanupOnce connStr mqSchema mqTableA
+      cleanupOnce connStr mqSchema mqTableB
       createHasqlEnv (Proxy @HasqlMultiQRegistry) connStr mqSchema

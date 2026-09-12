@@ -9,7 +9,7 @@ module Arbiter.Worker.Cron.Scheduler
   , processCronCatchUp
   , processRunRequests
   , enumerateCatchUpTicks
-  , makeDedupKey
+  , makeDedupKeyFromParts
   , computeDelayMicros
   ) where
 
@@ -82,7 +82,7 @@ runCronScheduler stateVar runNowVar logCfg schemaName queueName jobs = do
   initCronSchedules schemaName queueName jobs logCfg
   cronLog <- newCronLog logCfg
   startupNow <- liftIO getCurrentTime
-  shuttingDown <- isShuttingDown stateVar
+  shuttingDown <- (== ShuttingDown) <$> readTVarIO stateVar
   unless shuttingDown $ do
     processRunRequests cronLog schemaName jobs startupNow
     processCronCatchUp cronLog schemaName queueName jobs startupNow
@@ -307,10 +307,6 @@ logCron cronLog level msg = liftIO $ tryLog (cronLogConfig cronLog) level msg
 tryCron :: (MonadUnliftIO m) => CronLog -> Text -> m a -> m (Either SomeException a)
 tryCron cronLog = tryReportedOn (cronLogConfig cronLog) Error (cronLogGates cronLog)
 
--- | Dedup key for a cron job, from its code-defined overlap and timezone.
-makeDedupKey :: CronJob payload -> UTCTime -> Text
-makeDedupKey cron tick = makeDedupKeyFromParts (name cron) (overlap cron) (timezone cron) tick
-
 -- | For 'AllowOverlap', the key includes the tick formatted in the schedule's
 -- timezone. A DST fall-back minute fires one time.
 makeDedupKeyFromParts :: Text -> OverlapPolicy -> Maybe Text -> UTCTime -> Text
@@ -355,7 +351,3 @@ waitForWake stateVar runNowVar timerVar = liftIO . atomically $ do
             pure WakeRunNow
       writeTVar runNowVar False
       pure reason
-
--- | Snapshot of the current 'WorkerState' for use outside STM.
-isShuttingDown :: (MonadIO m) => TVar WorkerState -> m Bool
-isShuttingDown stateVar = (== ShuttingDown) <$> readTVarIO stateVar

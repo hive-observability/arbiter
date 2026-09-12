@@ -137,7 +137,7 @@ type PoolMode m payload = Mode IO (UnliftIO m) (Job.JobRead payload) (NonEmpty (
 poolMode
   :: forall payload m
    . ( EncodeJobResult (ResultOf m payload)
-     , JobOperation m payload
+     , MonadArbiter m
      )
   => WorkerConfig m payload
   -> Ops.JobStatements
@@ -180,7 +180,7 @@ batchCallbacks callbacks =
     failAs kind job msg = here (\ctx -> callbackFail callbacks ctx (msg, kind) job)
 
 -- | Ack a job inside the caller's transaction, throwing if another worker reclaimed it mid-flight.
-ackOrGone :: (JobOperation m payload) => Ops.JobStatements -> Job.JobRead payload -> m ()
+ackOrGone :: (MonadArbiter m) => Ops.JobStatements -> Job.JobRead payload -> m ()
 ackOrGone statements job = do
   rowsAffected <- Ops.ackJobWith (Ops.statementsAck statements) job
   when (rowsAffected == 0) $
@@ -227,7 +227,7 @@ fireCancelled config job errorMsg = do
 
 -- | Delete what a tree or branch cancel names, returning the rows deleted.
 cancelJobFor
-  :: (JobOperation m payload)
+  :: (MonadArbiter m)
   => FailureKind
   -> Job.JobRead payload
   -> m Int64
@@ -242,7 +242,7 @@ cancelJobFor kind job = do
 -- once it commits. 'Left' why the write found no row.
 handleJobFailure
   :: forall payload m
-   . (JobOperation m payload)
+   . (MonadArbiter m)
   => WorkerConfig m payload
   -> Ops.TreeLocks
   -- ^ Whether the caller already holds the parent and tree locks.

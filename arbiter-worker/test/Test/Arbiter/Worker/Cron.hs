@@ -10,9 +10,9 @@ import Arbiter.Core.HighLevel qualified as HL
 import Arbiter.Core.Job.Types (DedupKey (IgnoreDuplicate), JobRead, dedupKey, defaultJob, payload)
 import Arbiter.Core.Operations qualified as Ops
 import Arbiter.Core.QueueRegistry (Queue)
-import Arbiter.Simple (SimpleDb, SimpleEnv (..), createSimpleEnvWithPool, inTransaction, runSimpleDb)
+import Arbiter.Simple (SimpleDb, SimpleEnv, inTransaction, runSimpleDb)
 import Arbiter.Test.Fixtures (WorkerTestPayload (..))
-import Arbiter.Test.Setup (cleanupData, createSharedPool, setupOnce)
+import Arbiter.Test.Setup (createSharedPool, setupOnce)
 import Control.Exception (bracket, catch)
 import Control.Monad (forM_, void)
 import Control.Monad.IO.Class (liftIO)
@@ -58,7 +58,7 @@ import Arbiter.Worker.Cron
   , formatMinute
   , formatMinuteInTimezone
   , initCronSchedules
-  , makeDedupKey
+  , makeDedupKeyFromParts
   , matchesInTimezone
   , newCronLog
   , nextRunInTimezone
@@ -68,6 +68,7 @@ import Arbiter.Worker.Cron
   , truncateToMinute
   )
 import Arbiter.Worker.Logger (LogConfig (..), LogDestination (..), LogLevel (..), defaultLogConfig)
+import Test.Arbiter.Worker.SharedPool (withPool)
 
 type WorkerTestRegistry = '[Queue "arbiter_cron_test" WorkerTestPayload]
 
@@ -158,16 +159,16 @@ spec connStr = do
       let tick = mkTime 2025 1 9 8 5 0
       formatMinute tick `shouldBe` "2025-01-09T08:05"
 
-  describe "makeDedupKey" $ do
+  describe "makeDedupKeyFromParts" $ do
     it "SkipOverlap produces arbiter_cron:<name> (no time)" $ do
       let Right cron = cronJob "nightly" "0 3 * * *" SkipOverlap (\_ _ -> defaultJob (SimpleTask "x"))
           tick = mkTime 2025 6 15 3 0 0
-      makeDedupKey cron tick `shouldBe` "arbiter_cron:nightly"
+      makeDedupKeyFromParts (name cron) (overlap cron) (timezone cron) tick `shouldBe` "arbiter_cron:nightly"
 
     it "AllowOverlap produces arbiter_cron:<name>:<time>" $ do
       let Right cron = cronJob "nightly" "0 3 * * *" AllowOverlap (\_ _ -> defaultJob (SimpleTask "x"))
           tick = mkTime 2025 6 15 3 0 0
-      makeDedupKey cron tick `shouldBe` "arbiter_cron:nightly:2025-06-15T03:00"
+      makeDedupKeyFromParts (name cron) (overlap cron) (timezone cron) tick `shouldBe` "arbiter_cron:nightly:2025-06-15T03:00"
 
   describe "timezone handling" $ do
     it "cronJobInTimezone rejects an unknown Olson name" $ do
@@ -390,7 +391,7 @@ spec connStr = do
   -- Integration tests (require PostgreSQL)
   describe "processCronTick" $ beforeAll (setupOnce connStr testSchema testTable True) $ do
     sharedPool <- runIO (createSharedPool connStr)
-    around (withPool sharedPool) $ do
+    around (withCronPool sharedPool) $ do
       it "inserts a job when the schedule matches the tick time" $ \env -> do
         let Right cron =
               cronJob
@@ -531,7 +532,7 @@ spec connStr = do
 
   describe "processRunRequests" $ beforeAll (setupOnce connStr testSchema testTable True) $ do
     sharedPool <- runIO (createSharedPool connStr)
-    around (withPool sharedPool) $ do
+    around (withCronPool sharedPool) $ do
       it "fires a requested schedule the tick would not match" $ \env -> do
         let Right cron =
               cronJob
@@ -752,7 +753,7 @@ spec connStr = do
   -- DB integration tests for cron schedule management
   describe "initCronSchedules" $ beforeAll (setupOnce connStr testSchema testTable True) $ do
     sharedPool <- runIO (createSharedPool connStr)
-    around (withPool sharedPool) $ do
+    around (withCronPool sharedPool) $ do
       it "upserts rows" $ \env -> do
         let Right cj1 = cronJob "test-a" "0 3 * * *" SkipOverlap (\_ _ -> defaultJob (SimpleTask "a"))
             Right cj2 = cronJob "test-b" "*/5 * * * *" AllowOverlap (\_ _ -> defaultJob (SimpleTask "b"))
@@ -861,7 +862,7 @@ spec connStr = do
 
   describe "processCronCatchUp" $ beforeAll (setupOnce connStr testSchema testTable True) $ do
     sharedPool <- runIO (createSharedPool connStr)
-    around (withPool sharedPool) $ do
+    around (withCronPool sharedPool) $ do
       it "fires every missed minute for schedules with Backfill policy" $ \env -> do
         -- Simulate a scheduler wake-up after a 5-minute gap. last_checked_at
         -- is 5 minutes in the past. With Backfill 600 (10 min window) the
@@ -1017,7 +1018,7 @@ spec connStr = do
 
   describe "cron concurrency primitives" $ beforeAll (setupOnce connStr testSchema testTable True) $ do
     sharedPool <- runIO (createSharedPool connStr)
-    around (withPool sharedPool) $ do
+    around (withCronPool sharedPool) $ do
       it "touchCronChecked advances last_checked_at monotonically and matches by name" $ \env -> do
         let Right cron = cronJob "touch-test" "* * * * *" AllowOverlap (\_ _ -> defaultJob (SimpleTask "x"))
             tEarly = mkTime 2025 6 15 12 0 0
@@ -1081,11 +1082,10 @@ spec connStr = do
             got4 `shouldBe` True
             PG.rollback conn2
 
-withPool :: Pool PG.Connection -> (SimpleEnv WorkerTestRegistry -> IO a) -> IO a
-withPool sharedPool action = do
-  env <- createSimpleEnvWithPool (Proxy @WorkerTestRegistry) sharedPool testSchema
-  withResource sharedPool $ \conn -> do
-    cleanupData testSchema testTable conn
-    _ <- PG.execute_ conn "DELETE FROM arbiter_cron_test.cron_schedules" `catch` (\(_ :: PG.SqlError) -> pure 0)
-    pure ()
-  action env
+withCronPool :: Pool PG.Connection -> (SimpleEnv WorkerTestRegistry -> IO a) -> IO a
+withCronPool sharedPool action =
+  withPool (Proxy @WorkerTestRegistry) testSchema testTable sharedPool $ \env -> do
+    withResource sharedPool $ \conn -> do
+      _ <- PG.execute_ conn "DELETE FROM arbiter_cron_test.cron_schedules" `catch` (\(_ :: PG.SqlError) -> pure 0)
+      pure ()
+    action env

@@ -11,6 +11,7 @@ module Arbiter.Core.Job.Types
   , PayloadKeys (..)
   , PayloadColumns (..)
   , JobRead
+  , jobReadPairs
   , JobWrite
   , primaryKey
   , payload
@@ -80,7 +81,8 @@ module Arbiter.Core.Job.Types
   ) where
 
 import Control.Exception qualified as E
-import Data.Aeson (FromJSON (..), ToJSON (..), withObject, (.!=), (.:), (.:?))
+import Data.Aeson (FromJSON (..), ToJSON (..), object, withObject, (.!=), (.:), (.:?), (.=))
+import Data.Aeson.Types (Pair)
 import Data.Int (Int32, Int64)
 import Data.Maybe (isJust)
 import Data.Text (Text)
@@ -192,6 +194,38 @@ instance (FromJSON payload) => FromJSON (JobRead payload) where
       <*> obj .:? "claimSeq" .!= 0
       <*> obj .:? "archiveFor"
       <*> (PayloadKeys <$> obj .:? "kind" <*> obj .:? "rateLimit" <*> obj .:? "concurrency")
+
+instance (ToJSON payload) => ToJSON (JobRead payload) where
+  toJSON = object . jobReadPairs
+
+jobReadPairs :: (ToJSON payload) => JobRead payload -> [Pair]
+jobReadPairs job =
+  [ "primaryKey" .= primaryKey job
+  , "payload" .= payload job
+  , "queueName" .= queueName job
+  , "groupKey" .= groupKey job
+  , "insertedAt" .= insertedAt job
+  , "updatedAt" .= updatedAt job
+  , "attempts" .= attempts job
+  , "lastError" .= lastError job
+  , "priority" .= priority job
+  , "lastAttemptedAt" .= lastAttemptedAt job
+  , "notVisibleUntil" .= notVisibleUntil job
+  , "dedupKey" .= dedupKey job
+  , "maxAttempts" .= maxAttempts job
+  , "parentId" .= parentId job
+  , "parentState" .= parentState job
+  , "isRollup" .= isRollup job
+  , "traceparent" .= (traceparent <$> traceContext job)
+  , "tracestate" .= (tracestate =<< traceContext job)
+  , "suspended" .= suspended job
+  , "claimedBy" .= claimedBy job
+  , "claimSeq" .= claimSeq job
+  , "archiveFor" .= archiveFor job
+  , "kind" .= jobKind (payloadKeys job)
+  , "rateLimit" .= jobRateLimitKey (payloadKeys job)
+  , "concurrency" .= jobConcurrencyKey (payloadKeys job)
+  ]
 
 -- | Ungrouped 'JobWrite' with default values. For serial processing within a
 -- group, use 'defaultGroupedJob'.

@@ -43,17 +43,18 @@ library
   hs-source-dirs:  src
   exposed-modules: Arbiter.Worker.TestKit
   build-depends:
-    , aeson              >=2.0  && <2.3
-    , arbiter-core       >=0.1  && <0.2
-    , arbiter-worker     >=0.1  && <0.2
-    , base               >=4.20 && <5
-    , bytestring         >=0.10 && <0.13
-    , containers         >=0.6  && <0.9
-    , hspec              >=2.0  && <2.12
-    , postgresql-simple  >=0.6  && <0.8
-    , text               >=1.2  && <2.2
-    , time               >=1.11 && <1.16
-    , unliftio           >=0.2  && <0.3
+    , aeson                >=2.0  && <2.3
+    , arbiter-core         >=0.1  && <0.2
+    , arbiter-test-common  >=0.1  && <0.2
+    , arbiter-worker       >=0.1  && <0.2
+    , base                 >=4.20 && <5
+    , bytestring           >=0.10 && <0.13
+    , containers           >=0.6  && <0.9
+    , hspec                >=2.0  && <2.12
+    , postgresql-simple    >=0.6  && <0.8
+    , text                 >=1.2  && <2.2
+    , time                 >=1.11 && <1.16
+    , unliftio             >=0.2  && <0.3
 
 test-suite arbiter-worker-testkit-tests
   import:         shared-properties

@@ -23,10 +23,12 @@ import Arbiter.Test.Poll (waitUntil)
 import Arbiter.Worker (runWorkerPool)
 import Arbiter.Worker.Config (WorkerConfig (..), transactionalWorkerConfig)
 import Arbiter.Worker.TestKit (workerSpec)
+import Control.Exception (bracket_)
 import Control.Monad (void)
 import Control.Monad.IO.Class (liftIO)
 import Data.Aeson (FromJSON, ToJSON)
 import Data.ByteString (ByteString)
+import Data.Int (Int64)
 import Data.Text (Text)
 import Data.Text qualified as T
 import GHC.Generics (Generic)
@@ -39,15 +41,14 @@ import Test.Hspec
   , beforeAll
   , beforeWith
   , describe
-  , expectationFailure
   , it
   , shouldBe
   )
 import UnliftIO.Async (withAsync)
 
 import Test.Arbiter.Orville.TestHelpers
-  ( OrvilleTestEnv (..)
-  , TestOrville (..)
+  ( OrvilleTestEnv
+  , TestOrville
   , cleanupOrvilleTest
   , executeSql
   , runOrvilleTest
@@ -69,30 +70,50 @@ type OrvilleWorkerTestRegistry =
 testTable :: Text
 testTable = "arbiter_orville_worker_test"
 
+-- | The table a handler records its own work in.
+testOperations :: Text
+testOperations = workerTestSchemaName <> ".test_operations"
+
+-- | Run a test body with an empty test_operations table, dropped afterwards.
+withTestOperations :: OrvilleTestEnv OrvilleWorkerTestRegistry -> IO a -> IO a
+withTestOperations env =
+  bracket_
+    ( runOrvilleTest env $ do
+        executeSql $ "CREATE TABLE IF NOT EXISTS " <> testOperations <> " (job_id INT, operation TEXT)"
+        executeSql $ "TRUNCATE " <> testOperations
+    )
+    (runOrvilleTest env $ executeSql $ "DROP TABLE IF EXISTS " <> testOperations)
+
+-- | Record a job as processed inside the handler's transaction.
+recordProcessed :: JobRead OrvilleWorkerTestPayload -> TestOrville OrvilleWorkerTestRegistry ()
+recordProcessed job =
+  O.executeVoid O.InsertQuery
+    $ RawSql.fromText
+    $ "INSERT INTO "
+      <> testOperations
+      <> " (job_id, operation) VALUES ("
+      <> T.pack (show (primaryKey job))
+      <> ", 'processed')"
+
+processedCount :: Text
+processedCount = "SELECT COUNT(*) FROM " <> testOperations <> " WHERE operation = 'processed'"
+
+-- | The single count a COUNT query returns.
+countRows :: (O.MonadOrville m) => Text -> m Int64
+countRows sql = O.withConnection $ \conn -> liftIO $ do
+  rows <- ExecResult.readRows =<< RawSql.execute conn (RawSql.fromText sql)
+  case rows of
+    [[(_, val)]] -> either (fail . ("Failed to decode count: " <>)) pure (SqlValue.toInt64 val)
+    _ -> fail "Expected one row from COUNT query"
+
 spec :: ByteString -> Spec
 spec connStr = beforeAll (setupOrvilleTest connStr workerTestSchemaName testTable 10) $ beforeWith (\env -> cleanupOrvilleTest env >> pure env) $ do
   workerSpec @OrvilleWorkerTestPayload SimpleTask FailingTask id runOrvilleTest
 
   describe "Transactional Atomicity" $ do
-    it "rolls back user operations when handler fails" $ \env -> do
-      -- Create a test table to track user operations
-      runOrvilleTest env $ do
-        executeSql $ "CREATE TABLE IF NOT EXISTS " <> workerTestSchemaName <> ".test_operations (job_id INT, operation TEXT)"
-        executeSql $ "TRUNCATE " <> workerTestSchemaName <> ".test_operations"
-
+    it "rolls back user operations when handler fails" $ \env -> withTestOperations env $ do
       let handler :: JobRead OrvilleWorkerTestPayload -> TestOrville OrvilleWorkerTestRegistry (Maybe [Text])
-          handler job = do
-            -- User performs their own database operation using the connection
-            let insertSql =
-                  RawSql.fromText $
-                    "INSERT INTO "
-                      <> workerTestSchemaName
-                      <> ".test_operations (job_id, operation) VALUES ("
-                      <> T.pack (show (primaryKey job))
-                      <> ", 'processed')"
-            -- Then the handler fails
-            O.executeVoid O.InsertQuery insertSql
-            throwRetryable "Simulated failure"
+          handler job = recordProcessed job >> throwRetryable "Simulated failure"
 
       -- Insert a job
       let job =
@@ -123,43 +144,11 @@ spec connStr = beforeAll (setupOrvilleTest connStr workerTestSchemaName testTabl
             liftIO $ (payload $ DLQ.jobSnapshot (head dlqJobs)) `shouldBe` SimpleTask "WillFail"
 
             -- Verify the user's database operation was rolled back
-            O.withConnection $ \conn -> do
-              let countSql = RawSql.fromText $ "SELECT COUNT(*) FROM " <> workerTestSchemaName <> ".test_operations WHERE operation = 'processed'"
-              result <- liftIO $ RawSql.execute conn countSql
-              rows <- liftIO $ ExecResult.readRows result
-              case rows of
-                [[(_name, val)]] -> do
-                  case SqlValue.toInt64 val of
-                    Right count | count == 0 -> pure ()
-                    Right count -> liftIO $ expectationFailure $ "Expected 0 rows but got " <> show count
-                    Left err -> liftIO $ expectationFailure $ "Failed to decode count: " <> err
-                _ -> liftIO $ expectationFailure "Expected one row from COUNT query"
+            countRows processedCount >>= liftIO . (`shouldBe` 0)
 
-      O.runOrvilleWithState (testOrvilleState env) $
-        O.executeVoid O.OtherQuery (RawSql.fromText $ "DROP TABLE IF EXISTS " <> workerTestSchemaName <> ".test_operations")
-
-    it "commits user operations when handler succeeds" $ \env -> do
-      -- Create a test table to track user operations
-      O.runOrvilleWithState (testOrvilleState env) $ do
-        O.executeVoid
-          O.OtherQuery
-          ( RawSql.fromText $
-              "CREATE TABLE IF NOT EXISTS " <> workerTestSchemaName <> ".test_operations (job_id INT, operation TEXT)"
-          )
-        O.executeVoid O.OtherQuery (RawSql.fromText $ "TRUNCATE " <> workerTestSchemaName <> ".test_operations")
-
+    it "commits user operations when handler succeeds" $ \env -> withTestOperations env $ do
       let handler :: JobRead OrvilleWorkerTestPayload -> TestOrville OrvilleWorkerTestRegistry (Maybe [Text])
-          handler job = do
-            -- User performs their own database operation using the connection
-            let insertSql =
-                  RawSql.fromText $
-                    "INSERT INTO "
-                      <> workerTestSchemaName
-                      <> ".test_operations (job_id, operation) VALUES ("
-                      <> T.pack (show (primaryKey job))
-                      <> ", 'processed')"
-            O.executeVoid O.InsertQuery insertSql
-            pure mempty
+          handler job = recordProcessed job >> pure mempty
 
       -- Insert a job
       let job =
@@ -184,30 +173,7 @@ spec connStr = beforeAll (setupOrvilleTest connStr workerTestSchemaName testTabl
             pure (null jobs)
 
           -- Verify the queue is empty
-          O.withConnection $ \conn -> do
-            let countSql = RawSql.fromText $ "SELECT COUNT(*) FROM " <> Schema.jobQueueTable workerTestSchemaName testTable
-            result <- liftIO $ RawSql.execute conn countSql
-            rows <- liftIO $ ExecResult.readRows result
-            case rows of
-              [[(_name, val)]] -> do
-                case SqlValue.toInt64 val of
-                  Right count | count == 0 -> pure ()
-                  Right count -> liftIO $ expectationFailure $ "Expected 0 jobs in queue but got " <> show count
-                  Left err -> liftIO $ expectationFailure $ "Failed to decode count: " <> err
-              _ -> liftIO $ expectationFailure "Expected one row from COUNT query"
+          countRows ("SELECT COUNT(*) FROM " <> Schema.jobQueueTable workerTestSchemaName testTable) >>= liftIO . (`shouldBe` 0)
 
-            -- Verify the user's database operation was committed
-            let countOpsSQL = RawSql.fromText $ "SELECT COUNT(*) FROM " <> workerTestSchemaName <> ".test_operations WHERE operation = 'processed'"
-            result2 <- liftIO $ RawSql.execute conn countOpsSQL
-            rows2 <- liftIO $ ExecResult.readRows result2
-            case rows2 of
-              [[(_name, val)]] -> do
-                case SqlValue.toInt64 val of
-                  Right count | count == 1 -> pure ()
-                  Right count -> liftIO $ expectationFailure $ "Expected 1 row but got " <> show count
-                  Left err -> liftIO $ expectationFailure $ "Failed to decode count: " <> err
-              _ -> liftIO $ expectationFailure "Expected one row from COUNT query"
-
-      -- Cleanup test table
-      runOrvilleTest env $
-        O.executeVoid O.OtherQuery (RawSql.fromText $ "DROP TABLE IF EXISTS " <> workerTestSchemaName <> ".test_operations")
+          -- Verify the user's database operation was committed
+          countRows processedCount >>= liftIO . (`shouldBe` 1)
