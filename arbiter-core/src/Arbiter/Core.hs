@@ -50,6 +50,8 @@ module Arbiter.Core
     -- | 'Arbiter.Core.Listen.Notification' collides with @Database.PostgreSQL.Simple.Notification@.
     -- Import it from @Arbiter.Core.Listen@.
   , Listener
+  , ListenConn (..)
+  , libpqListenConn
   , RunningHub
   , HubLog (..)
   , withChannels
@@ -79,9 +81,11 @@ import Arbiter.Core.JobTree hiding (insertJobTree) -- use HighLevel.insertJobTre
 import Arbiter.Core.Listen
   ( DedicatedListen
   , HubLog (..)
+  , ListenConn (..)
   , Listener
   , RunningHub
   , dedicatedListener
+  , libpqListenConn
   , newDedicatedListen
   , newPoolListener
   , withChannels

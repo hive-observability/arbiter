@@ -50,6 +50,7 @@ library
     , arbiter-core       >=0.1  && <0.2
     , base               >=4.20 && <5
     , bytestring         >=0.10 && <0.13
+    , exceptions         >=0.10 && <0.11
     , mtl                >=2.2  && <2.4
     , postgresql-simple  >=0.6  && <0.8
     , resource-pool      >=0.4  && <0.6

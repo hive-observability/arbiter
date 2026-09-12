@@ -11,9 +11,8 @@
 -- @
 module Arbiter.Simple.SimpleDb
   ( -- * Database Monad
-    SimpleDb
+    SimpleDb (..)
   , SimpleEnv
-  , Simple (..)
   , Db (..)
   , Env (..)
   , PoolState (..)
@@ -44,11 +43,14 @@ import Arbiter.Core.Backend
   )
 import Arbiter.Core.Backend qualified as Backend
 import Arbiter.Core.Job.Schema (SchemaName)
+import Arbiter.Core.Listen (libpqListenConn)
 import Arbiter.Core.MonadArbiter (MonadArbiter (..))
 import Arbiter.Core.PoolConfig (PoolConfig)
+import Arbiter.Core.QueueRegistry (JobPayloadRegistry)
 import Arbiter.Core.PoolConfig qualified as PC
+import Control.Monad.Catch (MonadCatch, MonadMask, MonadThrow)
 import Control.Monad.IO.Class (MonadIO)
-import Control.Monad.Reader (asks)
+import Control.Monad.Reader (MonadReader, asks)
 import Data.ByteString (ByteString)
 import Data.Pool (Pool)
 import Data.Proxy (Proxy (..))
@@ -63,18 +65,28 @@ import Arbiter.Simple.MonadArbiter
   , simpleWithDbTransaction
   )
 
--- | The postgresql-simple backend tag.
-data Simple = Simple
-
 -- | Schema name and connection pool for 'SimpleDb'.
-type SimpleEnv = Env Connection Simple
+type SimpleEnv = Env Connection
 
 -- | The postgresql-simple database monad.
-type SimpleDb = Db Connection Simple
+newtype SimpleDb (registry :: JobPayloadRegistry) m a = SimpleDb {unSimpleDb :: Db Connection registry m a}
+  deriving newtype
+    ( Applicative
+    , Functor
+    , Monad
+    , MonadCatch
+    , MonadFail
+    , MonadIO
+    , MonadMask
+    , MonadReader (SimpleEnv registry)
+    , MonadThrow
+    , MonadUnliftIO
+    , HasPoolState Connection
+    )
 
-instance (MonadUnliftIO m) => MonadArbiter (Db Connection Simple registry m) where
-  type RegistryOf (Db Connection Simple registry m) = registry
-  type Handler (Db Connection Simple registry m) job result = Connection -> job -> Db Connection Simple registry m result
+instance (MonadUnliftIO m) => MonadArbiter (SimpleDb registry m) where
+  type RegistryOf (SimpleDb registry m) = registry
+  type Handler (SimpleDb registry m) job result = Connection -> job -> SimpleDb registry m result
   getSchema = asks schema
   executeQuery = simpleExecuteQuery
   executeStatement = simpleExecuteStatement
@@ -88,7 +100,7 @@ destroySimpleEnv = destroyEnv
 
 -- | Run a 'SimpleDb' action in its env.
 runSimpleDb :: SimpleEnv registry -> SimpleDb registry m a -> m a
-runSimpleDb = runDb
+runSimpleDb env = runDb env . unSimpleDb
 
 -- | Run a 'SimpleDb' action on one connection without a pool or env. The connection is
 -- pinned as an open transaction. 'Arbiter.Core.MonadArbiter.withDbTransaction' nests
@@ -107,7 +119,7 @@ inTransaction
   -- ^ Schema name
   -> SimpleDb registry m a
   -> m a
-inTransaction = Backend.inTransaction Simple
+inTransaction conn schemaName = Backend.inTransaction conn schemaName . unSimpleDb
 
 -- | Create a 'SimpleEnv' with default pool settings. Size worker pools with
 -- 'createSimpleEnvWithConfig' and @poolConfigForWorkers@.
@@ -147,7 +159,7 @@ createSimpleEnvWithConfig
   -- ^ Pool configuration
   -> m (SimpleEnv registry)
 createSimpleEnvWithConfig _proxy connStr =
-  createEnvWithConfig withConnection Simple (connectPostgreSQL connStr) close
+  createEnvWithConfig withListenConn (connectPostgreSQL connStr) close
 
 -- | Create a 'SimpleEnv' over a caller's own connection pool. The shared listener
 -- holds one pool connection for the env's lifetime. Size the pool for the worker
@@ -163,4 +175,7 @@ createSimpleEnvWithPool
   -> SchemaName
   -- ^ Schema name
   -> m (SimpleEnv registry)
-createSimpleEnvWithPool _proxy = createEnvWithPool withConnection Simple
+createSimpleEnvWithPool _proxy = createEnvWithPool withListenConn
+
+withListenConn :: Backend.WithListenConn Connection
+withListenConn conn action = withConnection conn (action . libpqListenConn)

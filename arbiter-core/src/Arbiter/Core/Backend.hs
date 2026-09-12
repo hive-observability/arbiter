@@ -11,7 +11,7 @@ module Arbiter.Core.Backend
   , inTransaction
 
     -- * Environment Creation
-  , WithLibPQ
+  , WithListenConn
   , createEnvWithConfig
   , createEnvWithPool
   , destroyEnv
@@ -35,12 +35,11 @@ import Data.ByteString.Char8 qualified as BSC
 import Data.Foldable (traverse_)
 import Data.Pool (Pool, defaultPoolConfig, destroyAllResources, newPool, setNumStripes, withResource)
 import Data.Text (Text)
-import Database.PostgreSQL.LibPQ qualified as PQ
 import UnliftIO (MonadUnliftIO, mask, onException, withRunInIO)
 
 import Arbiter.Core.Exceptions (throwInternal)
 import Arbiter.Core.Job.Schema (SchemaName)
-import Arbiter.Core.Listen (Listener, dedicatedListener, newDedicatedListen, newPoolListener)
+import Arbiter.Core.Listen (ListenConn, Listener, dedicatedListener, newDedicatedListen, newPoolListener)
 import Arbiter.Core.PoolConfig (PoolConfig (..))
 import Arbiter.Core.QueueRegistry (JobPayloadRegistry)
 
@@ -56,17 +55,18 @@ class (Monad m) => HasPoolState conn m | m -> conn where
   getPoolState :: m (PoolState conn)
   localPoolState :: (PoolState conn -> PoolState conn) -> m a -> m a
 
--- | Schema name, pool state, listener, and a backend's own extra.
-data Env conn ext (registry :: JobPayloadRegistry) = Env
+-- | Schema name, pool state, listener, and the prepared-statement flag.
+data Env conn (registry :: JobPayloadRegistry) = Env
   { schema :: SchemaName
   , poolState :: PoolState conn
   , listener :: Maybe Listener
   -- ^ Resolved LISTEN source. 'Nothing' runs poll-only.
-  , extra :: ext
+  , preparedStatements :: Bool
+  -- ^ Whether a backend prepares its hot statements once per connection.
   }
 
 -- | A pooled backend's database monad.
-newtype Db conn ext (registry :: JobPayloadRegistry) m a = Db {unDb :: ReaderT (Env conn ext registry) m a}
+newtype Db conn (registry :: JobPayloadRegistry) m a = Db {unDb :: ReaderT (Env conn registry) m a}
   deriving newtype
     ( Applicative
     , Functor
@@ -75,84 +75,83 @@ newtype Db conn ext (registry :: JobPayloadRegistry) m a = Db {unDb :: ReaderT (
     , MonadFail
     , MonadIO
     , MonadMask
-    , MonadReader (Env conn ext registry)
+    , MonadReader (Env conn registry)
     , MonadThrow
     , MonadUnliftIO
     )
 
-instance (Monad m) => HasPoolState conn (Db conn ext registry m) where
+instance (Monad m) => HasPoolState conn (Db conn registry m) where
   getPoolState = asks poolState
   localPoolState adjust = local (\env -> env {poolState = adjust (poolState env)})
 
 -- | Run a 'Db' action in its env.
-runDb :: Env conn ext registry -> Db conn ext registry m a -> m a
+runDb :: Env conn registry -> Db conn registry m a -> m a
 runDb env action = runReaderT (unDb action) env
 
 -- | Run a 'Db' action on one connection without a pool. The connection is pinned as
 -- an open transaction. 'Arbiter.Core.MonadArbiter.withDbTransaction' nests through
 -- savepoints. The caller owns the transaction.
-inTransaction :: ext -> conn -> SchemaName -> Db conn ext registry m a -> m a
-inTransaction ext conn schemaName =
+inTransaction :: conn -> SchemaName -> Db conn registry m a -> m a
+inTransaction conn schemaName =
   runDb
     Env
       { schema = schemaName
       , poolState = PoolState {connectionPool = Nothing, activeConn = Just conn, transactionDepth = 1}
       , listener = Nothing
-      , extra = ext
+      , preparedStatements = True
       }
 
 -- | Release the env's connection pool, closing its open connections.
-destroyEnv :: (MonadIO m) => Env conn ext registry -> m ()
+destroyEnv :: (MonadIO m) => Env conn registry -> m ()
 destroyEnv env = liftIO $ traverse_ destroyAllResources (connectionPool (poolState env))
 
 -- | Turn off the shared LISTEN listener for an env, running poll-only.
-disableListener :: Env conn ext registry -> Env conn ext registry
+disableListener :: Env conn registry -> Env conn registry
 disableListener env = env {listener = Nothing}
 
 -- | Give the env a dedicated LISTEN connection opened from a connection string.
 -- The listener takes no pool slot.
-useDedicatedListener :: (MonadIO m) => ByteString -> Env conn ext registry -> m (Env conn ext registry)
+useDedicatedListener :: (MonadIO m) => ByteString -> Env conn registry -> m (Env conn registry)
 useDedicatedListener connStr env = do
   dedicated <- newDedicatedListen connStr
   pure env {listener = Just (dedicatedListener dedicated)}
 
--- | Run an action on a connection's underlying libpq handle.
-type WithLibPQ conn = conn -> (PQ.Connection -> IO ()) -> IO ()
+-- | Run the listener loop on a connection's driver handle.
+type WithListenConn conn = conn -> (ListenConn -> IO ()) -> IO ()
 
 -- | A listener that borrows one pool connection for the hub's lifetime.
-poolListener :: WithLibPQ conn -> Pool conn -> IO Listener
-poolListener withLibPQ pool = newPoolListener (\action -> withResource pool (`withLibPQ` action))
+poolListener :: WithListenConn conn -> Pool conn -> IO Listener
+poolListener withListenConn pool = newPoolListener (\action -> withResource pool (`withListenConn` action))
 
 -- | Create an env over a new pool opened with the connect and release actions.
 createEnvWithConfig
   :: (MonadIO m)
-  => WithLibPQ conn
-  -> ext
+  => WithListenConn conn
   -> IO conn
   -> (conn -> IO ())
   -> SchemaName
   -> PoolConfig
-  -> m (Env conn ext registry)
-createEnvWithConfig withLibPQ ext connect release schemaName config = liftIO $ do
+  -> m (Env conn registry)
+createEnvWithConfig withListenConn connect release schemaName config = liftIO $ do
   connPool <-
     newPool
       $ setNumStripes (poolStripes config)
       $ defaultPoolConfig connect release (fromIntegral $ poolIdleTimeout config) (poolSize config)
-  createEnvWithPool withLibPQ ext connPool schemaName
+  createEnvWithPool withListenConn connPool schemaName
 
 -- | Create an env over a caller's own connection pool. The shared listener holds one
 -- pool connection for the env's lifetime. Size the pool for the worker load plus
 -- one. 'disableListener' runs poll-only and frees that slot. 'useDedicatedListener'
 -- gives the listener its own connection.
-createEnvWithPool :: (MonadIO m) => WithLibPQ conn -> ext -> Pool conn -> SchemaName -> m (Env conn ext registry)
-createEnvWithPool withLibPQ ext connPool schemaName = liftIO $ do
-  lstn <- poolListener withLibPQ connPool
+createEnvWithPool :: (MonadIO m) => WithListenConn conn -> Pool conn -> SchemaName -> m (Env conn registry)
+createEnvWithPool withListenConn connPool schemaName = liftIO $ do
+  lstn <- poolListener withListenConn connPool
   pure
     Env
       { schema = schemaName
       , poolState = PoolState {connectionPool = Just connPool, activeConn = Nothing, transactionDepth = 0}
       , listener = Just lstn
-      , extra = ext
+      , preparedStatements = True
       }
 
 -- | The pinned connection, or one checked out of the pool.

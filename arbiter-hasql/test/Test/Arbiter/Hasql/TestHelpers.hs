@@ -8,7 +8,7 @@ import Data.ByteString (ByteString)
 import Data.Pool (Pool, defaultPoolConfig, newPool, setNumStripes)
 import Hasql.Connection qualified as Hasql
 
-import Arbiter.Hasql.HasqlDb (hasqlSettings)
+import Arbiter.Hasql.Compat (hasqlAcquire, hasqlSettings)
 
 createHasqlPool :: Int -> ByteString -> IO (Pool Hasql.Connection)
 createHasqlPool numConnections connStr =
@@ -16,10 +16,10 @@ createHasqlPool numConnections connStr =
     $ setNumStripes (Just 1)
     $ defaultPoolConfig
       ( do
-          result <- Hasql.acquire (hasqlSettings connStr)
+          result <- hasqlAcquire (hasqlSettings connStr)
           case result of
             Right conn -> pure conn
-            Left err -> error $ "hasql test: connection failed: " <> show err
+            Left err -> error $ "hasql test: connection failed: " <> err
       )
       Hasql.release
       60

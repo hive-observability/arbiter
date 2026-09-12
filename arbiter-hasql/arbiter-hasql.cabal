@@ -27,6 +27,11 @@ source-repository head
   type:     git
   location: https://github.com/velveteer/arbiter.git
 
+flag hasql2
+  description: Build against hasql 2, whose transport is a pqi adapter.
+  default:     True
+  manual:      False
+
 common shared-properties
   default-language: GHC2024
   ghc-options:
@@ -49,15 +54,25 @@ library
     Arbiter.Hasql.MonadArbiter
 
   build-depends:
-    , arbiter-core      >=0.1  && <0.2
-    , base              >=4.20 && <5
-    , bytestring        >=0.10 && <0.13
-    , hasql             >=1.9  && <1.11
-    , mtl               >=2.2  && <2.4
-    , postgresql-libpq  >=0.10 && <0.12
-    , resource-pool     >=0.4  && <0.6
-    , text              >=1.2  && <2.2
-    , unliftio          >=0.2  && <0.3
+    , arbiter-core   >=0.1  && <0.2
+    , base           >=4.20 && <5
+    , bytestring     >=0.10 && <0.13
+    , exceptions     >=0.10 && <0.11
+    , mtl            >=2.2  && <2.4
+    , resource-pool  >=0.4  && <0.6
+    , text           >=1.2  && <2.2
+    , unliftio       >=0.2  && <0.3
+
+  if flag(hasql2)
+    build-depends:
+      , hasql    >=2.0 && <2.1
+      , pqi      >=1.0 && <1.2
+      , pqi-ffi  >=1.0 && <1.1
+
+  else
+    build-depends:
+      , hasql             >=1.9  && <1.11
+      , postgresql-libpq  >=0.10 && <0.12
 
 test-suite arbiter-hasql-tests
   import:         shared-properties

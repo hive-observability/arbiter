@@ -18,4 +18,18 @@ ArbH.inTransaction @AppRegistry conn "arbiter" $
 _ <- Hasql.use conn (Session.script "COMMIT")
 ```
 
+Bring your own pool. On hasql 2 you pick the transport adapter when you open
+connections. The env constructors use the libpq adapter from `pqi-ffi`:
+
+```haskell
+import Data.Pool (defaultPoolConfig, newPool)
+import Pqi.Ffi qualified as Ffi
+
+let acquire = Hasql.acquire Ffi.adapter (ArbH.hasqlSettings connStr) >>= either (fail . show) pure
+pool <- newPool (defaultPoolConfig acquire Hasql.release 60 10)
+env <- ArbH.createHasqlEnvWithPool (Proxy @AppRegistry) pool "arbiter"
+```
+
+On hasql 1.x, `Hasql.acquire` takes only the settings.
+
 See the [arbiter-hasql haddocks](https://arbiterq.dev/arbiter-hasql/Arbiter-Hasql.html) for the env and pool constructors.

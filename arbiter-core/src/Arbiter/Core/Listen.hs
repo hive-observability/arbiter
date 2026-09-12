@@ -3,6 +3,8 @@
 -- | Backend-agnostic LISTEN/NOTIFY hub over one libpq connection per env.
 module Arbiter.Core.Listen
   ( Notification (..)
+  , ListenConn (..)
+  , libpqListenConn
   , Listener
   , RunningHub
   , HubLog (..)
@@ -37,7 +39,7 @@ import Control.Concurrent.STM
   , writeTVar
   )
 import Control.Exception (bracket, onException, uninterruptibleMask_)
-import Control.Monad (unless, void, when)
+import Control.Monad (unless, void, when, (>=>))
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Data.ByteString (ByteString)
 import Data.ByteString.Char8 qualified as BSC
@@ -56,6 +58,7 @@ import Data.Time (NominalDiffTime)
 import Database.PostgreSQL.LibPQ qualified as PQ
 import GHC.Clock (getMonotonicTime)
 import GHC.Conc (threadWaitReadSTM)
+import System.Posix.Types (Fd)
 import UnliftIO (MonadUnliftIO, withRunInIO)
 import UnliftIO.Async qualified as Async
 import UnliftIO.Exception (tryAny)
@@ -93,12 +96,37 @@ data HubLog = HubLog
 data Listener = Listener
   { listenerSlot :: MVar (Maybe RunningHub)
   -- ^ Rendezvous, lazily started and refcounted. Shared across an env's pools.
-  , listenerWithConn :: (PQ.Connection -> IO ()) -> IO ()
-  -- ^ Run the loop with a libpq connection, for the connection's lifetime.
+  , listenerWithConn :: (ListenConn -> IO ()) -> IO ()
+  -- ^ Run the loop with a connection, for the connection's lifetime.
   }
 
+-- | The connection operations the hub loop needs, so any driver can host it.
+data ListenConn = ListenConn
+  { listenNotifies :: IO (Maybe Notification)
+  , listenSocket :: IO (Maybe Fd)
+  , listenConsumeInput :: IO Bool
+  , listenExec :: ByteString -> IO (Either Text ())
+  -- ^ Run a command, reporting why it failed.
+  , listenEscapeIdentifier :: ByteString -> IO (Maybe ByteString)
+  }
+
+-- | A 'ListenConn' over a libpq connection.
+libpqListenConn :: PQ.Connection -> ListenConn
+libpqListenConn conn =
+  ListenConn
+    { listenNotifies = fmap toNotification <$> PQ.notifies conn
+    , listenSocket = PQ.socket conn
+    , listenConsumeInput = PQ.consumeInput conn
+    , listenExec = PQ.exec conn >=> maybe (pure (Left "returned no result")) commandOk
+    , listenEscapeIdentifier = PQ.escapeIdentifier conn
+    }
+  where
+    commandOk res = do
+      status <- PQ.resultStatus res
+      pure $ if status == PQ.CommandOk then Right () else Left ("failed with " <> T.pack (show status))
+
 -- | Build a pool-backed 'Listener' with a fresh hub slot from a connection runner.
-newPoolListener :: ((PQ.Connection -> IO ()) -> IO ()) -> IO Listener
+newPoolListener :: ((ListenConn -> IO ()) -> IO ()) -> IO Listener
 newPoolListener withConn = do
   slot <- newMVar Nothing
   pure (Listener slot withConn)
@@ -239,18 +267,18 @@ hubRepeatAfter hub =
 
 -- | Reconcile on the first iteration and whenever the desired channel set changes.
 -- @onReady@ runs once the first reconcile has subscribed.
-connectionLoop :: RunningHub -> PQ.Connection -> IO () -> IO ()
+connectionLoop :: RunningHub -> ListenConn -> IO () -> IO ()
 connectionLoop hub conn onReady = do
   desired <- reconcile hub conn
   onReady
   loop desired
   where
     loop desired = do
-      mNotify <- PQ.notifies conn
+      mNotify <- listenNotifies conn
       case mNotify of
-        Just notify -> dispatch hub (toNotification notify) >> loop desired
+        Just notification -> dispatch hub notification >> loop desired
         Nothing -> do
-          mfd <- PQ.socket conn
+          mfd <- listenSocket conn
           case mfd of
             Nothing -> throwInternal "connection has no socket"
             Just socketFd -> do
@@ -259,12 +287,12 @@ connectionLoop hub conn onReady = do
                   atomically $
                     (False <$ waitRead)
                       `orElse` (readTVar (hubHandlers hub) >>= \handlers -> True <$ check (Map.keysSet handlers /= desired))
-              consumed <- PQ.consumeInput conn
+              consumed <- listenConsumeInput conn
               unless consumed $ throwInternal "consumeInput failed"
               if changed then reconcile hub conn >>= loop else loop desired
 
 -- | Bring the wire's subscriptions in line with the registered channels.
-reconcile :: RunningHub -> PQ.Connection -> IO (Set ByteString)
+reconcile :: RunningHub -> ListenConn -> IO (Set ByteString)
 reconcile hub conn = do
   (desired, subd) <-
     atomically $
@@ -279,18 +307,10 @@ reconcile hub conn = do
     issue _ [] = pure ()
     issue verb chans = do
       escaped <- traverse escapeChannel chans
-      mres <- PQ.exec conn (BSC.intercalate "; " [verb <> " " <> ident | ident <- escaped])
-      case mres of
-        Nothing ->
-          throwInternal $
-            T.pack (BSC.unpack verb) <> " returned no result"
-        Just res -> do
-          status <- PQ.resultStatus res
-          when (status /= PQ.CommandOk)
-            $ throwInternal
-            $ T.pack (BSC.unpack verb) <> " failed with " <> T.pack (show status)
+      listenExec conn (BSC.intercalate "; " [verb <> " " <> ident | ident <- escaped])
+        >>= either (\reason -> throwInternal (T.pack (BSC.unpack verb) <> " " <> reason)) pure
     escapeChannel chan =
-      fromMaybe (quoteChannel chan) <$> PQ.escapeIdentifier conn chan
+      fromMaybe (quoteChannel chan) <$> listenEscapeIdentifier conn chan
 
 dispatch :: RunningHub -> Notification -> IO ()
 dispatch hub notification = do
@@ -347,7 +367,7 @@ dedicatedListener dedicated =
         bracket (interruptibleConnectDb (dedicatedConnStr dedicated)) PQ.finish $ \conn -> do
           status <- PQ.status conn
           case status of
-            PQ.ConnectionOk -> action conn
+            PQ.ConnectionOk -> action (libpqListenConn conn)
             _ -> do
               merr <- PQ.errorMessage conn
               throwInternal $

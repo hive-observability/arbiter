@@ -1,5 +1,3 @@
-{-# LANGUAGE OverloadedStrings #-}
-
 -- | 'Arbiter.Core.MonadArbiter.MonadArbiter' primitives backed by postgresql-simple.
 module Arbiter.Simple.MonadArbiter
   ( -- * MonadArbiter implementation
@@ -104,11 +102,11 @@ someParamToAction (SomeParam (PArray col) value) = withColToField col (toField (
 someParamToAction (SomeParam (PNullArray col) value) = withColToField col (toField (PGArray value))
 
 withColToField :: Col a -> ((ToField a) => r) -> r
-withColToField CInt4 continuation = continuation
-withColToField CInt8 continuation = continuation
-withColToField CText continuation = continuation
-withColToField CBool continuation = continuation
-withColToField CTimestamptz continuation = continuation
-withColToField CJsonb continuation = continuation
-withColToField CFloat8 continuation = continuation
-withColToField CUuid continuation = continuation
+withColToField CInt4 k = k
+withColToField CInt8 k = k
+withColToField CText k = k
+withColToField CBool k = k
+withColToField CTimestamptz k = k
+withColToField CJsonb k = k
+withColToField CFloat8 k = k
+withColToField CUuid k = k
