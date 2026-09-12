@@ -3,9 +3,10 @@
 {-# LANGUAGE TypeFamilies #-}
 
 -- | Fence tests: the deadlines the worker holds a handler to without asking the database.
-module Test.Arbiter.Worker.Deadline (spec) where
+module Arbiter.Worker.TestKit.Deadline (deadlineSpec) where
 
 import Arbiter.Core.Exceptions (JobForceCancelled (..))
+import Arbiter.Core.HighLevel (QueueOperation, RegistryAdmissionPolicies)
 import Arbiter.Core.HighLevel qualified as HL
 import Arbiter.Core.Job.DLQ (DLQJob (..))
 import Arbiter.Core.Job.Types
@@ -20,37 +21,10 @@ import Arbiter.Core.Job.Types
   , setGroupKey
   , setMaxAttempts
   )
-import Arbiter.Core.MonadArbiter (JobHandler)
-import Arbiter.Core.QueueRegistry (Queue)
+import Arbiter.Core.MonadArbiter (JobHandler, RegistryOf, ResultOf)
+import Arbiter.Core.QueueRegistry (RegistryTables)
 import Arbiter.Core.Trace (capturingContextIO)
-import Arbiter.Simple (SimpleDb, SimpleEnv, runSimpleDb)
-import Arbiter.Test.Fixtures (WorkerTestPayload (..))
 import Arbiter.Test.Poll (waitUntil)
-import Arbiter.Test.Setup (createSharedPool, setupOnce)
-import Control.Concurrent (threadDelay)
-import Control.Exception (SomeException, fromException, uninterruptibleMask_)
-import Control.Monad (void, when)
-import Control.Monad.IO.Class (MonadIO, liftIO)
-import Data.ByteString (ByteString)
-import Data.Either (isRight)
-import Data.Foldable (toList)
-import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
-import Data.Int (Int64)
-import Data.List (partition)
-import Data.List.NonEmpty (NonEmpty ((:|)))
-import Data.Maybe (fromMaybe, isJust)
-import Data.Proxy (Proxy (..))
-import Data.String (fromString)
-import Data.Text (Text)
-import Data.Text qualified as T
-import Data.Time (UTCTime, getCurrentTime)
-import Database.PostgreSQL.Simple (close, connectPostgreSQL)
-import Database.PostgreSQL.Simple qualified as PG
-import GHC.Clock (getMonotonicTime)
-import Test.Hspec (Spec, around, beforeAll, describe, it, runIO, shouldBe, shouldSatisfy)
-import UnliftIO (MonadUnliftIO, bracket, finally, mask_, tryAny, withRunInIO)
-import UnliftIO.Async (async, poll, waitCatch, withAsync)
-
 import Arbiter.Worker (runWorkerPool)
 import Arbiter.Worker.BackoffStrategy (Jitter (NoJitter))
 import Arbiter.Worker.Config
@@ -63,15 +37,28 @@ import Arbiter.Worker.Config
 import Arbiter.Worker.Heartbeat (HeartbeatGuard, newHeartbeatGuard)
 import Arbiter.Worker.Heartbeat.Guard (Batch (..), guardBatch, leaseExpiredReason, reclaimedReason, runHeartbeatGuard)
 import Arbiter.Worker.Logger (LogConfig (..), LogDestination (..), defaultLogConfig, silentLogConfig)
-import Test.Arbiter.Worker.SharedPool (withPool)
-
-type WorkerTestRegistry = '[Queue "arbiter_worker_deadline_test" WorkerTestPayload]
-
-testSchema :: Text
-testSchema = "arbiter_worker_deadline_test"
-
-testTable :: Text
-testTable = "arbiter_worker_deadline_test"
+import Control.Concurrent (threadDelay)
+import Control.Exception (SomeException, fromException, uninterruptibleMask_)
+import Control.Monad (void, when)
+import Control.Monad.IO.Class (MonadIO, liftIO)
+import Data.ByteString (ByteString)
+import Data.Either (isRight)
+import Data.Foldable (toList)
+import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
+import Data.Int (Int64)
+import Data.List (partition)
+import Data.List.NonEmpty (NonEmpty ((:|)))
+import Data.Maybe (fromMaybe, isJust)
+import Data.String (fromString)
+import Data.Text (Text)
+import Data.Text qualified as T
+import Data.Time (UTCTime, getCurrentTime)
+import Database.PostgreSQL.Simple (close, connectPostgreSQL)
+import Database.PostgreSQL.Simple qualified as PG
+import GHC.Clock (getMonotonicTime)
+import Test.Hspec (Spec, around, describe, it, shouldBe, shouldSatisfy)
+import UnliftIO (MonadUnliftIO, bracket, finally, mask_, tryAny, withRunInIO)
+import UnliftIO.Async (async, poll, waitCatch, withAsync)
 
 -- | Longer than any deadline under test.
 handlerSleepMicros :: Int
@@ -138,48 +125,56 @@ slowWaitMillis = 15_000
 dlqWaitMillis :: Int
 dlqWaitMillis = 20_000
 
--- | Insert a job and return it.
-inserted :: SimpleEnv WorkerTestRegistry -> JobWrite WorkerTestPayload -> IO (JobRead WorkerTestPayload)
-inserted env job = runSimpleDb env (HL.insertJob job) >>= maybe (fail "insert returned no job") pure
-
--- | Insert a slow job with the default attempt budget and return its id.
-insertedPlainId :: SimpleEnv WorkerTestRegistry -> IO Int64
-insertedPlainId env = primaryKey <$> inserted env (defaultJob (SlowTask 30))
-
--- | Insert a single-attempt slow job and return its id.
-insertedId :: SimpleEnv WorkerTestRegistry -> IO Int64
-insertedId env = primaryKey <$> inserted env (setMaxAttempts (Just 1) (defaultJob (SlowTask 30)))
-
--- | A handler that finishes at once.
-idleHandler :: JobHandler (SimpleDb WorkerTestRegistry IO) WorkerTestPayload ()
-idleHandler _conn _job = pure ()
-
 -- | Run @action@ with the batch registered with the guard, as the pool does.
 withJobsHeartbeat
   :: (MonadUnliftIO m)
-  => HeartbeatGuard WorkerTestPayload
+  => HeartbeatGuard payload
   -> UTCTime
-  -> NonEmpty (JobRead WorkerTestPayload)
-  -> m [JobRead WorkerTestPayload]
+  -> NonEmpty (JobRead payload)
+  -> m [JobRead payload]
   -> m a
   -> m a
 withJobsHeartbeat guard startTime jobs pending action = do
   inherit <- capturingContextIO
   withRunInIO $ \run -> guardBatch guard (Batch jobs (run pending) startTime inherit) (run action)
 
-spec :: ByteString -> Spec
-spec connStr = beforeAll (setupOnce connStr testSchema testTable True) $ do
-  sharedPool <- runIO (createSharedPool connStr)
-  around (withPool (Proxy @WorkerTestRegistry) testSchema testTable sharedPool) $ do
+-- | Deadline test suite, instantiated for each backend. The queue under test declares @()@ as its result type.
+deadlineSpec
+  :: forall payload m env
+   . ( Eq payload
+     , QueueOperation m payload
+     , RegistryAdmissionPolicies (RegistryOf m)
+     , RegistryTables (RegistryOf m)
+     , ResultOf m payload ~ ()
+     )
+  => Text
+  -- ^ Schema name
+  -> Text
+  -- ^ Queue table name
+  -> ByteString
+  -- ^ Connection string, for the side connections that poke rows
+  -> (Text -> payload)
+  -- ^ Construct a simple task payload
+  -> IO env
+  -- ^ A fresh env over an emptied queue table
+  -> (env -> IO ())
+  -- ^ Release that env
+  -> ((JobRead payload -> m (ResultOf m payload)) -> JobHandler m payload (ResultOf m payload))
+  -- ^ Adapt a job action into the backend's handler shape
+  -> (forall a. env -> m a -> IO a)
+  -- ^ Runner function
+  -> Spec
+deadlineSpec schema table connStr mkSimple mkEnv destroyEnv mkHandler runM =
+  around (bracket mkEnv destroyEnv) $ do
     describe "Guard registration" $ do
       it "returns once a signal in flight meets the unregister" $ \env -> do
-        job <- inserted env (defaultJob (SlowTask 1))
+        job <- inserted env (defaultJob (mkSimple "slow"))
         config <- transactionalWorkerConfig 1 idleHandler
-        guard <- runSimpleDb env (newHeartbeatGuard config {maxJobDuration = Just 1, logConfig = silentLogConfig})
+        guard <- runM env (newHeartbeatGuard config {maxJobDuration = Just 1, logConfig = silentLogConfig})
         startTime <- getCurrentTime
         withAsync (runHeartbeatGuard guard) $ \_ -> do
           registration <-
-            async . runSimpleDb env . mask_ $ do
+            async . runM env . mask_ $ do
               withJobsHeartbeat guard startTime (job :| []) (pure []) (liftIO (uninterruptibleMask_ (threadDelay maskedMicros)))
               liftIO (threadDelay afterRegistrationMicros)
           waitUntil stuckRegistrationMillis (isJust <$> poll registration)
@@ -192,12 +187,12 @@ spec connStr = beforeAll (setupOnce connStr testSchema testTable True) $ do
         finishedRef <- newIORef ([] :: [Int64])
         reasonsRef <- newIORef ([] :: [(Int64, Text)])
         beatsRef <- newIORef ([] :: [(Int64, Double)])
-        let handler :: JobHandler (SimpleDb WorkerTestRegistry IO) WorkerTestPayload ()
-            handler _conn job = liftIO $ do
+        let handler :: JobHandler m payload ()
+            handler = mkHandler $ \job -> liftIO $ do
               atomicModifyIORef' startedRef (\started -> (primaryKey job : started, ()))
               threadDelay siblingRunMicros
               atomicModifyIORef' finishedRef (\finished -> (primaryKey job : finished, ()))
-            hooks :: ObservabilityHooks (SimpleDb WorkerTestRegistry IO) WorkerTestPayload
+            hooks :: ObservabilityHooks m payload
             hooks =
               defaultObservabilityHooks
                 { onJobHeartbeat = \job _ _ ->
@@ -219,9 +214,9 @@ spec connStr = beforeAll (setupOnce connStr testSchema testTable True) $ do
                 , logConfig = silentLogConfig
                 }
 
-        withAsync (runSimpleDb env $ runWorkerPool workerConfig) $ \_ -> do
+        withAsync (runM env $ runWorkerPool workerConfig) $ \_ -> do
           waitUntil waitMillis $ (== 2) . length <$> readIORef startedRef
-          reclaimJob connStr stolenId
+          reclaimJob connStr qualifiedTable stolenId
           waitUntil waitMillis $ not . null <$> readIORef reasonsRef
           reclaimedAt <- getMonotonicTime
           waitUntil slowWaitMillis $ not . null <$> readIORef finishedRef
@@ -238,23 +233,23 @@ spec connStr = beforeAll (setupOnce connStr testSchema testTable True) $ do
         let guardConfig = config {jobHeartbeatInterval = 0.5, visibilityTimeout = 20, logConfig = silentLogConfig}
         handedId <- insertedPlainId env
         _ <- insertedPlainId env
-        batch <- runSimpleDb env (HL.claimNextVisibleJobsAs @WorkerTestPayload 2 20 (workerId config))
+        batch <- runM env (HL.claimNextVisibleJobsAs @payload 2 20 (workerId config))
         (handed, kept) <- case partition ((== handedId) . primaryKey) batch of
           ([job], [sibling]) -> pure (job, sibling)
           _ -> fail "expected two claimed jobs"
-        releaseRow connStr handedId
-        reclaimed <- runSimpleDb env (HL.claimNextVisibleJobsAs @WorkerTestPayload 1 20 (workerId config)) >>= single
-        guard <- runSimpleDb env (newHeartbeatGuard guardConfig)
+        releaseRow connStr qualifiedTable handedId
+        reclaimed <- runM env (HL.claimNextVisibleJobsAs @payload 1 20 (workerId config)) >>= single
+        guard <- runM env (newHeartbeatGuard guardConfig)
         startTime <- getCurrentTime
         withAsync (runHeartbeatGuard guard) $ \_ -> do
           keeper <-
-            async . runSimpleDb env $
+            async . runM env $
               withJobsHeartbeat guard startTime (handed :| [kept]) (pure [kept]) (liftIO (threadDelay siblingRunMicros))
           holder <-
-            async . runSimpleDb env $
+            async . runM env $
               withJobsHeartbeat guard startTime (reclaimed :| []) (pure [reclaimed]) (liftIO (threadDelay siblingRunMicros))
           threadDelay beforeCancelMicros
-          flagCancelled connStr handedId
+          flagCancelled connStr qualifiedTable handedId
           holderOutcome <- waitCatch holder
           keeperOutcome <- waitCatch keeper
           either isForceCancelled (const False) holderOutcome `shouldBe` True
@@ -263,11 +258,11 @@ spec connStr = beforeAll (setupOnce connStr testSchema testTable True) $ do
       it "beats a batch while a sibling batch's row is locked" $ \env -> do
         startedRef <- newIORef ([] :: [Int64])
         beatsRef <- newIORef ([] :: [(Int64, Double)])
-        let handler :: JobHandler (SimpleDb WorkerTestRegistry IO) WorkerTestPayload ()
-            handler _conn job = liftIO $ do
+        let handler :: JobHandler m payload ()
+            handler = mkHandler $ \job -> liftIO $ do
               atomicModifyIORef' startedRef (\started -> (primaryKey job : started, ()))
               threadDelay handlerSleepMicros
-            hooks :: ObservabilityHooks (SimpleDb WorkerTestRegistry IO) WorkerTestPayload
+            hooks :: ObservabilityHooks m payload
             hooks = defaultObservabilityHooks {onJobHeartbeat = \job _ _ -> liftIO (stamp beatsRef job)}
         lockedId <- insertedId env
         freeId <- insertedId env
@@ -281,10 +276,10 @@ spec connStr = beforeAll (setupOnce connStr testSchema testTable True) $ do
                 , observabilityHooks = hooks
                 , logConfig = silentLogConfig
                 }
-        withAsync (runSimpleDb env $ runWorkerPool workerConfig) $ \_ -> do
+        withAsync (runM env $ runWorkerPool workerConfig) $ \_ -> do
           waitUntil waitMillis $ (== 2) . length <$> readIORef startedRef
           lockedFrom <- getMonotonicTime
-          holdRowLock connStr lockedId rowLockMicros
+          holdRowLock connStr qualifiedTable lockedId rowLockMicros
           beats <- readIORef beatsRef
           [() | (jobId, at) <- beats, jobId == freeId, at > lockedFrom + lockedBeatFrom, at < lockedFrom + lockedBeatTo]
             `shouldSatisfy` (not . null)
@@ -292,16 +287,15 @@ spec connStr = beforeAll (setupOnce connStr testSchema testTable True) $ do
       it "extends a grouped job whose handler enqueued into its group" $ \env -> do
         loggedRef <- newIORef ([] :: [Text])
         finishedRef <- newIORef (0 :: Int)
-        let handler :: JobHandler (SimpleDb WorkerTestRegistry IO) WorkerTestPayload ()
-            handler _conn job = case payload job of
-              SlowTask _ -> do
-                void (HL.insertJob (setGroupKey (Just "shared") (defaultJob (SimpleTask "child"))))
+        let handler :: JobHandler m payload ()
+            handler = mkHandler $ \job ->
+              when (payload job == mkSimple "slow") $ do
+                void (HL.insertJob (setGroupKey (Just "shared") (defaultJob (mkSimple "child"))))
                 liftIO (threadDelay groupedHandlerMicros)
                 liftIO (atomicModifyIORef' finishedRef (\count -> (count + 1, ())))
-              _ -> pure ()
             capture _level msg _ctx = atomicModifyIORef' loggedRef (\messages -> (msg : messages, ()))
-        parent <- inserted env (setGroupKey (Just "shared") (setMaxAttempts (Just 1) (defaultJob (SlowTask 3))))
-        config <- transactionalWorkerConfig 1 handler
+        parent <- inserted env (setGroupKey (Just "shared") (setMaxAttempts (Just 1) (defaultJob (mkSimple "slow"))))
+        config :: WorkerConfig m payload <- transactionalWorkerConfig 1 handler
         let workerConfig =
               config
                 { pollInterval = 0.2
@@ -310,9 +304,9 @@ spec connStr = beforeAll (setupOnce connStr testSchema testTable True) $ do
                 , jobHeartbeatInterval = 1
                 , logConfig = defaultLogConfig {logDestination = LogCallback capture}
                 }
-        withAsync (runSimpleDb env $ runWorkerPool workerConfig) $ \_ -> do
+        withAsync (runM env $ runWorkerPool workerConfig) $ \_ -> do
           waitUntil waitMillis $ (== 1) <$> readIORef finishedRef
-          waitUntil waitMillis $ (== 0) <$> rowCount connStr (primaryKey parent)
+          waitUntil waitMillis $ (== 0) <$> rowCount connStr qualifiedTable (primaryKey parent)
           logged <- readIORef loggedRef
           filter (T.isInfixOf "deadlock" . T.toLower) logged `shouldBe` []
           dlq <- listDLQ env
@@ -322,15 +316,15 @@ spec connStr = beforeAll (setupOnce connStr testSchema testTable True) $ do
       it "interrupts a handler that outruns the maximum job duration" $ \env -> do
         startedRef <- newIORef (0 :: Int)
         finishedRef <- newIORef (0 :: Int)
-        let handler :: JobHandler (SimpleDb WorkerTestRegistry IO) WorkerTestPayload ()
-            handler _conn _job = liftIO $ do
+        let handler :: JobHandler m payload ()
+            handler = mkHandler $ \_job -> liftIO $ do
               atomicModifyIORef' startedRef (\count -> (count + 1, ()))
               threadDelay handlerSleepMicros
               atomicModifyIORef' finishedRef (\count -> (count + 1, ()))
 
         void (insertedId env)
 
-        config <- transactionalWorkerConfig 1 handler
+        config :: WorkerConfig m payload <- transactionalWorkerConfig 1 handler
         let workerConfig =
               config
                 { pollInterval = 0.2
@@ -339,7 +333,7 @@ spec connStr = beforeAll (setupOnce connStr testSchema testTable True) $ do
                 , logConfig = silentLogConfig
                 }
 
-        withAsync (runSimpleDb env $ runWorkerPool workerConfig) $ \_ -> do
+        withAsync (runM env $ runWorkerPool workerConfig) $ \_ -> do
           waitUntil waitMillis $ (== 1) <$> readIORef startedRef
           waitUntil dlqWaitMillis $ not . null <$> listDLQ env
           dlq <- listDLQ env
@@ -350,13 +344,13 @@ spec connStr = beforeAll (setupOnce connStr testSchema testTable True) $ do
 
       it "fences a batch on time while another batch's heartbeat hook is slow" $ \env -> do
         startedRef <- newIORef ([] :: [(Int64, Double)])
-        let handler :: JobHandler (SimpleDb WorkerTestRegistry IO) WorkerTestPayload ()
-            handler _conn job = liftIO $ do
+        let handler :: JobHandler m payload ()
+            handler = mkHandler $ \job -> liftIO $ do
               now <- getMonotonicTime
               atomicModifyIORef' startedRef (\started -> ((primaryKey job, now) : started, ()))
               threadDelay handlerSleepMicros
         slowId <- insertedId env
-        let hooks :: ObservabilityHooks (SimpleDb WorkerTestRegistry IO) WorkerTestPayload
+        let hooks :: ObservabilityHooks m payload
             hooks =
               defaultObservabilityHooks
                 { onJobHeartbeat = \job _ _ ->
@@ -375,7 +369,7 @@ spec connStr = beforeAll (setupOnce connStr testSchema testTable True) $ do
                 , logConfig = silentLogConfig
                 }
 
-        withAsync (runSimpleDb env $ runWorkerPool workerConfig) $ \_ -> do
+        withAsync (runM env $ runWorkerPool workerConfig) $ \_ -> do
           waitUntil waitMillis $ (== 1) . length <$> readIORef startedRef
           threadDelay beforeFencedInsertMicros
           fencedId <- insertedId env
@@ -390,9 +384,9 @@ spec connStr = beforeAll (setupOnce connStr testSchema testTable True) $ do
         loggedRef <- newIORef ([] :: [Text])
         finishedRef <- newIORef (0 :: Int)
         let handler
-              :: NonEmpty (JobRead WorkerTestPayload)
-              -> BatchCallbacks (SimpleDb WorkerTestRegistry IO) WorkerTestPayload ()
-              -> SimpleDb WorkerTestRegistry IO ()
+              :: NonEmpty (JobRead payload)
+              -> BatchCallbacks m payload ()
+              -> m ()
             handler jobs callbacks = do
               ackAll callbacks (toList jobs)
               liftIO $ do
@@ -411,7 +405,7 @@ spec connStr = beforeAll (setupOnce connStr testSchema testTable True) $ do
                 , logConfig = defaultLogConfig {logDestination = LogCallback capture}
                 }
 
-        withAsync (runSimpleDb env $ runWorkerPool workerConfig) $ \_ -> do
+        withAsync (runM env $ runWorkerPool workerConfig) $ \_ -> do
           waitUntil slowWaitMillis $ any ("finalized" `T.isInfixOf`) <$> readIORef loggedRef
           finished <- readIORef finishedRef
           finished `shouldBe` 0
@@ -422,13 +416,13 @@ spec connStr = beforeAll (setupOnce connStr testSchema testTable True) $ do
         startedRef <- newIORef (Nothing :: Maybe Double)
         finishedRef <- newIORef (0 :: Int)
         beatsRef <- newIORef ([] :: [Double])
-        let handler :: JobHandler (SimpleDb WorkerTestRegistry IO) WorkerTestPayload ()
-            handler _conn _job = liftIO $ do
+        let handler :: JobHandler m payload ()
+            handler = mkHandler $ \_job -> liftIO $ do
               getMonotonicTime >>= writeIORef startedRef . Just
               uninterruptibleMask_ (threadDelay maskedMicros)
               threadDelay handlerSleepMicros
               atomicModifyIORef' finishedRef (\count -> (count + 1, ()))
-            hooks :: ObservabilityHooks (SimpleDb WorkerTestRegistry IO) WorkerTestPayload
+            hooks :: ObservabilityHooks m payload
             hooks = defaultObservabilityHooks {onJobHeartbeat = \_ _ _ -> recordBeat beatsRef}
 
         void (insertedId env)
@@ -445,7 +439,7 @@ spec connStr = beforeAll (setupOnce connStr testSchema testTable True) $ do
                 , logConfig = silentLogConfig
                 }
 
-        withAsync (runSimpleDb env $ runWorkerPool workerConfig) $ \_ -> do
+        withAsync (runM env $ runWorkerPool workerConfig) $ \_ -> do
           waitUntil waitMillis $ isJust <$> readIORef startedRef
           waitUntil dlqWaitMillis $ not . null <$> listDLQ env
           started <- maybe 0 id <$> readIORef startedRef
@@ -457,15 +451,15 @@ spec connStr = beforeAll (setupOnce connStr testSchema testTable True) $ do
       it "interrupts a handler that catches sync exceptions" $ \env -> do
         startedRef <- newIORef (0 :: Int)
         finishedRef <- newIORef (0 :: Int)
-        let handler :: JobHandler (SimpleDb WorkerTestRegistry IO) WorkerTestPayload ()
-            handler _conn _job = liftIO $ do
+        let handler :: JobHandler m payload ()
+            handler = mkHandler $ \_job -> liftIO $ do
               atomicModifyIORef' startedRef (\count -> (count + 1, ()))
               void (tryAny (threadDelay handlerSleepMicros))
               atomicModifyIORef' finishedRef (\count -> (count + 1, ()))
 
         void (insertedId env)
 
-        config <- transactionalWorkerConfig 1 handler
+        config :: WorkerConfig m payload <- transactionalWorkerConfig 1 handler
         let workerConfig =
               config
                 { pollInterval = 0.2
@@ -474,7 +468,7 @@ spec connStr = beforeAll (setupOnce connStr testSchema testTable True) $ do
                 , logConfig = silentLogConfig
                 }
 
-        withAsync (runSimpleDb env $ runWorkerPool workerConfig) $ \_ -> do
+        withAsync (runM env $ runWorkerPool workerConfig) $ \_ -> do
           waitUntil waitMillis $ (== 1) <$> readIORef startedRef
           waitUntil dlqWaitMillis $ not . null <$> listDLQ env
           finished <- readIORef finishedRef
@@ -485,8 +479,8 @@ spec connStr = beforeAll (setupOnce connStr testSchema testTable True) $ do
         finishedRef <- newIORef (0 :: Int)
         beatsRef <- newIORef ([] :: [Double])
         reasonsRef <- newIORef ([] :: [Text])
-        let handler :: JobHandler (SimpleDb WorkerTestRegistry IO) WorkerTestPayload ()
-            handler _conn _job =
+        let handler :: JobHandler m payload ()
+            handler = mkHandler $ \_job ->
               liftIO
                 ( do
                     getMonotonicTime >>= writeIORef startedRef . Just
@@ -494,7 +488,7 @@ spec connStr = beforeAll (setupOnce connStr testSchema testTable True) $ do
                     atomicModifyIORef' finishedRef (\count -> (count + 1, ()))
                 )
                 `finally` liftIO (threadDelay unwindMicros)
-            hooks :: ObservabilityHooks (SimpleDb WorkerTestRegistry IO) WorkerTestPayload
+            hooks :: ObservabilityHooks m payload
             hooks =
               defaultObservabilityHooks
                 { onJobHeartbeat = \_ _ _ -> recordBeat beatsRef
@@ -516,7 +510,7 @@ spec connStr = beforeAll (setupOnce connStr testSchema testTable True) $ do
                 , logConfig = silentLogConfig
                 }
 
-        withAsync (runSimpleDb env $ runWorkerPool workerConfig) $ \_ -> do
+        withAsync (runM env $ runWorkerPool workerConfig) $ \_ -> do
           waitUntil waitMillis $ isJust <$> readIORef startedRef
           waitUntil dlqWaitMillis $ not . null <$> listDLQ env
           started <- maybe 0 id <$> readIORef startedRef
@@ -535,12 +529,12 @@ spec connStr = beforeAll (setupOnce connStr testSchema testTable True) $ do
         startedRef <- newIORef (0 :: Int)
         finishedRef <- newIORef (0 :: Int)
         reasonsRef <- newIORef ([] :: [Text])
-        let handler :: JobHandler (SimpleDb WorkerTestRegistry IO) WorkerTestPayload ()
-            handler _conn _job = liftIO $ do
+        let handler :: JobHandler m payload ()
+            handler = mkHandler $ \_job -> liftIO $ do
               atomicModifyIORef' startedRef (\count -> (count + 1, ()))
               threadDelay handlerSleepMicros
               atomicModifyIORef' finishedRef (\count -> (count + 1, ()))
-            hooks :: ObservabilityHooks (SimpleDb WorkerTestRegistry IO) WorkerTestPayload
+            hooks :: ObservabilityHooks m payload
             hooks =
               defaultObservabilityHooks
                 { onJobUnavailable = \_ reason ->
@@ -560,17 +554,27 @@ spec connStr = beforeAll (setupOnce connStr testSchema testTable True) $ do
                 , logConfig = silentLogConfig
                 }
 
-        withAsync (runSimpleDb env $ runWorkerPool workerConfig) $ \_ -> do
+        withAsync (runM env $ runWorkerPool workerConfig) $ \_ -> do
           waitUntil waitMillis $ (== 1) <$> readIORef startedRef
-          takeClaimHolder connStr
+          takeClaimHolder connStr qualifiedTable
           waitUntil slowWaitMillis $ not . null <$> readIORef reasonsRef
           finished <- readIORef finishedRef
           finished `shouldBe` 0
           reasons <- readIORef reasonsRef
           reasons `shouldBe` [leaseExpiredReason]
-
-listDLQ :: SimpleEnv WorkerTestRegistry -> IO [DLQJob WorkerTestPayload]
-listDLQ env = runSimpleDb env (HL.listDLQJobs 10 0)
+  where
+    qualifiedTable :: Text
+    qualifiedTable = schema <> "." <> table
+    inserted :: env -> JobWrite payload -> IO (JobRead payload)
+    inserted env job = runM env (HL.insertJob job) >>= maybe (fail "insert returned no job") pure
+    insertedPlainId :: env -> IO Int64
+    insertedPlainId env = primaryKey <$> inserted env (defaultJob (mkSimple "slow"))
+    insertedId :: env -> IO Int64
+    insertedId env = primaryKey <$> inserted env (setMaxAttempts (Just 1) (defaultJob (mkSimple "slow")))
+    idleHandler :: JobHandler m payload ()
+    idleHandler = mkHandler (\_job -> pure ())
+    listDLQ :: env -> IO [DLQJob payload]
+    listDLQ env = runM env (HL.listDLQJobs 10 0)
 
 maskedSeconds :: Double
 maskedSeconds = fromIntegral maskedMicros / 1_000_000
@@ -579,8 +583,8 @@ recordBeat :: (MonadIO m) => IORef [Double] -> m ()
 recordBeat beatsRef = liftIO $ getMonotonicTime >>= \now -> atomicModifyIORef' beatsRef (\beats -> (now : beats, ()))
 
 -- | Take the claim without bumping its token. The extend then reports 'VisibilityUnchanged'.
-takeClaimHolder :: ByteString -> IO ()
-takeClaimHolder connStr = withFreshConn connStr $ \conn ->
+takeClaimHolder :: ByteString -> Text -> IO ()
+takeClaimHolder connStr qualifiedTable = withFreshConn connStr $ \conn ->
   void $
     PG.execute_
       conn
@@ -594,8 +598,8 @@ takeClaimHolder connStr = withFreshConn connStr $ \conn ->
       )
 
 -- | Run one UPDATE on a job row over a fresh connection.
-updateJob :: ByteString -> Text -> Int64 -> IO ()
-updateJob connStr setClause jobId = withFreshConn connStr $ \conn ->
+updateJob :: ByteString -> Text -> Text -> Int64 -> IO ()
+updateJob connStr qualifiedTable setClause jobId = withFreshConn connStr $ \conn ->
   void $
     PG.execute
       conn
@@ -603,11 +607,8 @@ updateJob connStr setClause jobId = withFreshConn connStr $ \conn ->
       (PG.Only jobId)
 
 -- | Take the claim under a new token, as another worker's claim does.
-reclaimJob :: ByteString -> Int64 -> IO ()
-reclaimJob connStr = updateJob connStr "attempts = attempts + 1, claim_seq = claim_seq + 1"
-
-qualifiedTable :: Text
-qualifiedTable = testSchema <> "." <> testTable
+reclaimJob :: ByteString -> Text -> Int64 -> IO ()
+reclaimJob connStr qualifiedTable = updateJob connStr qualifiedTable "attempts = attempts + 1, claim_seq = claim_seq + 1"
 
 withFreshConn :: ByteString -> (PG.Connection -> IO a) -> IO a
 withFreshConn connStr = bracket (connectPostgreSQL connStr) close
@@ -619,12 +620,12 @@ single _ = fail "expected exactly one job"
 isForceCancelled :: SomeException -> Bool
 isForceCancelled exc = isJust (fromException exc :: Maybe JobForceCancelled)
 
-stamp :: IORef [(Int64, Double)] -> JobRead WorkerTestPayload -> IO ()
+stamp :: IORef [(Int64, Double)] -> JobRead payload -> IO ()
 stamp ref job = getMonotonicTime >>= \now -> atomicModifyIORef' ref (\seen -> ((primaryKey job, now) : seen, ()))
 
 -- | Hold a row lock on one job for @micros@, as a transaction touching it would.
-holdRowLock :: ByteString -> Int64 -> Int -> IO ()
-holdRowLock connStr jobId micros = withFreshConn connStr $ \conn -> do
+holdRowLock :: ByteString -> Text -> Int64 -> Int -> IO ()
+holdRowLock connStr qualifiedTable jobId micros = withFreshConn connStr $ \conn -> do
   PG.begin conn
   _ <-
     PG.query
@@ -636,16 +637,16 @@ holdRowLock connStr jobId micros = withFreshConn connStr $ \conn -> do
   PG.commit conn
 
 -- | Flag a job cancelled under its lease, as a force-cancel does, without the NOTIFY.
-flagCancelled :: ByteString -> Int64 -> IO ()
-flagCancelled connStr = updateJob connStr "cancel_requested_at = NOW(), claim_seq = claim_seq + 1"
+flagCancelled :: ByteString -> Text -> Int64 -> IO ()
+flagCancelled connStr qualifiedTable = updateJob connStr qualifiedTable "cancel_requested_at = NOW(), claim_seq = claim_seq + 1"
 
 -- | Release a claim and make the row claimable now.
-releaseRow :: ByteString -> Int64 -> IO ()
-releaseRow connStr = updateJob connStr "claimed_by = NULL, not_visible_until = NULL"
+releaseRow :: ByteString -> Text -> Int64 -> IO ()
+releaseRow connStr qualifiedTable = updateJob connStr qualifiedTable "claimed_by = NULL, not_visible_until = NULL"
 
 -- | How many rows carry the job id.
-rowCount :: ByteString -> Int64 -> IO Int
-rowCount connStr jobId = withFreshConn connStr $ \conn -> do
+rowCount :: ByteString -> Text -> Int64 -> IO Int
+rowCount connStr qualifiedTable jobId = withFreshConn connStr $ \conn -> do
   [PG.Only count] <-
     PG.query
       conn

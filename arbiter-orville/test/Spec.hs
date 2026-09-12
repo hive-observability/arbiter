@@ -23,5 +23,10 @@ main = do
     describe "Arbiter.Orville.Worker" $ Worker.spec connStr
     describe "Arbiter.Orville.Listener" $ Listener.listenerSpec connStr
     describe "Arbiter.Orville.MultiQueueListener" $ Listener.multiQueueSpec connStr
+    describe "Arbiter.Orville.Deadline" $ Worker.deadlineSpec connStr
+    describe "Arbiter.Orville.Cron" $ Worker.cronSpec connStr
+    describe "Arbiter.Orville.Reclaim" $ Worker.reclaimSpec connStr
+    describe "Arbiter.Orville.ConnectionRecovery" $ Worker.connectionRecoverySpec connStr
+    describe "Arbiter.Orville.Lifecycle" $ Worker.lifecycleSpec connStr
     describe "Arbiter.Orville.RateLimit" $ RateLimit.spec connStr
     describe "Arbiter.Orville.ConcurrencyLimit" $ ConcurrencyLimit.spec connStr

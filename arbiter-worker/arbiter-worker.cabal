@@ -99,36 +99,26 @@ test-suite arbiter-worker-tests
   main-is:        Spec.hs
   ghc-options:    -threaded -rtsopts -with-rtsopts=-N
   other-modules:
-    Test.Arbiter.Worker.Concurrency
-    Test.Arbiter.Worker.ConnectionRecovery
-    Test.Arbiter.Worker.Cron
     Test.Arbiter.Worker.BatchSim
-    Test.Arbiter.Worker.Deadline
+    Test.Arbiter.Worker.Cron
     Test.Arbiter.Worker.GuardSim
     Test.Arbiter.Worker.Logging
     Test.Arbiter.Worker.MultiQueue
-    Test.Arbiter.Worker.PoolSizing
-    Test.Arbiter.Worker.SharedPool
     Test.Arbiter.Worker.Sim
     Test.Arbiter.Worker.WorkQueue
 
   build-depends:
-    , aeson
     , arbiter-core         >=0.1 && <0.2
-    , arbiter-simple       >=0.1 && <0.2
     , arbiter-test-common  >=0.1 && <0.2
     , arbiter-worker
     , base
-    , bytestring
     , containers
     , cron
     , hspec
     , io-classes
     , io-classes:si-timers
     , io-sim
-    , postgresql-simple
     , QuickCheck
-    , resource-pool
     , text
     , time
     , unliftio

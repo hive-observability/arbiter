@@ -66,15 +66,22 @@ test-suite arbiter-simple-tests
     Test.Arbiter.Simple.Concurrency
     Test.Arbiter.Simple.ConcurrencyLimit
     Test.Arbiter.Simple.Operations
+    Test.Arbiter.Simple.PlainResult
+    Test.Arbiter.Simple.PoolSizing
     Test.Arbiter.Simple.RateLimit
     Test.Arbiter.Simple.StateMachine
+    Test.Arbiter.Simple.Worker
 
   build-depends:
-    , arbiter-core         >=0.1 && <0.2
+    , aeson
+    , arbiter-core            >=0.1 && <0.2
     , arbiter-simple
-    , arbiter-test-common  >=0.1 && <0.2
+    , arbiter-test-common     >=0.1 && <0.2
+    , arbiter-worker          >=0.1 && <0.2
+    , arbiter-worker-testkit  >=0.1 && <0.2
     , base
     , bytestring
+    , containers
     , hspec                >=2.0 && <2.12
     , postgresql-simple
     , resource-pool

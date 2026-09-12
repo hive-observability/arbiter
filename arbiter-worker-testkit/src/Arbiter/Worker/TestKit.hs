@@ -8,6 +8,11 @@ module Arbiter.Worker.TestKit
   ( workerSpec
   , listenerSpec
   , multiQueueListenerSpec
+  , deadlineSpec
+  , cronSpec
+  , reclaimSpec
+  , connectionRecoverySpec
+  , lifecycleSpec
   ) where
 
 import Arbiter.Core.Exceptions
@@ -98,6 +103,12 @@ import Database.PostgreSQL.Simple.Types (Identifier (..))
 import Test.Hspec
 import UnliftIO (atomically, bracket, newEmptyMVar, putMVar, takeMVar, try)
 import UnliftIO.Async (concurrently_, withAsync)
+
+import Arbiter.Worker.TestKit.ConnectionRecovery (connectionRecoverySpec)
+import Arbiter.Worker.TestKit.Cron (cronSpec)
+import Arbiter.Worker.TestKit.Deadline (deadlineSpec)
+import Arbiter.Worker.TestKit.Lifecycle (lifecycleSpec)
+import Arbiter.Worker.TestKit.Reclaim (reclaimSpec)
 
 -- | Build a worker-pool test suite for the given 'Arbiter.Core.MonadArbiter.MonadArbiter' runner.
 --

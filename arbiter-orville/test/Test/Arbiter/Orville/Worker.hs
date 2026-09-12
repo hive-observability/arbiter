@@ -4,7 +4,14 @@
 {-# LANGUAGE TypeFamilies #-}
 {-# OPTIONS_GHC -Wno-x-partial #-}
 
-module Test.Arbiter.Orville.Worker (spec) where
+module Test.Arbiter.Orville.Worker
+  ( spec
+  , deadlineSpec
+  , cronSpec
+  , reclaimSpec
+  , connectionRecoverySpec
+  , lifecycleSpec
+  ) where
 
 import Arbiter.Core.Exceptions (throwRetryable)
 import Arbiter.Core.HighLevel qualified as HL
@@ -18,11 +25,13 @@ import Arbiter.Core.Job.Types
   , setGroupKey
   , setMaxAttempts
   )
-import Arbiter.Core.QueueRegistry (QueueSpec (..))
+import Arbiter.Core.QueueRegistry (Queue, QueueSpec (..))
 import Arbiter.Test.Poll (waitUntil)
+import Arbiter.Test.Setup qualified as TestSetup
 import Arbiter.Worker (runWorkerPool)
 import Arbiter.Worker.Config (WorkerConfig (..), transactionalWorkerConfig)
 import Arbiter.Worker.TestKit (workerSpec)
+import Arbiter.Worker.TestKit qualified as TestKit
 import Control.Exception (bracket_)
 import Control.Monad (void)
 import Control.Monad.IO.Class (liftIO)
@@ -50,6 +59,9 @@ import Test.Arbiter.Orville.TestHelpers
   ( OrvilleTestEnv
   , TestOrville
   , cleanupOrvilleTest
+  , createOrvilleTestEnv
+  , destroyOrvilleTestEnv
+  , disableOrvilleListener
   , executeSql
   , runOrvilleTest
   , setupOrvilleTest
@@ -177,3 +189,100 @@ spec connStr = beforeAll (setupOrvilleTest connStr workerTestSchemaName testTabl
 
           -- Verify the user's database operation was committed
           countRows processedCount >>= liftIO . (`shouldBe` 1)
+
+fresh :: ByteString -> Text -> IO (OrvilleTestEnv registry)
+fresh connStr schema = TestSetup.cleanupOnce connStr schema schema >> createOrvilleTestEnv connStr schema schema orvillePoolSize
+
+orvillePoolSize :: Int
+orvillePoolSize = 10
+
+deadlineSchema :: Text
+deadlineSchema = "arbiter_orville_deadline_test"
+
+type OrvilleDeadlineRegistry = '[Queue "arbiter_orville_deadline_test" OrvilleWorkerTestPayload]
+
+deadlineSpec :: ByteString -> Spec
+deadlineSpec connStr =
+  beforeAll (TestSetup.setupOnce connStr deadlineSchema deadlineSchema True) $
+    TestKit.deadlineSpec @OrvilleWorkerTestPayload @(TestOrville OrvilleDeadlineRegistry)
+      deadlineSchema
+      deadlineSchema
+      connStr
+      SimpleTask
+      (fresh connStr deadlineSchema)
+      destroyOrvilleTestEnv
+      id
+      runOrvilleTest
+
+cronSchema :: Text
+cronSchema = "arbiter_orville_cron_test"
+
+type OrvilleCronRegistry = '[Queue "arbiter_orville_cron_test" OrvilleWorkerTestPayload]
+
+cronSpec :: ByteString -> Spec
+cronSpec connStr =
+  beforeAll (TestSetup.setupOnce connStr cronSchema cronSchema True) $
+    TestKit.cronSpec @OrvilleWorkerTestPayload @(TestOrville OrvilleCronRegistry)
+      cronSchema
+      cronSchema
+      connStr
+      SimpleTask
+      (fresh connStr cronSchema)
+      destroyOrvilleTestEnv
+      runOrvilleTest
+
+reclaimSchema :: Text
+reclaimSchema = "arbiter_orville_reclaim_test"
+
+type OrvilleReclaimRegistry = '[Queue "arbiter_orville_reclaim_test" OrvilleWorkerTestPayload]
+
+reclaimSpec :: ByteString -> Spec
+reclaimSpec connStr =
+  beforeAll (TestSetup.setupOnce connStr reclaimSchema reclaimSchema True) $
+    TestKit.reclaimSpec @OrvilleWorkerTestPayload @(TestOrville OrvilleReclaimRegistry)
+      reclaimSchema
+      reclaimSchema
+      connStr
+      SimpleTask
+      FailingTask
+      (fresh connStr reclaimSchema)
+      destroyOrvilleTestEnv
+      id
+      runOrvilleTest
+
+recoverySchema :: Text
+recoverySchema = "arbiter_orville_recovery_test"
+
+type OrvilleRecoveryRegistry = '[Queue "arbiter_orville_recovery_test" OrvilleWorkerTestPayload]
+
+connectionRecoverySpec :: ByteString -> Spec
+connectionRecoverySpec connStr =
+  beforeAll (TestSetup.setupOnce connStr recoverySchema recoverySchema True) $
+    TestKit.connectionRecoverySpec @OrvilleWorkerTestPayload @(TestOrville OrvilleRecoveryRegistry)
+      recoverySchema
+      connStr
+      SimpleTask
+      (fresh connStr recoverySchema)
+      destroyOrvilleTestEnv
+      id
+      runOrvilleTest
+
+lifecycleSchema :: Text
+lifecycleSchema = "arbiter_orville_lifecycle_test"
+
+type OrvilleLifecycleRegistry =
+  '[QueueWithResult "arbiter_orville_lifecycle_test" OrvilleWorkerTestPayload (Maybe [Text])]
+
+lifecycleSpec :: ByteString -> Spec
+lifecycleSpec connStr =
+  beforeAll (TestSetup.setupOnce connStr lifecycleSchema lifecycleSchema True) $
+    TestKit.lifecycleSpec @OrvilleWorkerTestPayload @(TestOrville OrvilleLifecycleRegistry)
+      lifecycleSchema
+      lifecycleSchema
+      connStr
+      SimpleTask
+      (fresh connStr lifecycleSchema)
+      (disableOrvilleListener <$> fresh connStr lifecycleSchema)
+      destroyOrvilleTestEnv
+      id
+      runOrvilleTest

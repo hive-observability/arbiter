@@ -8,6 +8,7 @@ module Arbiter.Hasql.Compat
   , withHasqlLibPQConnection
   , hasqlSettings
   , HasqlSettings
+  , noRowCount
   ) where
 
 import Arbiter.Core.Exceptions (throwInternal)
@@ -17,6 +18,7 @@ import Data.Text.Encoding qualified as TE
 import Data.Text.Encoding.Error qualified as TE
 import Database.PostgreSQL.LibPQ qualified as LibPQ
 import Hasql.Connection qualified as Hasql
+import Hasql.Errors qualified as Errors
 import Hasql.Session qualified as Session
 
 #if MIN_VERSION_hasql(1,10,0)
@@ -25,6 +27,15 @@ import Hasql.Connection.Settings qualified as Settings
 import Hasql.Connection.Setting qualified as Setting
 import Hasql.Connection.Setting.Connection qualified as ConnSetting
 #endif
+
+-- | Whether a statement failed only because its command tag carries no row count.
+noRowCount :: Errors.SessionError -> Bool
+#if MIN_VERSION_hasql(1,10,0)
+noRowCount (Errors.StatementSessionError _ _ _ _ _ (Errors.UnexpectedResultStatementError "Empty bytes")) = True
+#else
+noRowCount (Errors.QueryError _ _ (Errors.ResultError (Errors.UnexpectedResult "Empty bytes"))) = True
+#endif
+noRowCount _ = False
 
 -- | Run a bare SQL command, such as @BEGIN@ or @COMMIT@.
 runSQL :: Hasql.Connection -> ByteString -> IO ()

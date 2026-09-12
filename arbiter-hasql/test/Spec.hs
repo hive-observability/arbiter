@@ -22,5 +22,10 @@ main = do
     describe "Arbiter.Hasql.Worker" $ Worker.spec connStr
     describe "Arbiter.Hasql.Listener" $ Worker.listenerSpec connStr
     describe "Arbiter.Hasql.MultiQueueListener" $ Worker.multiQueueSpec connStr
+    describe "Arbiter.Hasql.Deadline" $ Worker.deadlineSpec connStr
+    describe "Arbiter.Hasql.Cron" $ Worker.cronSpec connStr
+    describe "Arbiter.Hasql.Reclaim" $ Worker.reclaimSpec connStr
+    describe "Arbiter.Hasql.ConnectionRecovery" $ Worker.connectionRecoverySpec connStr
+    describe "Arbiter.Hasql.Lifecycle" $ Worker.lifecycleSpec connStr
     describe "Arbiter.Hasql.RateLimit" $ RateLimit.spec connStr
     describe "Arbiter.Hasql.ConcurrencyLimit" $ ConcurrencyLimit.spec connStr

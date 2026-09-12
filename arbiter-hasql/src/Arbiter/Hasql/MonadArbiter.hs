@@ -45,7 +45,7 @@ import Hasql.Statement qualified as S
 import UnliftIO (MonadUnliftIO, mask, onException)
 import UnliftIO.Exception (SomeException, try)
 
-import Arbiter.Hasql.Compat (connectionInTransaction, runSQL)
+import Arbiter.Hasql.Compat (connectionInTransaction, noRowCount, runSQL)
 import Arbiter.Hasql.Decode qualified as Decode
 import Arbiter.Hasql.Encode qualified as Encode
 
@@ -88,7 +88,9 @@ hasqlExecuteStatement query = withConn $ \conn -> liftIO $ do
   result <- Hasql.use conn (Session.statement () stmt)
   case result of
     Right rowCount -> pure rowCount
-    Left err -> throwInternal $ "hasql statement error: " <> T.pack (show err)
+    Left err
+      | noRowCount err -> pure 0
+      | otherwise -> throwInternal $ "hasql statement error: " <> T.pack (show err)
 
 -- | Transaction bracket. Nests via savepoints.
 hasqlWithDbTransaction :: (HasPoolState Hasql.Connection m, MonadUnliftIO m) => m a -> m a

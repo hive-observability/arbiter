@@ -3,23 +3,24 @@
 {-# LANGUAGE TypeFamilies #-}
 
 -- | poolConfigForWorkers sizes the pool to the enabled workers.
-module Test.Arbiter.Worker.PoolSizing (spec) where
+module Test.Arbiter.Simple.PoolSizing (spec) where
 
 import Arbiter.Core.HighLevel qualified as HL
 import Arbiter.Core.Job.Types (defaultJob)
 import Arbiter.Core.MonadArbiter (JobHandler)
 import Arbiter.Core.PoolConfig (poolSize)
 import Arbiter.Core.QueueRegistry (Queue)
-import Arbiter.Simple
-  ( SimpleDb
-  , createSimpleEnv
-  , createSimpleEnvWithConfig
-  , destroySimpleEnv
-  , runSimpleDb
-  )
 import Arbiter.Test.Fixtures (WorkerTestPayload (..))
 import Arbiter.Test.Poll (waitUntil)
 import Arbiter.Test.Setup (cleanupOnce, setupOnce)
+import Arbiter.Worker (namedWorkerPool, poolConfigForWorkers, runWorkerPools)
+import Arbiter.Worker.BackoffStrategy (Jitter (NoJitter))
+import Arbiter.Worker.Config
+  ( WorkerConfig (..)
+  , defaultBatchedWorkerConfig
+  , transactionalWorkerConfig
+  , validateWorkerConfig
+  )
 import Control.Monad (forM_, void)
 import Control.Monad.IO.Class (liftIO)
 import Data.ByteString (ByteString)
@@ -31,13 +32,12 @@ import Data.Text qualified as T
 import Test.Hspec (Spec, beforeAll, describe, it, shouldBe, shouldSatisfy)
 import UnliftIO.Async (withAsync)
 
-import Arbiter.Worker (namedWorkerPool, poolConfigForWorkers, runWorkerPools)
-import Arbiter.Worker.BackoffStrategy (Jitter (NoJitter))
-import Arbiter.Worker.Config
-  ( WorkerConfig (..)
-  , defaultBatchedWorkerConfig
-  , transactionalWorkerConfig
-  , validateWorkerConfig
+import Arbiter.Simple
+  ( SimpleDb
+  , createSimpleEnv
+  , createSimpleEnvWithConfig
+  , destroySimpleEnv
+  , runSimpleDb
   )
 
 type SizingTestRegistry = '[Queue "arbiter_worker_sizing_test" WorkerTestPayload]

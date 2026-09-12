@@ -2,7 +2,16 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE TypeFamilies #-}
 
-module Test.Arbiter.Hasql.Worker (spec, listenerSpec, multiQueueSpec) where
+module Test.Arbiter.Hasql.Worker
+  ( spec
+  , listenerSpec
+  , multiQueueSpec
+  , deadlineSpec
+  , cronSpec
+  , reclaimSpec
+  , connectionRecoverySpec
+  , lifecycleSpec
+  ) where
 
 import Arbiter.Core.QueueRegistry (Queue, QueueSpec (..))
 import Arbiter.Test.Setup (addQueueTable, cleanupOnce, setupOnce)
@@ -16,7 +25,8 @@ import GHC.Generics (Generic)
 import Test.Hspec
 
 import Arbiter.Hasql.HasqlDb
-  ( createHasqlEnv
+  ( HasqlEnv
+  , createHasqlEnv
   , createHasqlEnvWithPool
   , destroyHasqlEnv
   , disableListener
@@ -110,3 +120,99 @@ multiQueueSpec connStr =
       cleanupOnce connStr mqSchema mqTableA
       cleanupOnce connStr mqSchema mqTableB
       createHasqlEnv (Proxy @HasqlMultiQRegistry) connStr mqSchema
+
+hasqlHandler :: (job -> m r) -> conn -> job -> m r
+hasqlHandler handler _conn job = handler job
+
+fresh :: Proxy registry -> ByteString -> Text -> IO (HasqlEnv registry)
+fresh proxy connStr schema = cleanupOnce connStr schema schema >> createHasqlEnv proxy connStr schema
+
+deadlineSchema :: Text
+deadlineSchema = "arbiter_hasql_deadline_test"
+
+type HasqlDeadlineRegistry = '[Queue "arbiter_hasql_deadline_test" HasqlWorkerTestPayload]
+
+deadlineSpec :: ByteString -> Spec
+deadlineSpec connStr =
+  beforeAll (setupOnce connStr deadlineSchema deadlineSchema True) $
+    TestKit.deadlineSpec @HasqlWorkerTestPayload
+      deadlineSchema
+      deadlineSchema
+      connStr
+      SimpleTask
+      (fresh (Proxy @HasqlDeadlineRegistry) connStr deadlineSchema)
+      destroyHasqlEnv
+      hasqlHandler
+      runHasqlDb
+
+cronSchema :: Text
+cronSchema = "arbiter_hasql_cron_test"
+
+type HasqlCronRegistry = '[Queue "arbiter_hasql_cron_test" HasqlWorkerTestPayload]
+
+cronSpec :: ByteString -> Spec
+cronSpec connStr =
+  beforeAll (setupOnce connStr cronSchema cronSchema True) $
+    TestKit.cronSpec @HasqlWorkerTestPayload
+      cronSchema
+      cronSchema
+      connStr
+      SimpleTask
+      (fresh (Proxy @HasqlCronRegistry) connStr cronSchema)
+      destroyHasqlEnv
+      runHasqlDb
+
+reclaimSchema :: Text
+reclaimSchema = "arbiter_hasql_reclaim_test"
+
+type HasqlReclaimRegistry = '[Queue "arbiter_hasql_reclaim_test" HasqlWorkerTestPayload]
+
+reclaimSpec :: ByteString -> Spec
+reclaimSpec connStr =
+  beforeAll (setupOnce connStr reclaimSchema reclaimSchema True) $
+    TestKit.reclaimSpec @HasqlWorkerTestPayload
+      reclaimSchema
+      reclaimSchema
+      connStr
+      SimpleTask
+      FailingTask
+      (fresh (Proxy @HasqlReclaimRegistry) connStr reclaimSchema)
+      destroyHasqlEnv
+      hasqlHandler
+      runHasqlDb
+
+recoverySchema :: Text
+recoverySchema = "arbiter_hasql_recovery_test"
+
+type HasqlRecoveryRegistry = '[Queue "arbiter_hasql_recovery_test" HasqlWorkerTestPayload]
+
+connectionRecoverySpec :: ByteString -> Spec
+connectionRecoverySpec connStr =
+  beforeAll (setupOnce connStr recoverySchema recoverySchema True) $
+    TestKit.connectionRecoverySpec @HasqlWorkerTestPayload
+      recoverySchema
+      connStr
+      SimpleTask
+      (fresh (Proxy @HasqlRecoveryRegistry) connStr recoverySchema)
+      destroyHasqlEnv
+      hasqlHandler
+      runHasqlDb
+
+lifecycleSchema :: Text
+lifecycleSchema = "arbiter_hasql_lifecycle_test"
+
+type HasqlLifecycleRegistry = '[QueueWithResult "arbiter_hasql_lifecycle_test" HasqlWorkerTestPayload (Maybe [Text])]
+
+lifecycleSpec :: ByteString -> Spec
+lifecycleSpec connStr =
+  beforeAll (setupOnce connStr lifecycleSchema lifecycleSchema True) $
+    TestKit.lifecycleSpec @HasqlWorkerTestPayload
+      lifecycleSchema
+      lifecycleSchema
+      connStr
+      SimpleTask
+      (fresh (Proxy @HasqlLifecycleRegistry) connStr lifecycleSchema)
+      (disableListener <$> fresh (Proxy @HasqlLifecycleRegistry) connStr lifecycleSchema)
+      destroyHasqlEnv
+      hasqlHandler
+      runHasqlDb
