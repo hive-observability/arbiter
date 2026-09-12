@@ -8,7 +8,7 @@ module Arbiter.Orville.MonadArbiter
   , orvilleRunHandlerWithConnection
   ) where
 
-import Arbiter.Core.Array qualified as Array
+import Arbiter.Orville.Array qualified as Array
 import Arbiter.Core.Codec (Col (..), NullCol (..), ParamType (..), SomeParam (..), runCodec)
 import Arbiter.Core.Exceptions (throwInternal)
 import Arbiter.Core.MonadArbiter (Query (..))

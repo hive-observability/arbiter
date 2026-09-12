@@ -39,15 +39,14 @@ import Arbiter.Core.Backend
   , destroyEnv
   , disableListener
   , runDb
-  , useDedicatedListener
   )
 import Arbiter.Core.Backend qualified as Backend
 import Arbiter.Core.Job.Schema (SchemaName)
-import Arbiter.Core.Listen (libpqListenConn)
 import Arbiter.Core.MonadArbiter (MonadArbiter (..))
 import Arbiter.Core.PoolConfig (PoolConfig)
-import Arbiter.Core.QueueRegistry (JobPayloadRegistry)
 import Arbiter.Core.PoolConfig qualified as PC
+import Arbiter.Core.QueueRegistry (JobPayloadRegistry)
+import Arbiter.LibPQ (libpqListenConn, withLibPQListenConn)
 import Control.Monad.Catch (MonadCatch, MonadMask, MonadThrow)
 import Control.Monad.IO.Class (MonadIO)
 import Control.Monad.Reader (MonadReader, asks)
@@ -73,6 +72,7 @@ newtype SimpleDb (registry :: JobPayloadRegistry) m a = SimpleDb {unSimpleDb :: 
   deriving newtype
     ( Applicative
     , Functor
+    , HasPoolState Connection
     , Monad
     , MonadCatch
     , MonadFail
@@ -81,7 +81,6 @@ newtype SimpleDb (registry :: JobPayloadRegistry) m a = SimpleDb {unSimpleDb :: 
     , MonadReader (SimpleEnv registry)
     , MonadThrow
     , MonadUnliftIO
-    , HasPoolState Connection
     )
 
 instance (MonadUnliftIO m) => MonadArbiter (SimpleDb registry m) where
@@ -179,3 +178,8 @@ createSimpleEnvWithPool _proxy = createEnvWithPool withListenConn
 
 withListenConn :: Backend.WithListenConn Connection
 withListenConn conn action = withConnection conn (action . libpqListenConn)
+
+-- | Give the env a dedicated LISTEN connection opened from a connection string.
+-- The listener takes no pool slot.
+useDedicatedListener :: (MonadIO m) => ByteString -> SimpleEnv registry -> m (SimpleEnv registry)
+useDedicatedListener connStr = Backend.useDedicatedListener (withLibPQListenConn connStr)

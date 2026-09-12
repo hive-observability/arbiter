@@ -21,7 +21,7 @@ import Arbiter.Core.MonadArbiter (HasRegistry, MonadArbiter (..), ResultOf)
 import Arbiter.Core.PoolConfig (PoolConfig (..))
 import Arbiter.Core.QueueRegistry (Queue, RegistryTables)
 import Arbiter.Core.RateLimit.Spec (HasRateLimit (..), limitBy, tokenBucket)
-import Arbiter.Hasql (HasqlDb, createHasqlEnvWithConfig, runHasqlDb)
+import Arbiter.Hasql (HasqlDb, runHasqlDb)
 import Arbiter.Migrations (MigrationResult (..), defaultMigrationConfig, runMigrationsForRegistry)
 import Arbiter.Orville
   ( createOrvilleConnectionOptions
@@ -55,7 +55,8 @@ import Data.Foldable (toList, traverse_)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.Int (Int64)
 import Data.List (find, partition)
-import Data.List.NonEmpty (NonEmpty)
+import Data.List.NonEmpty (NonEmpty (..))
+import Data.List.NonEmpty qualified as NE
 import Data.Proxy (Proxy (..))
 import Data.String (fromString)
 import Data.Tagged (Tagged (..))
@@ -89,6 +90,8 @@ import Test.Tasty (localOption, mkTimeout)
 import Test.Tasty.Bench
 import Test.Tasty.Providers (IsTest (..), singleTest, testPassed)
 import UnliftIO (MonadUnliftIO)
+
+import BenchHasql (hasqlTransports)
 
 benchSchema :: Text
 benchSchema = "arbiter"
@@ -1042,7 +1045,10 @@ main = do
   let benchPoolConfig = PoolConfig {poolSize = 25, poolIdleTimeout = 60, poolStripes = Just 4}
   simpleEnv <- createSimpleEnvWithConfig (Proxy @BenchRegistry) benchConnStr benchSchema benchPoolConfig
 
-  hasqlEnv <- createHasqlEnvWithConfig (Proxy @BenchRegistry) benchConnStr benchSchema benchPoolConfig
+  hasqlEnvs <-
+    traverse
+      (\(label, mkEnv) -> (label,) <$> mkEnv (Proxy @BenchRegistry) benchConnStr benchSchema benchPoolConfig)
+      hasqlTransports
 
   let orvilleOptions = createOrvilleConnectionOptions benchConnStr benchPoolConfig
   orvillePool <- O.createConnectionPool orvilleOptions
@@ -1076,18 +1082,29 @@ main = do
       producerRun = runSimpleDb producerEnv
 
       hasqlRun :: RunM HasqlM
-      hasqlRun = runHasqlDb hasqlEnv
+      hasqlRun = runHasqlDb (snd (NE.head hasqlEnvs))
+      hasqlGroups (label, env) =
+        let run :: RunM HasqlM
+            run = runHasqlDb env
+         in [ bgroup ("Worker Throughput (" <> label <> ")") $
+                mkWorkerBenches simpleEnv (hasqlWorkerTrial run statsConn)
+            , bgroup ("Steady-State Throughput (" <> label <> ")") $
+                steadyStateBenches $
+                  steadyStateTrial run producerRun statsConn $ \workers counter ->
+                    transactionalWorkerConfig workers $ \(_conn :: Hasql.Connection) job ->
+                      flakyGate (countProcessed counter) job
+            , bgroup ("Gating Overhead (" <> label <> ")") $
+                gatingBenches settleGated (hasqlGatedSteadyTrial run producerRun statsConn)
+            ]
 
       orvilleRun :: RunM OrvilleM
       orvilleRun action = runReaderT (unBenchOrville action) (benchSchema, orvilleState)
 
-  defaultMain $
-    map
+  defaultMain
+    $ map
       (localOption (mkTimeout benchTimeout))
-      [ bgroup "Worker Throughput (simple)" $
+    $ [ bgroup "Worker Throughput (simple)" $
           mkWorkerBenches simpleEnv (simpleWorkerTrial simpleRun statsConn)
-      , bgroup "Worker Throughput (hasql)" $
-          mkWorkerBenches simpleEnv (hasqlWorkerTrial hasqlRun statsConn)
       , bgroup "Group Cardinality and Skew (hasql)" $
           groupShapeBenches statsConn simpleEnv hasqlRun
       , bgroup "Worker Throughput (orville)" $
@@ -1097,18 +1114,12 @@ main = do
             steadyStateTrial simpleRun producerRun statsConn $ \workers counter ->
               transactionalWorkerConfig workers $ \(_conn :: Connection) job ->
                 flakyGate (countProcessed counter) job
-      , bgroup "Steady-State Throughput (hasql)" $
-          steadyStateBenches $
-            steadyStateTrial hasqlRun producerRun statsConn $ \workers counter ->
-              transactionalWorkerConfig workers $ \(_conn :: Hasql.Connection) job ->
-                flakyGate (countProcessed counter) job
       , bgroup "Steady-State Throughput (orville)" $
           steadyStateBenches $
             steadyStateTrial orvilleRun producerRun statsConn $ \workers counter ->
               transactionalWorkerConfig workers $ \job -> flakyGate (countProcessed counter) job
-      , bgroup "Gating Overhead (hasql)" $
-          gatingBenches settleGated (hasqlGatedSteadyTrial hasqlRun producerRun statsConn)
       ]
+      <> concatMap hasqlGroups (NE.toList hasqlEnvs)
 
 -- | Measure the group-maintenance cost as group size and key skew increase.
 -- A smaller trial set keeps this diagnostic suite practical.

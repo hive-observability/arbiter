@@ -65,12 +65,12 @@ library
 
   if flag(hasql2)
     build-depends:
-      , hasql    >=2.0 && <2.1
-      , pqi      >=1.0 && <1.2
-      , pqi-ffi  >=1.0 && <1.1
+      , hasql  >=2.0 && <2.1
+      , pqi    >=1.0 && <1.2
 
   else
     build-depends:
+      , arbiter-libpq     >=0.1  && <0.2
       , hasql             >=1.9  && <1.11
       , postgresql-libpq  >=0.10 && <0.12
 
@@ -102,3 +102,6 @@ test-suite arbiter-hasql-tests
     , postgresql-simple
     , resource-pool
     , text
+
+  if flag(hasql2)
+    build-depends: pqi-ffi >=1.0 && <1.1

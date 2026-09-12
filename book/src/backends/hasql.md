@@ -4,9 +4,14 @@ This backend uses `hasql` and `resource-pool`. Handlers receive a
 `Hasql.Connection` for typed queries in the worker transaction.
 
 ```haskell
-env <- ArbH.createHasqlEnv (Proxy @AppRegistry) connStr "arbiter"
+import Pqi.Ffi qualified as Ffi
+
+env <- ArbH.createHasqlEnv (Proxy @AppRegistry) Ffi.adapter connStr "arbiter"
 ArbH.runHasqlDb env $ Arb.insertJob (Arb.defaultJob $ SendWelcome "alice@example.com" "Alice")
 ```
+
+The adapter is the transport. `pqi-ffi` wraps libpq. `pqi-native` is pure
+Haskell and needs no C library. On hasql 1.x the constructors take no adapter.
 
 Share a transaction with external hasql work:
 
@@ -18,8 +23,8 @@ ArbH.inTransaction @AppRegistry conn "arbiter" $
 _ <- Hasql.use conn (Session.script "COMMIT")
 ```
 
-Bring your own pool. On hasql 2 you pick the transport adapter when you open
-connections. The env constructors use the libpq adapter from `pqi-ffi`:
+Bring your own pool. The env borrows one pool connection for `LISTEN/NOTIFY`,
+whichever adapter opened it:
 
 ```haskell
 import Data.Pool (defaultPoolConfig, newPool)
@@ -29,7 +34,5 @@ let acquire = Hasql.acquire Ffi.adapter (ArbH.hasqlSettings connStr) >>= either 
 pool <- newPool (defaultPoolConfig acquire Hasql.release 60 10)
 env <- ArbH.createHasqlEnvWithPool (Proxy @AppRegistry) pool "arbiter"
 ```
-
-On hasql 1.x, `Hasql.acquire` takes only the settings.
 
 See the [arbiter-hasql haddocks](https://arbiterq.dev/arbiter-hasql/Arbiter-Hasql.html) for the env and pool constructors.

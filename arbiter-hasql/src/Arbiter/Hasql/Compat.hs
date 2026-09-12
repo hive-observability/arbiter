@@ -27,13 +27,12 @@ import Arbiter.Core.Listen (Notification (..))
 import Control.Monad ((>=>))
 import Hasql.Connection.Settings qualified as Settings
 import Pqi qualified as PQ
-import Pqi.Ffi qualified as Ffi
 #elif MIN_VERSION_hasql(1,10,0)
-import Arbiter.Core.Listen (libpqListenConn)
+import Arbiter.LibPQ (libpqListenConn)
 import Database.PostgreSQL.LibPQ qualified as PQ
 import Hasql.Connection.Settings qualified as Settings
 #else
-import Arbiter.Core.Listen (libpqListenConn)
+import Arbiter.LibPQ (libpqListenConn)
 import Database.PostgreSQL.LibPQ qualified as PQ
 import Hasql.Connection.Setting qualified as Setting
 import Hasql.Connection.Setting.Connection qualified as ConnSetting
@@ -62,11 +61,12 @@ runScript :: T.Text -> Session.Session ()
 runScript = Session.sql
 #endif
 
--- | Open a connection, describing any failure.
-hasqlAcquire :: HasqlSettings -> IO (Either String Hasql.Connection)
+-- | Open a connection, describing any failure. hasql 2 takes the transport adapter first.
 #if MIN_VERSION_hasql(2,0,0)
-hasqlAcquire settings = either (Left . show) Right <$> Hasql.acquire Ffi.adapter settings
+hasqlAcquire :: PQ.Adapter -> HasqlSettings -> IO (Either String Hasql.Connection)
+hasqlAcquire adapter settings = either (Left . show) Right <$> Hasql.acquire adapter settings
 #else
+hasqlAcquire :: HasqlSettings -> IO (Either String Hasql.Connection)
 hasqlAcquire settings = either (Left . show) Right <$> Hasql.acquire settings
 #endif
 

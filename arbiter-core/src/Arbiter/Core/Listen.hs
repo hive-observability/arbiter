@@ -1,23 +1,17 @@
 {-# LANGUAGE OverloadedStrings #-}
 
--- | Backend-agnostic LISTEN/NOTIFY hub over one libpq connection per env.
+-- | Backend-agnostic LISTEN/NOTIFY hub over one connection per env.
 module Arbiter.Core.Listen
   ( Notification (..)
   , ListenConn (..)
-  , libpqListenConn
   , Listener
   , RunningHub
   , HubLog (..)
   , withChannels
-  , newPoolListener
-
-    -- * Dedicated-connection listener
-  , DedicatedListen
-  , newDedicatedListen
-  , dedicatedListener
+  , newListener
   ) where
 
-import Control.Concurrent (threadDelay, threadWaitRead, threadWaitWrite)
+import Control.Concurrent (threadDelay)
 import Control.Concurrent.MVar
   ( MVar
   , modifyMVar
@@ -38,9 +32,8 @@ import Control.Concurrent.STM
   , readTVarIO
   , writeTVar
   )
-import Control.Exception (bracket, onException, uninterruptibleMask_)
-import Control.Monad (unless, void, when, (>=>))
-import Control.Monad.IO.Class (MonadIO, liftIO)
+import Control.Exception (bracket, uninterruptibleMask_)
+import Control.Monad (unless, void, when)
 import Data.ByteString (ByteString)
 import Data.ByteString.Char8 qualified as BSC
 import Data.Foldable (for_, traverse_)
@@ -55,7 +48,6 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import Data.Time (NominalDiffTime)
-import Database.PostgreSQL.LibPQ qualified as PQ
 import GHC.Clock (getMonotonicTime)
 import GHC.Conc (threadWaitReadSTM)
 import System.Posix.Types (Fd)
@@ -110,24 +102,9 @@ data ListenConn = ListenConn
   , listenEscapeIdentifier :: ByteString -> IO (Maybe ByteString)
   }
 
--- | A 'ListenConn' over a libpq connection.
-libpqListenConn :: PQ.Connection -> ListenConn
-libpqListenConn conn =
-  ListenConn
-    { listenNotifies = fmap toNotification <$> PQ.notifies conn
-    , listenSocket = PQ.socket conn
-    , listenConsumeInput = PQ.consumeInput conn
-    , listenExec = PQ.exec conn >=> maybe (pure (Left "returned no result")) commandOk
-    , listenEscapeIdentifier = PQ.escapeIdentifier conn
-    }
-  where
-    commandOk res = do
-      status <- PQ.resultStatus res
-      pure $ if status == PQ.CommandOk then Right () else Left ("failed with " <> T.pack (show status))
-
--- | Build a pool-backed 'Listener' with a fresh hub slot from a connection runner.
-newPoolListener :: ((ListenConn -> IO ()) -> IO ()) -> IO Listener
-newPoolListener withConn = do
+-- | A 'Listener' with a fresh hub slot over a connection runner.
+newListener :: ((ListenConn -> IO ()) -> IO ()) -> IO Listener
+newListener withConn = do
   slot <- newMVar Nothing
   pure (Listener slot withConn)
 
@@ -335,61 +312,6 @@ hubLoggers hub = registrants <$> readTVarIO (hubHandlers hub)
     registrants handlers =
       Map.elems (Map.fromList [(regId, logger) | registrations <- Map.elems handlers, (regId, logger, _) <- registrations])
 
-toNotification :: PQ.Notify -> Notification
-toNotification notify =
-  Notification
-    { notificationChannel = PQ.notifyRelname notify
-    , notificationData = PQ.notifyExtra notify
-    }
-
 -- | Quote a channel name as a SQL identifier, doubling embedded quotes.
 quoteChannel :: ByteString -> ByteString
 quoteChannel = TE.encodeUtf8 . quoteIdentifier . TE.decodeUtf8
-
--- | A listener over its own libpq connection opened from a connection string.
-data DedicatedListen = DedicatedListen
-  { dedicatedSlot :: MVar (Maybe RunningHub)
-  , dedicatedConnStr :: ByteString
-  }
-
--- | Allocate a 'DedicatedListen' from a connection string, once at startup.
-newDedicatedListen :: (MonadIO m) => ByteString -> m DedicatedListen
-newDedicatedListen connStr = liftIO $ do
-  slot <- newMVar Nothing
-  pure (DedicatedListen slot connStr)
-
--- | The 'Listener' for a 'DedicatedListen'.
-dedicatedListener :: DedicatedListen -> Listener
-dedicatedListener dedicated =
-  Listener
-    { listenerSlot = dedicatedSlot dedicated
-    , listenerWithConn = \action ->
-        bracket (interruptibleConnectDb (dedicatedConnStr dedicated)) PQ.finish $ \conn -> do
-          status <- PQ.status conn
-          case status of
-            PQ.ConnectionOk -> action (libpqListenConn conn)
-            _ -> do
-              merr <- PQ.errorMessage conn
-              throwInternal $
-                "connect failed" <> foldMap ((": " <>) . T.pack . BSC.unpack) merr
-    }
-
--- | Open a libpq connection asynchronously. A teardown cancel interrupts the connect.
-interruptibleConnectDb :: ByteString -> IO PQ.Connection
-interruptibleConnectDb connStr = do
-  conn <- PQ.connectStart connStr
-  status <- PQ.status conn
-  case status of
-    PQ.ConnectionBad -> pure conn
-    _ -> (poll conn >> pure conn) `onException` PQ.finish conn
-  where
-    poll conn = do
-      status <- PQ.connectPoll conn
-      case status of
-        PQ.PollingReading -> waitSocket conn threadWaitRead >> poll conn
-        PQ.PollingWriting -> waitSocket conn threadWaitWrite >> poll conn
-        _ -> pure ()
-    waitSocket conn wait =
-      PQ.socket conn >>= \case
-        Just socketFd -> wait socketFd
-        Nothing -> throwInternal "connection has no socket during connect"

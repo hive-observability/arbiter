@@ -39,7 +39,7 @@ import UnliftIO (MonadUnliftIO, mask, onException, withRunInIO)
 
 import Arbiter.Core.Exceptions (throwInternal)
 import Arbiter.Core.Job.Schema (SchemaName)
-import Arbiter.Core.Listen (ListenConn, Listener, dedicatedListener, newDedicatedListen, newPoolListener)
+import Arbiter.Core.Listen (ListenConn, Listener, newListener)
 import Arbiter.Core.PoolConfig (PoolConfig (..))
 import Arbiter.Core.QueueRegistry (JobPayloadRegistry)
 
@@ -109,19 +109,19 @@ destroyEnv env = liftIO $ traverse_ destroyAllResources (connectionPool (poolSta
 disableListener :: Env conn registry -> Env conn registry
 disableListener env = env {listener = Nothing}
 
--- | Give the env a dedicated LISTEN connection opened from a connection string.
--- The listener takes no pool slot.
-useDedicatedListener :: (MonadIO m) => ByteString -> Env conn registry -> m (Env conn registry)
-useDedicatedListener connStr env = do
-  dedicated <- newDedicatedListen connStr
-  pure env {listener = Just (dedicatedListener dedicated)}
+-- | Give the env a LISTEN connection of its own from a connection runner. The
+-- listener takes no pool slot.
+useDedicatedListener :: (MonadIO m) => ((ListenConn -> IO ()) -> IO ()) -> Env conn registry -> m (Env conn registry)
+useDedicatedListener withDedicated env = liftIO $ do
+  lstn <- newListener withDedicated
+  pure env {listener = Just lstn}
 
 -- | Run the listener loop on a connection's driver handle.
 type WithListenConn conn = conn -> (ListenConn -> IO ()) -> IO ()
 
 -- | A listener that borrows one pool connection for the hub's lifetime.
 poolListener :: WithListenConn conn -> Pool conn -> IO Listener
-poolListener withListenConn pool = newPoolListener (\action -> withResource pool (`withListenConn` action))
+poolListener withListenConn pool = newListener (\action -> withResource pool (`withListenConn` action))
 
 -- | Create an env over a new pool opened with the connect and release actions.
 createEnvWithConfig

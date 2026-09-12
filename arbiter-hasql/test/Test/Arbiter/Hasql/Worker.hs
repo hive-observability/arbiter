@@ -26,13 +26,12 @@ import Test.Hspec
 
 import Arbiter.Hasql.HasqlDb
   ( HasqlEnv
-  , createHasqlEnv
   , createHasqlEnvWithPool
   , destroyHasqlEnv
   , disableListener
   , runHasqlDb
   )
-import Test.Arbiter.Hasql.TestHelpers (createHasqlPool)
+import Test.Arbiter.Hasql.TestHelpers (createHasqlPool, createHasqlTestEnv)
 
 workerTestSchemaName :: Text
 workerTestSchemaName = "arbiter_hasql_worker_test"
@@ -72,9 +71,9 @@ listenerSpec connStr =
       listenSchema
       connStr
       SimpleTask
-      (cleanupOnce connStr listenSchema listenSchema >> createHasqlEnv (Proxy @HasqlListenRegistry) connStr listenSchema)
+      (cleanupOnce connStr listenSchema listenSchema >> createHasqlTestEnv (Proxy @HasqlListenRegistry) connStr listenSchema)
       ( cleanupOnce connStr listenSchema listenSchema
-          >> (disableListener <$> createHasqlEnv (Proxy @HasqlListenRegistry) connStr listenSchema)
+          >> (disableListener <$> createHasqlTestEnv (Proxy @HasqlListenRegistry) connStr listenSchema)
       )
       destroyHasqlEnv
       (\handler _conn job -> handler job)
@@ -119,13 +118,13 @@ multiQueueSpec connStr =
     mkEnv = do
       cleanupOnce connStr mqSchema mqTableA
       cleanupOnce connStr mqSchema mqTableB
-      createHasqlEnv (Proxy @HasqlMultiQRegistry) connStr mqSchema
+      createHasqlTestEnv (Proxy @HasqlMultiQRegistry) connStr mqSchema
 
 hasqlHandler :: (job -> m r) -> conn -> job -> m r
 hasqlHandler handler _conn job = handler job
 
 fresh :: Proxy registry -> ByteString -> Text -> IO (HasqlEnv registry)
-fresh proxy connStr schema = cleanupOnce connStr schema schema >> createHasqlEnv proxy connStr schema
+fresh proxy connStr schema = cleanupOnce connStr schema schema >> createHasqlTestEnv proxy connStr schema
 
 deadlineSchema :: Text
 deadlineSchema = "arbiter_hasql_deadline_test"

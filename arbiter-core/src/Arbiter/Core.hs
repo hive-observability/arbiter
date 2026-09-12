@@ -51,14 +51,10 @@ module Arbiter.Core
     -- Import it from @Arbiter.Core.Listen@.
   , Listener
   , ListenConn (..)
-  , libpqListenConn
   , RunningHub
   , HubLog (..)
   , withChannels
-  , newPoolListener
-  , DedicatedListen
-  , newDedicatedListen
-  , dedicatedListener
+  , newListener
   ) where
 
 import Arbiter.Core.Codec
@@ -79,15 +75,11 @@ import Arbiter.Core.Job.Types
 import Arbiter.Core.JobResult
 import Arbiter.Core.JobTree hiding (insertJobTree) -- use HighLevel.insertJobTree
 import Arbiter.Core.Listen
-  ( DedicatedListen
-  , HubLog (..)
+  ( HubLog (..)
   , ListenConn (..)
   , Listener
   , RunningHub
-  , dedicatedListener
-  , libpqListenConn
-  , newDedicatedListen
-  , newPoolListener
+  , newListener
   , withChannels
   )
 import Arbiter.Core.MonadArbiter

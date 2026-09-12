@@ -19,10 +19,11 @@ A producer process that does not start a pool does not open this connection.
 While workers run, the listener uses one pool connection.
 
 On the provided backends, `useDedicatedListener` creates a separate listener
-connection:
+connection. The hasql backend takes the transport adapter first on hasql 2:
 
 ```haskell
 env <- ArbS.useDedicatedListener connStr =<< ArbS.createSimpleEnv (Proxy @AppRegistry) connStr "arbiter"
+env <- ArbH.useDedicatedListener Ffi.adapter connStr =<< ArbH.createHasqlEnv (Proxy @AppRegistry) Ffi.adapter connStr "arbiter"
 ```
 
 `disableListener` disables the listener and uses polling mode:

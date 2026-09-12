@@ -47,7 +47,6 @@ library
     Arbiter.Concurrency
     Arbiter.Core
     Arbiter.Core.Admission
-    Arbiter.Core.Array
     Arbiter.Core.Backend
     Arbiter.Core.Codec
     Arbiter.Core.Concurrency.Schema
@@ -122,8 +121,6 @@ library
     , hs-opentelemetry-propagator-w3c  >=1.0  && <1.1
     , mtl                              >=2.2  && <2.4
     , neat-interpolation               >=0.5  && <0.6
-    , postgresql-libpq                 >=0.10 && <0.12
-    , postgresql-simple                >=0.6  && <0.8
     , resource-pool                    >=0.4  && <0.6
     , selective                        >=0.5  && <0.8
     , stm                              >=2.5  && <2.6

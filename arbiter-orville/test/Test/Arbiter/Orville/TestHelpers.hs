@@ -12,9 +12,10 @@ module Test.Arbiter.Orville.TestHelpers
   , TestOrville (..)
   ) where
 
-import Arbiter.Core.Listen (DedicatedListen, dedicatedListener, newDedicatedListen)
+import Arbiter.Core.Listen (Listener)
 import Arbiter.Core.MonadArbiter (MonadArbiter (..))
 import Arbiter.Core.QueueRegistry (JobPayloadRegistry)
+import Arbiter.LibPQ (newLibPQListener)
 import Arbiter.Test.Setup qualified as TestSetup
 import Control.Monad (void)
 import Control.Monad.Catch (MonadCatch, MonadMask, MonadThrow)
@@ -43,7 +44,7 @@ data OrvilleTestEnv (registry :: JobPayloadRegistry) = OrvilleTestEnv
   , testConnStr :: ByteString
   , testOrvilleState :: O.OrvilleState
   , testPool :: O.ConnectionPool
-  , testListen :: Maybe DedicatedListen
+  , testListen :: Maybe Listener
   }
 
 -- | Test monad that provides both OrvilleState and ArbiterEnv
@@ -69,7 +70,7 @@ instance MonadArbiter (TestOrville registry) where
   executeStatement = orvilleExecuteStatement
   withDbTransaction = orvilleWithDbTransaction
   runHandlerWithConnection = orvilleRunHandlerWithConnection
-  getListener = TestOrville $ asks (fmap dedicatedListener . testListen)
+  getListener = TestOrville $ asks testListen
 
 -- Helper to execute raw SQL
 executeSql :: (O.MonadOrville m) => Text -> m ()
@@ -97,7 +98,7 @@ createOrvilleTestEnv connStr schemaName tableName maxConns = do
           }
   orvillePool <- O.createConnectionPool options
   let orvilleState = O.newOrvilleState O.defaultErrorDetailLevel orvillePool
-  listen <- newDedicatedListen connStr
+  listen <- newLibPQListener connStr
 
   pure $
     OrvilleTestEnv

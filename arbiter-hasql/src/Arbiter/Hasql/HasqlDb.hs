@@ -1,3 +1,4 @@
+{-# LANGUAGE CPP #-}
 {-# LANGUAGE DeriveAnyClass #-}
 {-# LANGUAGE TypeFamilies #-}
 
@@ -47,15 +48,14 @@ import Arbiter.Core.Backend
   , destroyEnv
   , disableListener
   , runDb
-  , useDedicatedListener
   )
 import Arbiter.Core.Backend qualified as Backend
 import Arbiter.Core.Job.Schema (SchemaName)
 import Arbiter.Core.MonadArbiter (MonadArbiter (..))
 import Arbiter.Core.PoolConfig (PoolConfig)
-import Arbiter.Core.QueueRegistry (JobPayloadRegistry)
 import Arbiter.Core.PoolConfig qualified as PC
-import Control.Exception (Exception, throwIO)
+import Arbiter.Core.QueueRegistry (JobPayloadRegistry)
+import Control.Exception (Exception, bracket, throwIO)
 import Control.Monad.Catch (MonadCatch, MonadMask, MonadThrow)
 import Control.Monad.IO.Class (MonadIO)
 import Control.Monad.Reader (MonadReader, asks)
@@ -64,6 +64,10 @@ import Data.Pool (Pool)
 import Data.Proxy (Proxy (..))
 import Hasql.Connection qualified as Hasql
 import UnliftIO (MonadUnliftIO)
+
+#if MIN_VERSION_hasql(2,0,0)
+import Pqi (Adapter)
+#endif
 
 import Arbiter.Hasql.Compat (hasqlAcquire, hasqlSettings, withHasqlListenConn)
 import Arbiter.Hasql.MonadArbiter
@@ -87,6 +91,7 @@ newtype HasqlDb (registry :: JobPayloadRegistry) m a = HasqlDb {unHasqlDb :: Db 
   deriving newtype
     ( Applicative
     , Functor
+    , HasPoolState Hasql.Connection
     , Monad
     , MonadCatch
     , MonadFail
@@ -95,7 +100,6 @@ newtype HasqlDb (registry :: JobPayloadRegistry) m a = HasqlDb {unHasqlDb :: Db 
     , MonadReader (HasqlEnv registry)
     , MonadThrow
     , MonadUnliftIO
-    , HasPoolState Hasql.Connection
     )
 
 instance (MonadUnliftIO m) => MonadArbiter (HasqlDb registry m) where
@@ -136,6 +140,51 @@ inTransaction
   -> m a
 inTransaction conn schemaName = Backend.inTransaction conn schemaName . unHasqlDb
 
+#if MIN_VERSION_hasql(2,0,0)
+-- | Create a 'HasqlEnv' with conservative pool defaults. Size worker pools with
+-- 'createHasqlEnvWithConfig' and @poolConfigForWorkers@.
+createHasqlEnv
+  :: forall registry m
+   . (MonadIO m)
+  => Proxy registry
+  -> Adapter
+  -- ^ Transport, such as @Pqi.Ffi.adapter@ or @Pqi.Native.adapter@
+  -> ByteString
+  -- ^ PostgreSQL connection string
+  -> SchemaName
+  -- ^ Schema name
+  -> m (HasqlEnv registry)
+createHasqlEnv proxy adapter connStr schemaName =
+  createHasqlEnvWithConfig proxy adapter connStr schemaName PC.defaultPoolConfig
+
+-- | Create a 'HasqlEnv' with custom pool settings.
+createHasqlEnvWithConfig
+  :: forall registry m
+   . (MonadIO m)
+  => Proxy registry
+  -> Adapter
+  -- ^ Transport, such as @Pqi.Ffi.adapter@ or @Pqi.Native.adapter@
+  -> ByteString
+  -- ^ PostgreSQL connection string
+  -> SchemaName
+  -- ^ Schema name
+  -> PoolConfig
+  -> m (HasqlEnv registry)
+createHasqlEnvWithConfig _proxy adapter connStr =
+  createEnvWithConfig withHasqlListenConn (acquireOrThrow adapter connStr) Hasql.release
+
+-- | Give the env a dedicated LISTEN connection opened from a connection string.
+-- The listener takes no pool slot.
+useDedicatedListener :: (MonadIO m) => Adapter -> ByteString -> HasqlEnv registry -> m (HasqlEnv registry)
+useDedicatedListener adapter connStr = Backend.useDedicatedListener withDedicated
+  where
+    withDedicated action =
+      bracket (acquireOrThrow adapter connStr) Hasql.release (`withHasqlListenConn` action)
+
+acquireOrThrow :: Adapter -> ByteString -> IO Hasql.Connection
+acquireOrThrow adapter connStr =
+  hasqlAcquire adapter (hasqlSettings connStr) >>= either (throwIO . HasqlConnectionError) pure
+#else
 -- | Create a 'HasqlEnv' with conservative pool defaults. Size worker pools with
 -- 'createHasqlEnvWithConfig' and @poolConfigForWorkers@.
 createHasqlEnv
@@ -162,9 +211,20 @@ createHasqlEnvWithConfig
   -> PoolConfig
   -> m (HasqlEnv registry)
 createHasqlEnvWithConfig _proxy connStr =
-  createEnvWithConfig withHasqlListenConn acquire Hasql.release
+  createEnvWithConfig withHasqlListenConn (acquireOrThrow connStr) Hasql.release
+
+-- | Give the env a dedicated LISTEN connection opened from a connection string.
+-- The listener takes no pool slot.
+useDedicatedListener :: (MonadIO m) => ByteString -> HasqlEnv registry -> m (HasqlEnv registry)
+useDedicatedListener connStr = Backend.useDedicatedListener withDedicated
   where
-    acquire = hasqlAcquire (hasqlSettings connStr) >>= either (throwIO . HasqlConnectionError) pure
+    withDedicated action =
+      bracket (acquireOrThrow connStr) Hasql.release (`withHasqlListenConn` action)
+
+acquireOrThrow :: ByteString -> IO Hasql.Connection
+acquireOrThrow connStr =
+  hasqlAcquire (hasqlSettings connStr) >>= either (throwIO . HasqlConnectionError) pure
+#endif
 
 -- | Create a 'HasqlEnv' over a caller's own connection pool. The shared listener
 -- holds one pool connection for the env's lifetime. Size the pool for the worker
