@@ -13,7 +13,7 @@ module Arbiter.Core.Sql.Queues
 import Data.Int (Int64)
 import Data.Text (Text)
 
-import Arbiter.Core.Codec (queueRowCodec)
+import Arbiter.Core.Codec (codecColumns, joinColumns, queueRowCodec)
 import Arbiter.Core.Job.Schema (SchemaName, pauseNotifyChannelPrefix)
 import Arbiter.Core.Queues (QueueRow, arbiterQueuesTable)
 import Arbiter.Core.Sql.QQ (sql)
@@ -23,7 +23,7 @@ import Arbiter.Core.Worker (arbiterWorkersTable)
 
 -- | The @arbiter_queues@ read columns, in codec order.
 queueColumnList :: Text
-queueColumnList = "queue_name, paused, paused_at, metadata, created_at, updated_at"
+queueColumnList = joinColumns (codecColumns queueRowCodec)
 
 -- | Insert an arbiter_queues row with defaults if one doesn't already exist.
 ensureQueueSQL :: SchemaName -> Text -> Query ()

@@ -1,11 +1,8 @@
 # Rate Limiting
 
-Use an arbitrary key to limit the job rate. A policy applies to all queues in a
-registry. One policy can control a resource used by multiple queues.
-
-Define a `HasRateLimit` instance for the payload. Its `rateLimitFor` function
-selects a policy for each job. The migration finds and initializes all policies
-that the selector can use. A separate policy list is not required.
+A policy limits the claim rate per key across every queue in the registry.
+`HasRateLimit` selects a policy and key for each job. The migration creates
+every policy the selector can return.
 
 ```haskell
 import Arbiter.RateLimit
@@ -25,19 +22,21 @@ instance HasRateLimit EmailPayload where
       (limitBy bulk recipientDomain)
 ```
 
-`tokenBucket prefix n period` permits `n` jobs in each period and a burst of up
-to `n` jobs. To configure the burst independently, construct a `Policy`. Set
-`policyMax` for the burst. Set `policyRefill` and `policyInterval` for the
-sustained rate. Use `rateLimitCost` to assign a higher cost to a job. Use
-`addRateLimitTokens` to add tokens manually.
+`tokenBucket prefix n period` admits `n` jobs per `period` seconds with a burst
+of `n`. For a different burst, build a `Policy`:
 
-When a bucket denies a job, Arbiter makes the job invisible until sufficient
-tokens are available. Arbiter does not poll the denied job. The API and admin
-UI show the number of throttled jobs for each policy. An operator can also
-change a policy at run time.
+| Field | Meaning |
+| --- | --- |
+| `policyMax` | burst |
+| `policyRefill`, `policyInterval` | tokens added per interval |
 
-A fixed window is a manual bucket: declare it with a refill of 0 and reset it
-at the boundary from a cron.
+`rateLimitCost` sets a job's cost above 1. `addRateLimitTokens` adds tokens by
+hand.
+
+A denied job is invisible until its bucket has enough tokens. The API and admin
+UI show the throttled count per policy and accept policy changes at run time.
+
+A fixed window is a bucket with refill 0, reset from a cron:
 
 ```haskell
 daily :: Policy
@@ -53,36 +52,27 @@ daily =
 resetRateLimitBuckets (policyPrefixOf daily)
 ```
 
-Bucket state is not durable by default. After a database crash or failover,
-each bucket resets to full. Each key can then use one maximum burst before the
-sustained rate applies. Use durable buckets for strict external quotas or
-manual buckets that represent credit. Durable bucket state persists across a
-restart, but can reduce throughput:
+## Durability
+
+Buckets are unlogged by default. After a crash or failover every bucket is
+full. Durable buckets survive a restart and cost throughput:
 
 ```haskell
 runMigrationsForRegistry (Proxy @AppRegistry) connStr "arbiter"
   defaultMigrationConfig { rateLimitDurability = Durable }
 ```
 
-Durability is a property of the migrated schema. It is not a property of the
-registry type. The same registry can use an unlogged staging schema and a
-durable production schema.
+Durability is set per migrated schema.
 
 > [!IMPORTANT]
-> A job uses tokens when Arbiter **claims** it. Retries and redeliveries use
-> tokens again. Configure policies for the claim rate.
+> Tokens are spent at claim. Retries and redeliveries spend tokens again.
 >
-> Arbiter limits a `rateLimitCost` to the bucket maximum. A job with a higher
-> cost empties a full bucket and can run. A rate limit controls arrivals over
-> time. Use a concurrency limit to control the number of simultaneous jobs.
+> A cost above `policyMax` is clamped to `policyMax`.
 
 ## HTTP 429 Responses
 
-Select the response based on the scope of the limit.
-
-**One key is throttled.** Empty the bucket for that key. Jobs with the same key
-then wait for a refill. Nack the current job. Read the key from the job to use
-the suffix that the claim operation used:
+**One key is throttled.** Empty its bucket, set the visibility timeout to
+`Retry-After`, and nack:
 
 ```haskell
 import Arbiter.RateLimit (addRateLimitTokens)
@@ -92,28 +82,19 @@ sendEmail job cbs = do
   outcome <- liftIO $ postToVendor (Arb.payload job)
   case outcome of
     TooManyRequests retryAfter -> do
-      -- Empty the bucket. Any amount at or above its burst works, tokens floor at zero.
+      -- Empty the bucket. Any amount at or above the burst works. Tokens stop at zero.
       traverse_ (\key -> addRateLimitTokens key (-1000)) (Arb.jobRateLimitKey (Arb.payloadKeys job))
       void $ Arb.setVisibilityTimeout retryAfter job
       Worker.nack cbs job
     Sent -> Worker.ack cbs job
 ```
 
-`Nothing` means that the selector did not assign a policy to the job. There is
-no bucket to empty. An empty bucket refills according to its policy.
-
 > [!IMPORTANT]
-> This example uses a manual handler. With `transactionalWorkerConfig`, the
-> bucket update and handler run in one transaction. A retry rolls back the
-> bucket update. Manual and batched callbacks commit independently.
+> With `transactionalWorkerConfig` the bucket update rolls back with the
+> retry. Manual and batched callbacks commit on their own.
 
-`throwRetryable` does not specify a delay. The pool calculates the delay from
-the attempt count, `backoffStrategy`, and jitter. To use a `Retry-After` value,
-set the job visibility period and nack the job.
-
-**The complete policy is too fast.** Set a lower override and clear it when the
-vendor recovers. Both functions accept the declared policy. Import that policy
-to prevent a duplicate declaration:
+**The whole policy is too fast.** Override the policy. Clear the override when
+the vendor recovers:
 
 ```haskell
 import Arbiter.RateLimit (Policy (..), clearRateLimit, setRateLimit)
@@ -126,8 +107,5 @@ void $ setRateLimit transactional {policyRefill = policyRefill transactional / 2
 -- back to what the code declares
 void $ clearRateLimit transactional
 ```
-
-`setRateLimit` overrides burst, refill, and interval together. A record update
-on the declared policy changes one field and leaves the rest alone.
 
 See the [`Arbiter.RateLimit` haddocks](https://arbiterq.dev/arbiter-core/Arbiter-RateLimit.html) for the selector DSL and the policy type.

@@ -5,6 +5,7 @@ packages:
   arbiter-worker-testkit
   arbiter-simple
   arbiter-hasql
+  arbiter-libpq
   arbiter-orville
   arbiter-servant
   arbiter-servant-openapi

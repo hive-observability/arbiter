@@ -93,7 +93,6 @@ test-suite arbiter-otel-tests
     , hs-opentelemetry-propagator-w3c
     , hs-opentelemetry-sdk
     , hspec
-    , postgresql-simple
     , text
     , time
     , unliftio

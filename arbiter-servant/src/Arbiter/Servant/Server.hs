@@ -39,7 +39,7 @@ import Arbiter.Core.QueueRegistry (JobPayloadRegistry, RegistryTables (..), Spec
 import Arbiter.Core.Queues qualified as Queues
 import Arbiter.Core.Sql.Jobs (ArchiveSortColumn, DLQSortColumn, JobFilter (..), JobSortColumn, SortDir)
 import Arbiter.Core.Trace (withPublishSpan)
-import Arbiter.Simple (SimpleConnectionPool (..), SimpleDb, SimpleEnv (..), createSimpleEnvWithConfig, runSimpleDb)
+import Arbiter.Simple (Env (..), PoolState (..), SimpleDb, SimpleEnv, createSimpleEnvWithConfig, runSimpleDb)
 import Arbiter.Worker (MaintenancePace (..), runMaintenancePass, storeEncodedResult)
 import Arbiter.Worker.Config (maintenanceOpName)
 import Arbiter.Worker.Cron (nextRunFromExpression, updateCronScheduleChecked)
@@ -61,7 +61,7 @@ import Control.Concurrent.STM
   , readTVarIO
   , writeTChan
   )
-import Control.Exception (SomeAsyncException, SomeException, bracket, bracket_, fromException, handle, throwIO, try)
+import Control.Exception (bracket, bracket_)
 import Control.Monad (forever, guard, join, mfilter, unless, void, when)
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Data.Aeson (encode)
@@ -69,10 +69,13 @@ import Data.ByteString (ByteString)
 import Data.ByteString.Builder qualified as Builder
 import Data.ByteString.Char8 qualified as BS8
 import Data.ByteString.Lazy qualified as LBS
+import Data.Either (fromRight)
+import Data.Foldable (traverse_)
 import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Int (Int64)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (catMaybes, fromMaybe, isJust)
+import Data.Ord (clamp)
 import Data.Pool qualified as Pool
 import Data.Set qualified as Set
 import Data.String (fromString)
@@ -93,6 +96,7 @@ import Servant
 import Servant.Server.Generic (AsServerT)
 import System.IO (stderr)
 import System.Timeout (timeout)
+import UnliftIO.Exception (handleAny, tryAny)
 
 import Arbiter.Servant.API
   ( ArbiterAPI
@@ -311,12 +315,12 @@ listJobsHandler tableName config mLimit mOffset mGroupKey mParentId mJobId roots
     -- Every parent is a rollup finalizer. A page without one skips the count queries.
     let jobIds = map (Job.primaryKey . fst) page
         hasParents = any (isRollup . fst) page
-    if null page || not hasParents
-      then pure (page, matching, Map.empty, Map.empty)
-      else do
+    if hasParents
+      then do
         children <- Ops.countChildrenBatch schemaName tableName jobIds
         dlqChildren <- Ops.countDLQChildrenBatch schemaName tableName jobIds
         pure (page, matching, children, dlqChildren)
+      else pure (page, matching, Map.empty, Map.empty)
 
   let childCounts = fmap fst combined
       pausedParents = Map.keys $ Map.filter (\(childTotal, childPaused) -> childPaused == childTotal) combined
@@ -339,7 +343,7 @@ insertJobHandler
   => Text
   -> ArbiterServerConfig registry
   -> ApiJobWrite payload
-  -> Handler (JobResponse (ApiJob payload))
+  -> Handler (JobResponse (Job.JobRead payload))
 insertJobHandler tableName config (ApiJobWrite jobWrite) = do
   let schemaName = serverSchema config
   mJob <- runDb config $ withPublishSpan tableName [jobWrite] $ do
@@ -349,7 +353,7 @@ insertJobHandler tableName config (ApiJobWrite jobWrite) = do
       (Nothing, Just (IgnoreDuplicate duplicateKey)) -> Ops.getJobByDedupKey schemaName tableName duplicateKey
       _ -> pure Nothing
   case mJob of
-    Just found -> pure $ JobResponse (ApiJob found)
+    Just found -> pure $ JobResponse found
     Nothing ->
       throwError err409 {errBody = "Replace blocked: existing job is actively claimed, force-cancel flagged, or has children"}
 
@@ -369,8 +373,7 @@ insertJobsBatchHandler tableName config (BatchInsertRequest jobWrites) = do
     runDb config
       $ withPublishSpan tableName writes
       $ Ops.insertJobsBatch schemaName tableName writes
-  let apiJobs = map ApiJob inserted
-  pure $ BatchInsertResponse {inserted = apiJobs, insertedCount = length apiJobs}
+  pure $ BatchInsertResponse {inserted = inserted, insertedCount = length inserted}
 
 -- | Fetch a job by id.
 getJobHandler
@@ -433,19 +436,16 @@ moveToDLQHandler
   -> ArbiterServerConfig registry
   -> Int64
   -> Handler NoContent
-moveToDLQHandler tableName config jobId = do
-  let schemaName = serverSchema config
-  result <- runDb config $ withDbTransaction $ do
-    mJob <- Ops.getJobById @_ @payload schemaName tableName jobId
-    case mJob of
-      Nothing -> pure Nothing
-      Just job ->
-        Just <$> Ops.moveToDLQ Ops.TakeLocks schemaName tableName "Manually moved to DLQ via admin API" job
-
-  case result of
-    Nothing -> throwError err404 {errBody = "Job not found"}
-    Just 0 -> throwError err409 {errBody = "Job was concurrently modified"}
-    Just _ -> pure NoContent
+moveToDLQHandler tableName config jobId =
+  noContentOr =<< runDb config (withDbTransaction moved)
+  where
+    schemaName = serverSchema config
+    moved = Ops.getJobById @_ @payload schemaName tableName jobId >>= maybe (pure notFound) move
+    notFound = Left err404 {errBody = "Job not found"}
+    move job = decide <$> Ops.moveToDLQ Ops.TakeLocks schemaName tableName "Manually moved to DLQ via admin API" job
+    decide rowsAffected
+      | rowsAffected > 0 = Right ()
+      | otherwise = Left err409 {errBody = "Job was concurrently modified"}
 
 -- | Pause all children of a parent job.
 pauseChildrenHandler
@@ -454,13 +454,9 @@ pauseChildrenHandler
   -> ArbiterServerConfig registry
   -> Int64
   -> Handler NoContent
-pauseChildrenHandler tableName config jobId = do
-  let schemaName = serverSchema config
-  void . runDb config $
-    Ops.pauseChildren schemaName tableName jobId
-
+pauseChildrenHandler tableName config jobId =
   -- Pausing nothing is a success. The children may be in flight, suspended or done.
-  pure NoContent
+  NoContent <$ runDb config (Ops.pauseChildren (serverSchema config) tableName jobId)
 
 -- | Resume all suspended children of a parent job.
 resumeChildrenHandler
@@ -469,13 +465,9 @@ resumeChildrenHandler
   -> ArbiterServerConfig registry
   -> Int64
   -> Handler NoContent
-resumeChildrenHandler tableName config jobId = do
-  let schemaName = serverSchema config
-  void . runDb config $
-    Ops.resumeChildren schemaName tableName jobId
-
+resumeChildrenHandler tableName config jobId =
   -- Resuming nothing is a success. The children may be unsuspended or done.
-  pure NoContent
+  NoContent <$ runDb config (Ops.resumeChildren (serverSchema config) tableName jobId)
 
 -- | Suspend a job (make it unclaimable).
 suspendJobHandler
@@ -550,15 +542,14 @@ listDLQHandler tableName config mLimit mOffset mParentId mJobId mGroupKey mKind 
           , FilterKind <$> nonBlank mKind
           ]
 
-  (dlqJobs, total) <- runDb config $ withDbTransaction $ do
+  (entries, total) <- runDb config $ withDbTransaction $ do
     page <- Ops.listDLQFilteredOrdered schemaName tableName filters mSortBy mSortDir limit offset
     matching <- Ops.countDLQFiltered schemaName tableName filters
     pure (page, matching)
 
-  let apiDlqJobs = map ApiDLQJob dlqJobs
   pure $
     DLQResponse
-      { dlqJobs = apiDlqJobs
+      { dlqJobs = entries
       , dlqTotal = fromIntegral total
       , dlqOffset = offset
       , dlqLimit = limit
@@ -572,18 +563,15 @@ retryFromDLQHandler
   -> ArbiterServerConfig registry
   -> Int64
   -> Handler NoContent
-retryFromDLQHandler tableName config dlqId = do
-  let schemaName = serverSchema config
-  result <- runDb config $ withDbTransaction $ do
-    mJob <- Ops.retryFromDLQ @_ @payload schemaName tableName dlqId
-    case mJob of
-      Just _ -> pure (Right ())
-      Nothing -> Left <$> Ops.dlqJobExists schemaName tableName dlqId
-
-  case result of
-    Right () -> pure NoContent
-    Left True -> throwError err409 {errBody = "Cannot retry: parent job no longer exists (not in queue or DLQ)"}
-    Left False -> throwError err404 {errBody = "DLQ job not found"}
+retryFromDLQHandler tableName config dlqId =
+  noContentOr =<< runDb config (withDbTransaction retried)
+  where
+    schemaName = serverSchema config
+    retried = Ops.retryFromDLQ @_ @payload schemaName tableName dlqId >>= maybe missing (const (pure (Right ())))
+    missing = refuse <$> Ops.dlqJobExists schemaName tableName dlqId
+    refuse exists
+      | exists = Left err409 {errBody = "Cannot retry: parent job no longer exists (not in queue or DLQ)"}
+      | otherwise = Left err404 {errBody = "DLQ job not found"}
 
 -- | Delete a job from DLQ permanently.
 deleteDLQHandler
@@ -660,7 +648,7 @@ listArchiveHandler tableName config mLimit mOffset mParentId mJobId mGroupKey mK
 
   pure $
     ArchiveResponse
-      { archiveJobs = map ApiArchiveJob archived
+      { archiveJobs = archived
       , archiveTotal = fromIntegral total
       , archiveOffset = offset
       , archiveLimit = limit
@@ -772,15 +760,15 @@ claimJobsHandler
   -> Handler (ClaimResponse payload)
 claimJobsHandler tableName config req = liftIO $ do
   let schemaName = serverSchema config
-      maxJobs = clamp 1 1000 (fromMaybe 1 (crMaxJobs req))
-      leaseSecs = realToFrac (clamp 1 3600 (fromMaybe 60 (crLeaseSeconds req)))
+      wanted = clamp claimJobsRange (fromMaybe defaultClaimJobs (maxJobs req))
+      leaseSecs = realToFrac (clamp leaseSecondsRange (fromMaybe defaultLeaseSeconds (leaseSeconds req)))
   claimant <- UUID.nextRandom
-  jobs <- runDb config $ do
+  claimed <- runDb config $ do
     mQueue <- Ops.getQueue schemaName tableName
-    if maybe False Queues.paused mQueue
+    if any Queues.paused mQueue
       then pure []
-      else Ops.claimNextVisibleJobsAs @_ @payload schemaName tableName maxJobs leaseSecs claimant
-  pure $ ClaimResponse (map ApiJob jobs)
+      else Ops.claimNextVisibleJobsAs @_ @payload schemaName tableName wanted leaseSecs claimant
+  pure $ ClaimResponse claimed
 
 -- | Complete a job that the caller holds. Store an optional result in the
 -- parent rollup or archive entry, as worker @ackWith@ does.
@@ -824,7 +812,7 @@ extendClaimedJobHandler
   -> Handler NoContent
 extendClaimedJobHandler tableName config jobId req =
   withHeldJob @registry @payload tableName config jobId (erLease req) $ \schemaName job ->
-    Ops.setVisibilityTimeout schemaName tableName (realToFrac (clamp 1 3600 (erSeconds req))) job
+    Ops.setVisibilityTimeout schemaName tableName (realToFrac (clamp leaseSecondsRange (erSeconds req))) job
 
 -- | Finalize the job identified by a lease. Refuse a lease that the caller no
 -- longer holds or a lease held by a worker pool. Each statement checks the claim
@@ -893,9 +881,25 @@ maintenanceHandler config = liftIO $ do
   ops <- readIORef touched
   pure $ MaintenanceResponse ops (map maintenanceOpName failed)
 
--- | Hold a caller-supplied value inside the range an endpoint accepts.
-clamp :: (Ord a) => a -> a -> a -> a
-clamp lower upper = max lower . min upper
+-- | Bounds on jobs per claim.
+claimJobsRange :: (Int, Int)
+claimJobsRange = (1, 1000)
+
+-- | Jobs per claim when the request omits it.
+defaultClaimJobs :: Int
+defaultClaimJobs = 1
+
+-- | Bounds on lease seconds.
+leaseSecondsRange :: (Double, Double)
+leaseSecondsRange = (1, 3600)
+
+-- | Lease seconds when the request omits it.
+defaultLeaseSeconds :: Double
+defaultLeaseSeconds = 60
+
+-- | Bounds on page size.
+pageLimitRange :: (Int, Int)
+pageLimitRange = (1, 1000)
 
 -- | Queues API handler.
 queuesServer
@@ -940,8 +944,7 @@ setQueuePausedHandler config knownQueues pauseFlag queue = do
   void . runDb config $ Ops.setQueuePaused schemaName queue pauseFlag
   -- The landing overview shows each queue's paused flag.
   invalidate (allQueueStatsCache config)
-  invalidate (queueStatsCache config)
-  pure NoContent
+  NoContent <$ invalidate (queueStatsCache config)
 
 -- | Serve the SSE stream as a raw WAI application. Flush after each event and
 -- send a keepalive comment every 15 seconds. Each client reads a duplicate of
@@ -968,7 +971,7 @@ eventsServer config = Tagged $ \_req sendResponse ->
           Just sub -> sendResponse $ responseStream status200 sseHeaders $ \write flush ->
             -- A failed write (client gone) ends the stream. The enclosing bracket
             -- then drops this subscriber's refcount.
-            handle swallowSync $ do
+            handleAny (const (pure ())) $ do
               write "data: {\"event\":\"connected\",\"message\":\"Stream connected\"}\n\n"
               flush
               -- Read this client's channel with a 15s keepalive heartbeat.
@@ -992,11 +995,6 @@ eventsServer config = Tagged $ \_req sendResponse ->
       , ("X-Accel-Buffering", "no")
       ]
 
-swallowSync :: SomeException -> IO ()
-swallowSync exception = case fromException exception of
-  Just (_ :: SomeAsyncException) -> throwIO exception
-  Nothing -> pure ()
-
 -- | Subscribe to the shared SSE hub, returning a duplicated channel to stream
 -- from. The first subscriber starts the hub (one @LISTEN@ connection). Later
 -- subscribers bump the refcount. 'Nothing' when there is no pool.
@@ -1008,7 +1006,7 @@ subscribeSSE config =
         modifyTVar' (hubRefs hub) (+ 1)
         dupTChan (hubChan hub)
       pure (Just hub, Just sub)
-    Nothing -> case connectionPool (simplePool (serverEnv config)) of
+    Nothing -> case connectionPool (poolState (serverEnv config)) of
       Nothing -> pure (Nothing, Nothing)
       Just pool -> do
         broadcast <- newBroadcastTChanIO
@@ -1049,7 +1047,7 @@ sseListenerLoop pool broadcast refs = do
       check (subscribers == 0)
     pump backoff =
       forever
-        $ handle (onError backoff)
+        $ handleAny (onError backoff)
         $ bracket
           (Pool.takeResource pool)
           (\(conn, localPool) -> Pool.destroyResource pool localPool conn)
@@ -1059,20 +1057,17 @@ sseListenerLoop pool broadcast refs = do
           forever $ do
             notification <- getNotification conn
             atomically $ writeTChan broadcast (notificationData notification)
-    -- Re-raise async exceptions. On a sync error log it and retry with capped
-    -- exponential backoff.
-    onError backoff exception = case fromException exception of
-      Just (_ :: SomeAsyncException) -> throwIO exception
-      Nothing -> do
-        delay <- readIORef backoff
-        BS8.hPutStr stderr . encodeUtf8 $
-          "[arbiter:sse] listener error, retrying in "
-            <> T.pack (show (delay `div` 1_000_000))
-            <> "s: "
-            <> T.pack (show exception)
-            <> "\n"
-        threadDelay delay
-        writeIORef backoff (min maxBackoff (delay * 2))
+    -- On a sync error log it and retry with capped exponential backoff.
+    onError backoff exception = do
+      delay <- readIORef backoff
+      BS8.hPutStr stderr . encodeUtf8 $
+        "[arbiter:sse] listener error, retrying in "
+          <> T.pack (show (delay `div` 1_000_000))
+          <> "s: "
+          <> T.pack (show exception)
+          <> "\n"
+      threadDelay delay
+      writeIORef backoff (min maxBackoff (delay * 2))
 
 -- | Cron API handlers.
 cronServer
@@ -1229,11 +1224,10 @@ probeHealth
 probeHealth config = cachedFor healthCacheTtl (healthCache config) $ do
   let schemaName = serverSchema config
   started <- getCurrentTime
-  probed <- try @SomeException $ timeout healthProbeMicros (runDb config Health.getPgDbHealth)
-  either swallowSync (const (pure ())) probed
+  probed <- tryAny (timeout healthProbeMicros (runDb config Health.getPgDbHealth))
   finished <- getCurrentTime
   let elapsedMs = realToFrac (diffUTCTime finished started) * 1000
-  let reached = join (eitherToMaybe probed)
+      reached = fromRight Nothing probed
   pure
     HealthResponse
       { status = maybe Down (const Ok) reached
@@ -1242,8 +1236,6 @@ probeHealth config = cachedFor healthCacheTtl (healthCache config) $ do
       , dbLatencyMs = elapsedMs <$ reached
       , db = join reached
       }
-  where
-    eitherToMaybe = either (const Nothing) Just
 
 -- | Poll-collapsing TTL for the readiness probe.
 healthCacheTtl :: NominalDiffTime
@@ -1372,20 +1364,18 @@ updateRateLimitPolicyHandler
   -> Handler RateLimitPolicyView
 updateRateLimitPolicyHandler config prefix upd@(RateLimitPolicyUpdate mMax mRefill mInterval) = do
   let invalid
-        | maybe False (< 0) (join mMax) = Just "override max tokens must be >= 0"
-        | maybe False (< 0) (join mRefill) = Just "override refill amount must be >= 0"
-        | maybe False (<= 0) (join mInterval) = Just "override interval must be > 0"
+        | any (< 0) (join mMax) = Just "override max tokens must be >= 0"
+        | any (< 0) (join mRefill) = Just "override refill amount must be >= 0"
+        | any (<= 0) (join mInterval) = Just "override interval must be > 0"
         | otherwise = Nothing
-  case invalid of
-    Just msg -> throwError err400 {errBody = msg}
-    Nothing -> do
-      -- An all-absent patch reads the view without rewriting the row.
-      let update = case (mMax, mRefill, mInterval) of
-            (Nothing, Nothing, Nothing) -> pure ()
-            _ -> void $ HL.updateRateLimitPolicyOverrides prefix upd
-      view <- updateThenView config (update >> HL.getRateLimitPolicy prefix) "Rate-limit policy not found"
-      invalidate (rateLimitPoliciesCache config)
-      pure view
+  traverse_ (\msg -> throwError err400 {errBody = msg}) invalid
+  -- An all-absent patch reads the view without rewriting the row.
+  let update = case (mMax, mRefill, mInterval) of
+        (Nothing, Nothing, Nothing) -> pure ()
+        _ -> void $ HL.updateRateLimitPolicyOverrides prefix upd
+  view <- updateThenView config (update >> HL.getRateLimitPolicy prefix) "Rate-limit policy not found"
+  invalidate (rateLimitPoliciesCache config)
+  pure view
 
 -- | Clear every bucket for a prefix. Returns the number reset. 404s an unknown prefix.
 resetRateLimitBucketsHandler
@@ -1446,19 +1436,14 @@ updateConcurrencyPolicyHandler
   -> ConcurrencyPolicyUpdate
   -> Handler ConcurrencyPolicyView
 updateConcurrencyPolicyHandler config prefix upd@(ConcurrencyPolicyUpdate mLimit) = do
-  let invalid
-        | maybe False (< 0) (join mLimit) = Just "override limit must be >= 0"
-        | otherwise = Nothing
-  case invalid of
-    Just msg -> throwError err400 {errBody = msg}
-    Nothing -> do
-      -- An absent overrideLimit reads the view without rewriting the row.
-      let action = case mLimit of
-            Nothing -> HL.getConcurrencyPolicy prefix
-            Just _ -> HL.updateConcurrencyPolicyOverrides prefix upd >> HL.getConcurrencyPolicy prefix
-      view <- updateThenView config action "Concurrency pool not found"
-      invalidate (concurrencyPoliciesCache config)
-      pure view
+  when (any (< 0) (join mLimit)) $ throwError err400 {errBody = "override limit must be >= 0"}
+  -- An absent overrideLimit reads the view without rewriting the row.
+  let action = case mLimit of
+        Nothing -> HL.getConcurrencyPolicy prefix
+        Just _ -> HL.updateConcurrencyPolicyOverrides prefix upd >> HL.getConcurrencyPolicy prefix
+  view <- updateThenView config action "Concurrency pool not found"
+  invalidate (concurrencyPoliciesCache config)
+  pure view
 
 -- | Recompute every key's in-flight count from live jobs. Returns rows repaired.
 reconcileConcurrencyHandler
@@ -1565,6 +1550,4 @@ nonBlank = mfilter (not . T.null . T.strip)
 -- | Clamp pagination parameters to a limit of 1 to 1000 and a non-negative offset.
 validatePagination :: Int -> Maybe Int -> Maybe Int -> (Int, Int)
 validatePagination defLimit mLimit mOffset =
-  let limit = max 1 $ min 1000 $ fromMaybe defLimit mLimit
-      offset = max 0 $ fromMaybe 0 mOffset
-   in (limit, offset)
+  (clamp pageLimitRange (fromMaybe defLimit mLimit), max 0 (fromMaybe 0 mOffset))

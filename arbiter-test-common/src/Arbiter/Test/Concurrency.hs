@@ -7,8 +7,10 @@
 module Arbiter.Test.Concurrency
   ( concurrencySpec
   , raceConditionSpec
+  , drainAll
+  , findDuplicates
   , installHolDetector
-  , countHolViolations
+  , holViolations
   , removeHolDetector
   ) where
 
@@ -18,21 +20,18 @@ import Arbiter.Core.MonadArbiter (MonadArbiter, RegistryOf)
 import Arbiter.Core.QueueRegistry (TableForPayload)
 import Control.Concurrent (threadDelay)
 import Control.Monad (forM, forM_, replicateM, replicateM_, void, when)
-import Data.Foldable (traverse_)
 import Data.IORef (atomicModifyIORef', newIORef, readIORef)
 import Data.Int (Int64)
-import Data.List (nub, sort)
+import Data.List (sort)
 import Data.List.NonEmpty qualified as NE
 import Data.Set qualified as Set
-import Data.String (fromString)
 import Data.Text (Text)
 import Data.Text qualified as T
-import Database.PostgreSQL.Simple qualified as PG
 import GHC.TypeLits (KnownSymbol)
 import Test.Hspec
 import UnliftIO.Async (mapConcurrently, replicateConcurrently_)
 
-import Arbiter.Test.StateMachine (holInstallSql, holRemoveSql, holViolTbl)
+import Arbiter.Test.StateMachine (holViolations, installHolDetector, removeHolDetector)
 
 -- | Claim and ack jobs in a loop until no more are available.
 -- Backs off with 10ms delay between empty claim attempts, gives up
@@ -66,26 +65,6 @@ findDuplicates = go Set.empty Set.empty
     go seen dups (item : rest)
       | Set.member item seen = go seen (Set.insert item dups) rest
       | otherwise = go (Set.insert item seen) dups rest
-
--- | Install the gap-free HOL violation detector on a raw connection.
-installHolDetector :: PG.Connection -> Text -> Text -> IO ()
-installHolDetector conn schemaName tableName =
-  traverse_ (void . PG.execute_ conn . fromString . T.unpack) (holInstallSql schemaName tableName)
-
--- | Count violations detected by the HOL detector trigger.
-countHolViolations :: PG.Connection -> Text -> Text -> IO Int64
-countHolViolations conn schemaName tableName = do
-  [PG.Only count] <-
-    PG.query_ conn
-      $ fromString
-      $ T.unpack
-      $ "SELECT count(*)::bigint FROM " <> holViolTbl schemaName tableName
-  pure count
-
--- | Remove the HOL detector trigger, function, and violations table.
-removeHolDetector :: PG.Connection -> Text -> Text -> IO ()
-removeHolDetector conn schemaName tableName =
-  traverse_ (void . PG.execute_ conn . fromString . T.unpack) (holRemoveSql schemaName tableName)
 
 -- | Parameterized concurrency test suite. These tests need a connection pool of
 -- at least 10 connections.
@@ -167,7 +146,7 @@ concurrencySpec mkMessage runM = do
 
       let raced = map primaryKey (claimsA <> claimsB <> claimsC)
       -- No job claimed twice in the racy pass.
-      raced `shouldBe` nub raced
+      findDuplicates raced `shouldBe` []
       -- Drain the jobs the race missed. A follow-up claim surfaces the unclaimed ones.
       drainedRef <- newIORef ([] :: [Int64])
       drainAll (runM env (HL.claimNextVisibleJobs 6 60) :: IO [JobRead payload]) $ \job ->
@@ -175,7 +154,7 @@ concurrencySpec mkMessage runM = do
       drained <- readIORef drainedRef
       -- Every inserted job was claimed exactly once across the racing workers and the drain.
       let allClaimed = raced <> drained
-      allClaimed `shouldBe` nub allClaimed
+      findDuplicates allClaimed `shouldBe` []
       Set.fromList allClaimed `shouldBe` insertedIds
 
     it "concurrent workers respect per-group ordering for grouped jobs" $ \env -> do
@@ -447,7 +426,7 @@ raceConditionSpec mkMessage runM = do
                 , let ids = [jobId | (Just groupName, jobId) <- jobs, groupName == wantedGroup]
                 , not (null ids)
                 ]
-              allGroupKeys = nub [groupName | (_, jobs) <- results, (Just groupName, _) <- jobs]
+              allGroupKeys = Set.toList (Set.fromList [groupName | (_, jobs) <- results, (Just groupName, _) <- jobs])
               hasGaps ids = any (\(prev, next) -> next - prev /= 1) $ zip ids (drop 1 ids)
               gappedGroups =
                 [ groupName

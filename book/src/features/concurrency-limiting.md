@@ -1,8 +1,8 @@
 # Concurrency Limiting
 
-Set a maximum number of concurrent jobs for each key. A `HasConcurrency`
-instance specifies a **pool** and a key suffix for each job. A pool consists of
-a prefix and a default limit. Keys apply to all queues in a registry.
+A pool is a prefix and a default limit. It caps jobs in flight per key across
+every queue in the registry. `HasConcurrency` selects a pool and key for each
+job.
 
 ```haskell
 import Arbiter.Concurrency (ConcurrencyPolicy, HasConcurrency (..), concurrencyBy, concurrencyPool)
@@ -18,40 +18,34 @@ instance HasConcurrency SyncPayload where
   concurrencyFor = concurrencyBy syncPool tenantOf
 ```
 
-Build the selector with `noConcurrency`, `concurrencyBy`, `globalConcurrency`,
-or `concurrencyByCase`. The pool limit applies separately to each key with that
-prefix. An operator can change the pool limit through the API or admin UI. The
-override applies until an operator clears it. Arbiter then uses the declared
-default. A value of 0 prevents claims for all keys in the pool.
+Selectors: `noConcurrency`, `concurrencyBy`, `globalConcurrency`,
+`concurrencyByCase`. An operator can override the limit from the API or admin
+UI. If you clear the override, the declared default applies. Limit 0 admits
+nothing.
 
 ## Concurrency Limit 1 and Group Keys
 
-Both options permit one in-flight job for each key. Their failure behavior is
-different:
+Both admit one in-flight job per key.
 
 | | `group_key` | concurrency limit 1 |
 | --- | --- | --- |
 | What it is | a scheduling primitive (ordered head per group) | a counter |
-| On retry/backoff | the failing job **remains first**. The group waits until the job succeeds or moves to the DLQ | the failing job **releases its slot**. Another job can run during the backoff |
-| Ordering | eligible jobs run in insertion order within priority | none beyond the claim's sort |
-| Batching | claims an ordered batch per group | N independent jobs |
+| On retry/backoff | the failing job **stays first**. The group waits until the job succeeds or moves to the DLQ | the failing job **releases its slot**. Another job runs during the backoff |
+| Ordering | insertion order within priority | claim order only |
+| Batching | one ordered batch per group | N independent jobs |
 
-Use a **group key** for a serial sequence, such as an event stream or state
-machine. Use **concurrency 1** as a mutex, such as one synchronization per
-tenant. A job can use both features.
+A job can use both.
 
 > [!IMPORTANT]
-> The limit counts claims. A job occupies a slot until Arbiter acks, retries,
-> nacks, or reclaims it. An unacked job continues to occupy a slot after its
-> handler times out.
+> A job holds a slot from claim until ack, retry, nack, or reclaim. A handler
+> timeout does not release it.
 >
-> Arbiter periodically removes inactive keys. It also reconstructs in-flight
-> counts after a restart or failover.
+> The reaper prunes idle keys and rebuilds in-flight counts after a restart or
+> failover.
 
 ## External Limit Updates
 
-A handler can update an override in response to an external capacity signal.
-For example, update the override when a vendor response reports a new limit.
+Set the override from a handler when a vendor reports new capacity:
 
 ```haskell
 import Arbiter.Concurrency (setConcurrencyLimit)
@@ -67,14 +61,7 @@ syncHandler _conn job = do
     Ok -> pure ()
 ```
 
-The next claim uses the new limit. This change does not require a deployment or
-restart. Code with a `MonadArbiter` instance can write the override.
-
-`clearConcurrencyLimit syncPool` removes the override. Both functions accept a
-declared pool and use its prefix.
-
-The handler in this example is transactional. The override and job ack commit
-in the same transaction. If the handler throws an exception, the transaction
-rolls back both changes.
+`clearConcurrencyLimit syncPool` removes the override. In a transactional
+handler the override commits with the ack.
 
 See the [`Arbiter.Concurrency` haddocks](https://arbiterq.dev/arbiter-core/Arbiter-Concurrency.html) for the selector DSL and the pool type.

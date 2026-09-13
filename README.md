@@ -45,7 +45,8 @@ extra-deps:
       - arbiter-migrations
 ```
 
-Replace `arbiter-simple` with `arbiter-orville` or `arbiter-hasql` depending on your backend.
+Replace `arbiter-simple` with `arbiter-orville` or `arbiter-hasql` to use that
+backend.
 
 ## Quick Start
 
@@ -71,7 +72,7 @@ import Data.Proxy (Proxy (..))
 Mig.runMigrationsForRegistry (Proxy @AppRegistry) connStr "arbiter" Mig.defaultMigrationConfig
 ```
 
-**Producer** - enqueues only, so it needs no worker configuration:
+**Producer** - enqueues only, no worker configuration:
 
 ```haskell
 import Arbiter.Core qualified as Arb
@@ -83,15 +84,14 @@ ArbS.runSimpleDb env $
   void $ Arb.insertJob (Arb.defaultJob $ SendWelcome "alice@example.com" "Alice")
 ```
 
-**Worker** - a separate process, with a connection pool sized for the worker
-pools it runs:
+**Worker** - a separate process:
 
 ```haskell
 import Arbiter.Worker qualified as Worker
 
 main :: IO ()
 main = do
-  -- 1 pool of 5 worker threads, each handler wrapped in a transaction
+  -- One pool of five worker threads, each handler in a transaction
   config <- Worker.transactionalWorkerConfig 5 processEmail
   let workers = [Worker.namedWorkerPool config]
   poolCfg <- Worker.poolConfigForWorkers workers

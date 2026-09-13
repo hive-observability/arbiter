@@ -42,7 +42,6 @@ import Arbiter.Core.QueueRegistry (Queue)
 import Arbiter.Core.RateLimit.Schema
   ( arbiterRateLimitPoliciesTable
   , arbiterRateLimitsTable
-  , toPolicyRow
   , upsertPolicyRowSQL
   )
 import Arbiter.Core.RateLimit.Spec
@@ -56,7 +55,6 @@ import Arbiter.Core.RateLimit.Spec
   , limitByCase
   , noLimit
   , registryRateLimitPolicies
-  , runRateLimitFor
   , tokenBucket
   )
 import Arbiter.Core.RateLimit.Stats
@@ -64,6 +62,7 @@ import Arbiter.Core.RateLimit.Stats
   , RateLimitPolicyUpdate (..)
   , RateLimitPolicyView (..)
   )
+import Arbiter.Core.Selector (runSelector)
 import Control.Exception (finally)
 import Control.Monad (foldM_, void)
 import Data.Aeson (FromJSON, ToJSON)
@@ -108,7 +107,7 @@ rateLimitTable = "arbiter_ratelimit_test"
 setupRateLimitPolicy :: ByteString -> Text -> IO ()
 setupRateLimitPolicy connStr schema = do
   conn <- connectPostgreSQL connStr
-  traverse_ (execute_ conn . upsertPolicyRowSQL schema . toPolicyRow) (Set.toList (registryRateLimitPolicies @RLReg))
+  traverse_ (execute_ conn . upsertPolicyRowSQL schema) (Set.toList (registryRateLimitPolicies @RLReg))
   close conn
 
 job :: Text -> JobWrite RLPayload
@@ -522,7 +521,7 @@ rateLimitSpec runM = do
     -- With no policy row every job runs.
     let restore = runM env $ do
           schema <- getSchema
-          void $ execStatement (upsertPolicyRowSQL schema (toPolicyRow rlPolicy)) []
+          void $ execStatement (upsertPolicyRowSQL schema rlPolicy) []
     flip finally restore $ do
       runM env $ do
         schema <- getSchema
@@ -593,8 +592,8 @@ rateLimitSpec runM = do
         sel :: RateLimitFor Bool
         sel = chooseWhen id (limitBy policyA (const "x")) (limitBy policyB (const "y"))
     Set.toList (collectPolicies sel) `shouldMatchList` [policyA, policyB]
-    (rlkPrefix <$> runRateLimitFor True sel) `shouldBe` Just "ca"
-    (rlkPrefix <$> runRateLimitFor False sel) `shouldBe` Just "cb"
+    (rlkPrefix <$> runSelector True sel) `shouldBe` Just "ca"
+    (rlkPrefix <$> runSelector False sel) `shouldBe` Just "cb"
 
   it "limitByCase collects every branch and runs the matched one" $ \_env -> do
     let policyA = tokenBucket "la" 1 1
@@ -605,9 +604,9 @@ rateLimitSpec runM = do
           EQ -> noLimit
           GT -> limitBy policyB (const "y")
     Set.toList (collectPolicies sel) `shouldMatchList` [policyA, policyB]
-    (rlkPrefix <$> runRateLimitFor LT sel) `shouldBe` Just "la"
-    runRateLimitFor EQ sel `shouldBe` Nothing
-    (rlkPrefix <$> runRateLimitFor GT sel) `shouldBe` Just "lb"
+    (rlkPrefix <$> runSelector LT sel) `shouldBe` Just "la"
+    runSelector EQ sel `shouldBe` Nothing
+    (rlkPrefix <$> runSelector GT sel) `shouldBe` Just "lb"
 
 -- Pure reference bucket with zero refill. Tokens are integral.
 

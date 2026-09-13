@@ -1,8 +1,7 @@
 {-# LANGUAGE TypeFamilies #-}
 
 module Test.Arbiter.Orville.TestHelpers
-  ( executeSql
-  , setupOrvilleTest
+  ( setupOrvilleTest
   , createOrvilleTestEnv
   , destroyOrvilleTestEnv
   , disableOrvilleListener
@@ -12,21 +11,19 @@ module Test.Arbiter.Orville.TestHelpers
   , TestOrville (..)
   ) where
 
-import Arbiter.Core.Listen (DedicatedListen, dedicatedListener, newDedicatedListen)
+import Arbiter.Core.Listen (Listener)
 import Arbiter.Core.MonadArbiter (MonadArbiter (..))
 import Arbiter.Core.QueueRegistry (JobPayloadRegistry)
+import Arbiter.LibPQ (newLibPQListener)
 import Arbiter.Test.Setup qualified as TestSetup
-import Control.Monad (void)
 import Control.Monad.Catch (MonadCatch, MonadMask, MonadThrow)
 import Control.Monad.Trans.Reader (ReaderT (..), asks, runReaderT)
 import Data.ByteString (ByteString)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
-import Database.PostgreSQL.Simple (close, connectPostgreSQL)
 import Orville.PostgreSQL qualified as O
 import Orville.PostgreSQL.Raw.Connection (destroyIdleConnections)
-import Orville.PostgreSQL.Raw.RawSql qualified as RawSql
 import Orville.PostgreSQL.UnliftIO qualified as O
 import UnliftIO (MonadIO (..), MonadUnliftIO (..))
 
@@ -44,7 +41,7 @@ data OrvilleTestEnv (registry :: JobPayloadRegistry) = OrvilleTestEnv
   , testConnStr :: ByteString
   , testOrvilleState :: O.OrvilleState
   , testPool :: O.ConnectionPool
-  , testListen :: Maybe DedicatedListen
+  , testListen :: Maybe Listener
   }
 
 -- | Test monad that provides both OrvilleState and ArbiterEnv
@@ -70,13 +67,7 @@ instance MonadArbiter (TestOrville registry) where
   executeStatement = orvilleExecuteStatement
   withDbTransaction = orvilleWithDbTransaction
   runHandlerWithConnection = orvilleRunHandlerWithConnection
-  getListener = TestOrville $ asks (fmap dedicatedListener . testListen)
-
--- Helper to execute raw SQL
-executeSql :: (O.MonadOrville m) => Text -> m ()
-executeSql sql = O.withConnection $ \conn -> do
-  let rawSql = RawSql.fromText sql
-  void $ liftIO $ RawSql.execute conn rawSql
+  getListener = TestOrville $ asks testListen
 
 setupOrvilleTest :: ByteString -> Text -> Text -> Int -> IO (OrvilleTestEnv registry)
 setupOrvilleTest connStr schemaName tableName maxConns = do
@@ -98,7 +89,7 @@ createOrvilleTestEnv connStr schemaName tableName maxConns = do
           }
   orvillePool <- O.createConnectionPool options
   let orvilleState = O.newOrvilleState O.defaultErrorDetailLevel orvillePool
-  listen <- newDedicatedListen connStr
+  listen <- newLibPQListener connStr
 
   pure $
     OrvilleTestEnv
@@ -119,10 +110,7 @@ disableOrvilleListener :: OrvilleTestEnv registry -> OrvilleTestEnv registry
 disableOrvilleListener env = env {testListen = Nothing}
 
 cleanupOrvilleTest :: OrvilleTestEnv registry -> IO ()
-cleanupOrvilleTest env = do
-  conn <- connectPostgreSQL (testConnStr env)
-  TestSetup.cleanupData (testSchema env) (testTableName env) conn
-  close conn
+cleanupOrvilleTest env = TestSetup.cleanupOnce (testConnStr env) (testSchema env) (testTableName env)
 
 -- | Run a TestOrville action with the test environment
 runOrvilleTest :: OrvilleTestEnv registry -> TestOrville registry a -> IO a

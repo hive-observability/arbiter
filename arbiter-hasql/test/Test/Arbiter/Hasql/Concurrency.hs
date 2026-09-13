@@ -9,14 +9,14 @@ import Arbiter.Test.Concurrency
   , raceConditionSpec
   )
 import Arbiter.Test.Fixtures (TestPayload (..))
-import Arbiter.Test.Setup (setupOnce)
+import Arbiter.Test.Setup (cleanupOnce, setupOnce)
 import Data.ByteString (ByteString)
 import Data.Proxy (Proxy (..))
 import Data.Text (Text)
 import Test.Hspec
 
 import Arbiter.Hasql.HasqlDb (createHasqlEnvWithPool, runHasqlDb)
-import Test.Arbiter.Hasql.TestHelpers (cleanupHasqlTest, createHasqlPool)
+import Test.Arbiter.Hasql.TestHelpers (createHasqlPool)
 
 testSchema :: Text
 testSchema = "arbiter_hasql_concurrency_test"
@@ -27,13 +27,9 @@ testTable :: Text
 testTable = "arbiter_hasql_concurrency_test"
 
 spec :: ByteString -> Spec
-spec connStr = beforeAll (setupOnce connStr testSchema testTable False >> createHasqlPool 10 connStr) $ beforeWith (\pool -> cleanupHasqlTest connStr testSchema testTable >> pure pool) $ do
-  let run pool act = do
-        env <- createHasqlEnvWithPool (Proxy @HasqlConcurrencyTestRegistry) pool testSchema
-        runHasqlDb env act
-  concurrencySpec @TestPayload
-    TestMessage
-    run
-  raceConditionSpec @TestPayload
-    TestMessage
-    run
+spec connStr = beforeAll (setupOnce connStr testSchema testTable False) $ do
+  sharedPool <- runIO (createHasqlPool 10 connStr)
+  sharedEnv <- runIO (createHasqlEnvWithPool (Proxy @HasqlConcurrencyTestRegistry) sharedPool testSchema)
+  around (\action -> cleanupOnce connStr testSchema testTable >> action sharedEnv) $ do
+    concurrencySpec @TestPayload TestMessage runHasqlDb
+    raceConditionSpec @TestPayload TestMessage runHasqlDb

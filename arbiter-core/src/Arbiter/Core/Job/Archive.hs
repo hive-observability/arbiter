@@ -1,3 +1,5 @@
+{-# LANGUAGE OverloadedStrings #-}
+
 -- | Completed-job archive types. Arbiter archives an acked job when @archiveFor@
 -- is positive and removes it after the retention period. Re-enqueue entries with
 -- 'Arbiter.Core.HighLevel.reEnqueueFromArchive'.
@@ -5,7 +7,7 @@ module Arbiter.Core.Job.Archive
   ( ArchiveJob (..)
   ) where
 
-import Data.Aeson (Value)
+import Data.Aeson (FromJSON (..), ToJSON (..), Value, object, withObject, (.:), (.:?), (.=))
 import Data.Int (Int64)
 import Data.Time (UTCTime)
 import GHC.Generics (Generic)
@@ -24,3 +26,20 @@ data ArchiveJob payload = ArchiveJob
   -- ^ Handler result stored for a completed root job (one with no parent).
   }
   deriving stock (Eq, Generic, Show)
+
+instance (ToJSON payload) => ToJSON (ArchiveJob payload) where
+  toJSON archived =
+    object
+      [ "archivePrimaryKey" .= archivePrimaryKey archived
+      , "completedAt" .= completedAt archived
+      , "jobSnapshot" .= jobSnapshot archived
+      , "result" .= archivedResult archived
+      ]
+
+instance (FromJSON payload) => FromJSON (ArchiveJob payload) where
+  parseJSON = withObject "ArchiveJob" $ \obj ->
+    ArchiveJob
+      <$> obj .: "archivePrimaryKey"
+      <*> obj .: "completedAt"
+      <*> obj .: "jobSnapshot"
+      <*> obj .:? "result"

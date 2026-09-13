@@ -29,8 +29,8 @@ module Arbiter.Otel
 
     -- * Running pools
   , runWorkerPools
-  , runSelectedWorkerPools
   , runWorkerPoolsWith
+  , runSelectedWorkerPools
   , runSelectedWorkerPoolsWith
 
     -- * Gauges

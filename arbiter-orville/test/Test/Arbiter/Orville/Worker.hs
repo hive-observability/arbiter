@@ -1,57 +1,35 @@
 {-# LANGUAGE DeriveAnyClass #-}
-{-# LANGUAGE NumericUnderscores #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE TypeFamilies #-}
-{-# OPTIONS_GHC -Wno-x-partial #-}
 
-module Test.Arbiter.Orville.Worker (spec) where
+module Test.Arbiter.Orville.Worker
+  ( OrvilleWorkerTestPayload (..)
+  , withOrvilleBackend
+  , spec
+  , deadlineSpec
+  , cronSpec
+  , reclaimSpec
+  , connectionRecoverySpec
+  , lifecycleSpec
+  ) where
 
-import Arbiter.Core.Exceptions (throwRetryable)
-import Arbiter.Core.HighLevel qualified as HL
-import Arbiter.Core.Job.DLQ qualified as DLQ
-import Arbiter.Core.Job.Schema qualified as Schema
-import Arbiter.Core.Job.Types
-  ( JobRead
-  , defaultJob
-  , payload
-  , primaryKey
-  , setGroupKey
-  , setMaxAttempts
-  )
-import Arbiter.Core.QueueRegistry (QueueSpec (..))
-import Arbiter.Test.Poll (waitUntil)
-import Arbiter.Worker (runWorkerPool)
-import Arbiter.Worker.Config (WorkerConfig (..), transactionalWorkerConfig)
-import Arbiter.Worker.TestKit (workerSpec)
-import Control.Monad (void)
-import Control.Monad.IO.Class (liftIO)
+import Arbiter.Core.QueueRegistry (Queue, QueueSpec (..))
+import Arbiter.Test.Setup qualified as TestSetup
+import Arbiter.Worker.TestKit qualified as TestKit
 import Data.Aeson (FromJSON, ToJSON)
 import Data.ByteString (ByteString)
 import Data.Text (Text)
-import Data.Text qualified as T
 import GHC.Generics (Generic)
-import Orville.PostgreSQL qualified as O
-import Orville.PostgreSQL.Execution.ExecutionResult qualified as ExecResult
-import Orville.PostgreSQL.Raw.RawSql qualified as RawSql
-import Orville.PostgreSQL.Raw.SqlValue qualified as SqlValue
-import Test.Hspec
-  ( Spec
-  , beforeAll
-  , beforeWith
-  , describe
-  , expectationFailure
-  , it
-  , shouldBe
-  )
-import UnliftIO.Async (withAsync)
+import Test.Hspec (Spec, afterAll_, beforeAll, runIO)
 
 import Test.Arbiter.Orville.TestHelpers
-  ( OrvilleTestEnv (..)
-  , TestOrville (..)
+  ( OrvilleTestEnv
+  , TestOrville
   , cleanupOrvilleTest
-  , executeSql
+  , createOrvilleTestEnv
+  , destroyOrvilleTestEnv
+  , disableOrvilleListener
   , runOrvilleTest
-  , setupOrvilleTest
   )
 
 workerTestSchemaName :: Text
@@ -66,148 +44,83 @@ data OrvilleWorkerTestPayload
 type OrvilleWorkerTestRegistry =
   '[QueueWithResult "arbiter_orville_worker_test" OrvilleWorkerTestPayload (Maybe [Text])]
 
-testTable :: Text
-testTable = "arbiter_orville_worker_test"
-
 spec :: ByteString -> Spec
-spec connStr = beforeAll (setupOrvilleTest connStr workerTestSchemaName testTable 10) $ beforeWith (\env -> cleanupOrvilleTest env >> pure env) $ do
-  workerSpec @OrvilleWorkerTestPayload SimpleTask FailingTask id runOrvilleTest
+spec connStr = withOrvilleBackend @OrvilleWorkerTestRegistry connStr workerTestSchemaName TestKit.workerSpec
 
-  describe "Transactional Atomicity" $ do
-    it "rolls back user operations when handler fails" $ \env -> do
-      -- Create a test table to track user operations
-      runOrvilleTest env $ do
-        executeSql $ "CREATE TABLE IF NOT EXISTS " <> workerTestSchemaName <> ".test_operations (job_id INT, operation TEXT)"
-        executeSql $ "TRUNCATE " <> workerTestSchemaName <> ".test_operations"
+-- | Build the schema and one env over a shared pool, then run a suite over the backend.
+withOrvilleBackend
+  :: forall registry
+   . ByteString
+  -> Text
+  -> (TestKit.TestBackend OrvilleWorkerTestPayload (TestOrville registry) (OrvilleTestEnv registry) -> Spec)
+  -> Spec
+withOrvilleBackend connStr schema suite =
+  beforeAll (TestSetup.setupOnce connStr schema schema True) $ do
+    env <- runIO (createOrvilleTestEnv connStr schema schema orvillePoolSize)
+    afterAll_ (destroyOrvilleTestEnv env) $ suite (orvilleBackend connStr schema env)
 
-      let handler :: JobRead OrvilleWorkerTestPayload -> TestOrville OrvilleWorkerTestRegistry (Maybe [Text])
-          handler job = do
-            -- User performs their own database operation using the connection
-            let insertSql =
-                  RawSql.fromText $
-                    "INSERT INTO "
-                      <> workerTestSchemaName
-                      <> ".test_operations (job_id, operation) VALUES ("
-                      <> T.pack (show (primaryKey job))
-                      <> ", 'processed')"
-            -- Then the handler fails
-            O.executeVoid O.InsertQuery insertSql
-            throwRetryable "Simulated failure"
+orvilleBackend
+  :: forall registry
+   . ByteString
+  -> Text
+  -> OrvilleTestEnv registry
+  -> TestKit.TestBackend OrvilleWorkerTestPayload (TestOrville registry) (OrvilleTestEnv registry)
+orvilleBackend connStr schema env =
+  TestKit.TestBackend
+    { schema
+    , table = schema
+    , connStr
+    , mkSimple = SimpleTask
+    , mkFailing = FailingTask
+    , mkEnv = cleanupOrvilleTest env >> pure env
+    , pollOnly = disableOrvilleListener
+    , mkFreshEnv = TestSetup.cleanupOnce connStr schema schema >> createOrvilleTestEnv connStr schema schema orvillePoolSize
+    , destroyEnv = destroyOrvilleTestEnv
+    , mkHandler = id
+    , runCommand = TestKit.statementCommand
+    , runM = runOrvilleTest
+    }
 
-      -- Insert a job
-      let job =
-            setMaxAttempts (Just 1) $ setGroupKey (Just "g1") $ defaultJob (SimpleTask "WillFail")
-      void $ runOrvilleTest env $ HL.insertJob job
+orvillePoolSize :: Int
+orvillePoolSize = 10
 
-      -- Start a worker pool. One attempt sends the job to the DLQ.
-      config <- transactionalWorkerConfig 10 handler
-      runOrvilleTest env
-        $ withAsync
-          ( runWorkerPool
-              ( config
-                  { workerCount = 1
-                  , pollInterval = 0.1
-                  }
-              )
-          )
-        $ \_ ->
-          do
-            -- Wait for job to be processed and moved to DLQ
-            liftIO $ waitUntil 10_000 $ do
-              dlqJobs <- runOrvilleTest env $ HL.listDLQJobs @OrvilleWorkerTestPayload 10 0
-              pure (length dlqJobs == 1)
+deadlineSchema :: Text
+deadlineSchema = "arbiter_orville_deadline_test"
 
-            -- Verify the job is in the DLQ with the correct payload
-            dlqJobs <- HL.listDLQJobs @OrvilleWorkerTestPayload 10 0
-            liftIO $ length dlqJobs `shouldBe` 1
-            liftIO $ (payload $ DLQ.jobSnapshot (head dlqJobs)) `shouldBe` SimpleTask "WillFail"
+type OrvilleDeadlineRegistry = '[Queue "arbiter_orville_deadline_test" OrvilleWorkerTestPayload]
 
-            -- Verify the user's database operation was rolled back
-            O.withConnection $ \conn -> do
-              let countSql = RawSql.fromText $ "SELECT COUNT(*) FROM " <> workerTestSchemaName <> ".test_operations WHERE operation = 'processed'"
-              result <- liftIO $ RawSql.execute conn countSql
-              rows <- liftIO $ ExecResult.readRows result
-              case rows of
-                [[(_name, val)]] -> do
-                  case SqlValue.toInt64 val of
-                    Right count | count == 0 -> pure ()
-                    Right count -> liftIO $ expectationFailure $ "Expected 0 rows but got " <> show count
-                    Left err -> liftIO $ expectationFailure $ "Failed to decode count: " <> err
-                _ -> liftIO $ expectationFailure "Expected one row from COUNT query"
+deadlineSpec :: ByteString -> Spec
+deadlineSpec connStr = withOrvilleBackend @OrvilleDeadlineRegistry connStr deadlineSchema TestKit.deadlineSpec
 
-      O.runOrvilleWithState (testOrvilleState env) $
-        O.executeVoid O.OtherQuery (RawSql.fromText $ "DROP TABLE IF EXISTS " <> workerTestSchemaName <> ".test_operations")
+cronSchema :: Text
+cronSchema = "arbiter_orville_cron_test"
 
-    it "commits user operations when handler succeeds" $ \env -> do
-      -- Create a test table to track user operations
-      O.runOrvilleWithState (testOrvilleState env) $ do
-        O.executeVoid
-          O.OtherQuery
-          ( RawSql.fromText $
-              "CREATE TABLE IF NOT EXISTS " <> workerTestSchemaName <> ".test_operations (job_id INT, operation TEXT)"
-          )
-        O.executeVoid O.OtherQuery (RawSql.fromText $ "TRUNCATE " <> workerTestSchemaName <> ".test_operations")
+type OrvilleCronRegistry = '[Queue "arbiter_orville_cron_test" OrvilleWorkerTestPayload]
 
-      let handler :: JobRead OrvilleWorkerTestPayload -> TestOrville OrvilleWorkerTestRegistry (Maybe [Text])
-          handler job = do
-            -- User performs their own database operation using the connection
-            let insertSql =
-                  RawSql.fromText $
-                    "INSERT INTO "
-                      <> workerTestSchemaName
-                      <> ".test_operations (job_id, operation) VALUES ("
-                      <> T.pack (show (primaryKey job))
-                      <> ", 'processed')"
-            O.executeVoid O.InsertQuery insertSql
-            pure mempty
+cronSpec :: ByteString -> Spec
+cronSpec connStr = withOrvilleBackend @OrvilleCronRegistry connStr cronSchema TestKit.cronSpec
 
-      -- Insert a job
-      let job =
-            setGroupKey (Just "g1") $ defaultJob (SimpleTask "WillSucceed")
-      void $ runOrvilleTest env $ HL.insertJob job
+reclaimSchema :: Text
+reclaimSchema = "arbiter_orville_reclaim_test"
 
-      -- Start worker pool
-      config <- transactionalWorkerConfig 10 handler
-      runOrvilleTest env
-        $ withAsync
-          ( runWorkerPool
-              ( config
-                  { workerCount = 1
-                  , pollInterval = 0.1
-                  }
-              )
-          )
-        $ \_ -> do
-          -- Wait for job to be processed
-          liftIO $ waitUntil 10_000 $ do
-            jobs <- runOrvilleTest env $ HL.listJobs @OrvilleWorkerTestPayload 10 0
-            pure (null jobs)
+type OrvilleReclaimRegistry = '[Queue "arbiter_orville_reclaim_test" OrvilleWorkerTestPayload]
 
-          -- Verify the queue is empty
-          O.withConnection $ \conn -> do
-            let countSql = RawSql.fromText $ "SELECT COUNT(*) FROM " <> Schema.jobQueueTable workerTestSchemaName testTable
-            result <- liftIO $ RawSql.execute conn countSql
-            rows <- liftIO $ ExecResult.readRows result
-            case rows of
-              [[(_name, val)]] -> do
-                case SqlValue.toInt64 val of
-                  Right count | count == 0 -> pure ()
-                  Right count -> liftIO $ expectationFailure $ "Expected 0 jobs in queue but got " <> show count
-                  Left err -> liftIO $ expectationFailure $ "Failed to decode count: " <> err
-              _ -> liftIO $ expectationFailure "Expected one row from COUNT query"
+reclaimSpec :: ByteString -> Spec
+reclaimSpec connStr = withOrvilleBackend @OrvilleReclaimRegistry connStr reclaimSchema TestKit.reclaimSpec
 
-            -- Verify the user's database operation was committed
-            let countOpsSQL = RawSql.fromText $ "SELECT COUNT(*) FROM " <> workerTestSchemaName <> ".test_operations WHERE operation = 'processed'"
-            result2 <- liftIO $ RawSql.execute conn countOpsSQL
-            rows2 <- liftIO $ ExecResult.readRows result2
-            case rows2 of
-              [[(_name, val)]] -> do
-                case SqlValue.toInt64 val of
-                  Right count | count == 1 -> pure ()
-                  Right count -> liftIO $ expectationFailure $ "Expected 1 row but got " <> show count
-                  Left err -> liftIO $ expectationFailure $ "Failed to decode count: " <> err
-              _ -> liftIO $ expectationFailure "Expected one row from COUNT query"
+recoverySchema :: Text
+recoverySchema = "arbiter_orville_recovery_test"
 
-      -- Cleanup test table
-      runOrvilleTest env $
-        O.executeVoid O.OtherQuery (RawSql.fromText $ "DROP TABLE IF EXISTS " <> workerTestSchemaName <> ".test_operations")
+type OrvilleRecoveryRegistry = '[Queue "arbiter_orville_recovery_test" OrvilleWorkerTestPayload]
+
+connectionRecoverySpec :: ByteString -> Spec
+connectionRecoverySpec connStr = withOrvilleBackend @OrvilleRecoveryRegistry connStr recoverySchema TestKit.connectionRecoverySpec
+
+lifecycleSchema :: Text
+lifecycleSchema = "arbiter_orville_lifecycle_test"
+
+type OrvilleLifecycleRegistry =
+  '[QueueWithResult "arbiter_orville_lifecycle_test" OrvilleWorkerTestPayload (Maybe [Text])]
+
+lifecycleSpec :: ByteString -> Spec
+lifecycleSpec connStr = withOrvilleBackend @OrvilleLifecycleRegistry connStr lifecycleSchema TestKit.lifecycleSpec

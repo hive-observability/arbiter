@@ -1,10 +1,8 @@
 # Batched Handlers
 
-`defaultBatchedWorkerConfig` configures a manual handler that receives up to
-`batchSize` jobs in each invocation. The handler can combine operations for
-these jobs. A batch of grouped jobs contains one group. A batch of ungrouped
-jobs contains jobs from the ready set. Use the supplied callbacks to finalize
-each job.
+`defaultBatchedWorkerConfig workers batchSize handler` passes up to
+`batchSize` jobs per call. A grouped batch holds one group. An ungrouped batch
+holds ready jobs.
 
 ```haskell
 -- defaultBatchedWorkerConfig <workerCount> <batchSize> handler
@@ -21,9 +19,8 @@ batchHandler jobs cbs = do
   Worker.ackAllWith cbs scored
 ```
 
-Each callback runs in a separate transaction. Wrap a callback in
-`withDbTransaction` to commit the ack and application writes in one
-transaction:
+Each callback commits on its own. `withDbTransaction` commits a callback with
+application writes:
 
 ```haskell
 batchHandler jobs cbs =
@@ -34,15 +31,16 @@ batchHandler jobs cbs =
       Worker.ackWith cbs job score
 ```
 
-`onJobSuccess` does not commit in the transaction with these writes. It can run
-for a job that Arbiter later processes again. Put effects that must occur one
-time in the same transaction as the ack.
+`onJobSuccess` fires outside that transaction and can fire for a job that is
+later redelivered. Put once-only effects in the ack's transaction.
 
-A disposition applies to one job. A failure, cancellation, or nack does not
-change completed jobs in the batch. Arbiter reprocesses an unfinalized job.
-`ackWith` and `ackAllWith` store the queue [result](../features/results.md).
-`ack` and `ackAll` do not store a result and work with all queues. `spawn`
-inserts children under the job and suspends it until they finish, covered under
-[job trees](../features/job-trees.md#spawning-children-at-runtime). The
+| Callback | Effect |
+| --- | --- |
+| `ack`, `ackAll` | complete, no result |
+| `ackWith`, `ackAllWith` | complete and store the queue [result](../features/results.md) |
+| `failRetry`, `failPermanent`, `cancelBranch`, `cancelTree`, `nack` | see [Error Handling](../features/error-handling.md) |
+| `spawn` | insert children under the job and suspend it. See [Spawning Children at Runtime](../features/job-trees.md#spawning-children-at-runtime). |
+
+A callback affects one job. See the
 [`BatchCallbacks` haddocks](https://arbiterq.dev/arbiter-worker/Arbiter-Worker-Config.html#t:BatchCallbacks)
-list all dispositions.
+for each signature.

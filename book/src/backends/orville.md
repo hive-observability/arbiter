@@ -1,8 +1,7 @@
 # arbiter-orville (orville-postgresql)
 
-This backend uses `orville-postgresql`. Orville manages its connections and
-transactions. Handlers do not receive a connection parameter. Define a
-custom monad with `MonadOrville` and `MonadArbiter` instances:
+`orville-postgresql`. Orville owns its connections and transactions. Define a
+monad with `MonadOrville` and `MonadArbiter` instances:
 
 ```haskell
 {-# LANGUAGE TypeFamilies #-}
@@ -14,32 +13,30 @@ instance MonadArbiter AppM where
   -- ... executeQuery / executeStatement / withDbTransaction / runHandlerWithConnection
 ```
 
-`Handler` specifies the handler type. Because Orville does not pass a
-connection, this type contains the job argument only. Use
-`Arb.JobHandler AppM payload result` in handler signatures.
-[Writing a Backend](custom.md) covers the methods elided above.
+Handler signatures use `Arb.JobHandler AppM payload result`.
+[Writing a Backend](custom.md) covers the omitted methods.
 
-Orville does not expose its pooled connections for `LISTEN/NOTIFY`. Create a
-`DedicatedListen` from `Arbiter.Core.Listen` with the Orville pool connection
-string. Store it in the reader environment and return it from `getListener`.
+For `LISTEN/NOTIFY`, build a `Listener` with `newLibPQListener` from
+`arbiter-libpq` and the pool's connection string. Keep it in the reader
+environment and return it from `getListener`.
 
-`createOrvilleConnectionOptions` accepts an Arbiter `PoolConfig`. Use
-`poolConfigForWorkers` to calculate the Orville pool size:
+Size the Orville pool with `poolConfigForWorkers`:
 
 ```haskell
-import Arbiter.Core.Listen (DedicatedListen, dedicatedListener, newDedicatedListen)
+import Arbiter.Core.Listen (Listener)
+import Arbiter.LibPQ (newLibPQListener)
 
 data AppEnv = AppEnv
   { appSchema  :: SchemaName
   , appOrville :: O.OrvilleState
-  , appListen  :: DedicatedListen
+  , appListen  :: Listener
   }
 
 main :: IO ()
 main = do
   poolCfg <- Worker.poolConfigForWorkers workers
   orvillePool <- O.createConnectionPool (createOrvilleConnectionOptions connStr poolCfg)
-  listen <- newDedicatedListen connStr
+  listen <- newLibPQListener connStr
   let env =
         AppEnv
           { appSchema = "arbiter"
@@ -50,7 +47,7 @@ main = do
 
 instance MonadArbiter AppM where
   -- ... RegistryOf / Handler / getSchema and the query methods, as above
-  getListener = asks (Just . dedicatedListener . appListen)
+  getListener = asks (Just . appListen)
 ```
 
 See the [arbiter-orville haddocks](https://arbiterq.dev/arbiter-orville/Arbiter-Orville.html) for the connection options.

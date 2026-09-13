@@ -21,7 +21,7 @@ import Arbiter.Core.MonadArbiter (HasRegistry, MonadArbiter (..), ResultOf)
 import Arbiter.Core.PoolConfig (PoolConfig (..))
 import Arbiter.Core.QueueRegistry (Queue, RegistryTables)
 import Arbiter.Core.RateLimit.Spec (HasRateLimit (..), limitBy, tokenBucket)
-import Arbiter.Hasql (HasqlDb, createHasqlEnvWithConfig, runHasqlDb, setPreparedStatements)
+import Arbiter.Hasql (HasqlDb, createHasqlEnvWithConfig, runHasqlDb)
 import Arbiter.Migrations (MigrationResult (..), defaultMigrationConfig, runMigrationsForRegistry)
 import Arbiter.Orville
   ( createOrvilleConnectionOptions
@@ -42,7 +42,7 @@ import Arbiter.Worker
   , transactionalWorkerConfig
   )
 import Control.Concurrent (threadDelay)
-import Control.Concurrent.Async (mapConcurrently_, race_)
+import Control.Concurrent.Async (mapConcurrently_, race, race_)
 import Control.Concurrent.MVar (MVar, modifyMVar, newMVar)
 import Control.Exception (finally)
 import Control.Monad (replicateM, void, when)
@@ -52,10 +52,11 @@ import Control.Monad.Trans.Reader (ReaderT (..), asks)
 import Data.Aeson (FromJSON, ToJSON)
 import Data.ByteString (ByteString)
 import Data.Foldable (toList, traverse_)
-import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
+import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.Int (Int64)
 import Data.List (find, partition)
-import Data.List.NonEmpty (NonEmpty)
+import Data.List.NonEmpty (NonEmpty (..))
+import Data.List.NonEmpty qualified as NE
 import Data.Proxy (Proxy (..))
 import Data.String (fromString)
 import Data.Tagged (Tagged (..))
@@ -89,6 +90,8 @@ import Test.Tasty (localOption, mkTimeout)
 import Test.Tasty.Bench
 import Test.Tasty.Providers (IsTest (..), singleTest, testPassed)
 import UnliftIO (MonadUnliftIO)
+
+import BenchHasql (hasqlTransports)
 
 benchSchema :: Text
 benchSchema = "arbiter"
@@ -249,12 +252,16 @@ withInstrumentedPools otel configs use = do
         setGlobalTracerProvider tracerProvider
         use (map (Otel.instrumentConfig tel) configs)
 
+-- | The group an index lands in, spread evenly over @numGroups@ groups.
+modGroupKey :: Int -> Int -> Text
+modGroupKey numGroups index = T.pack $ "g" <> show ((index `mod` numGroups) + 1)
+
 -- | One job in a 'GroupedBacklog' queue, selected by index. A fifth are flaky and
 -- fail once into backoff. A fifth are scheduled into the near future. The rest are
 -- ready now.
 backlogJob :: UTCTime -> Int -> Int -> JobWrite BenchPayload
 backlogJob now numGroups index =
-  let groupKey = T.pack $ "g" <> show ((index `mod` numGroups) + 1)
+  let groupKey = modGroupKey numGroups index
    in case index `mod` 5 of
         0 -> defaultGroupedJob groupKey (BenchFlaky index)
         1 -> setNotVisibleUntil (Just (addUTCTime (scheduledDelay index) now)) $ defaultGroupedJob groupKey (BenchBatch index)
@@ -268,7 +275,7 @@ scheduledDelay index = realToFrac (0.5 + fromIntegral (index `mod` 7) * 0.4 :: D
 -- jobs parked 30 days out.
 dormantJob :: UTCTime -> Int -> Int -> JobWrite BenchPayload
 dormantJob now numGroups index =
-  let groupKey = T.pack $ "g" <> show ((index `mod` numGroups) + 1)
+  let groupKey = modGroupKey numGroups index
    in if odd (index `div` numGroups)
         then setNotVisibleUntil (Just (addUTCTime (30 * 86400) now)) $ defaultGroupedJob groupKey (BenchBatch index)
         else defaultGroupedJob groupKey (BenchBatch index)
@@ -279,6 +286,19 @@ dormantUngroupedJob now index =
   if odd index
     then setNotVisibleUntil (Just (addUTCTime (30 * 86400) now)) $ defaultJob (BenchBatch index)
     else defaultJob (BenchBatch index)
+
+-- | The job at @index@ in a queue of the flavor.
+flavorJob :: QueueFlavor -> UTCTime -> Int -> JobWrite BenchPayload
+flavorJob flavor now index = case flavor of
+  Ungrouped -> defaultJob (BenchBatch index)
+  Grouped numGroups -> defaultGroupedJob (modGroupKey numGroups index) (BenchBatch index)
+  GroupedSkewed numGroups hotGroups -> defaultGroupedJob (skewedGroupKey numGroups hotGroups index) (BenchBatch index)
+  Mixed numGroups
+    | even index -> defaultJob (BenchBatch index)
+    | otherwise -> defaultGroupedJob (modGroupKey numGroups index) (BenchBatch index)
+  GroupedBacklog numGroups -> backlogJob now numGroups index
+  GroupedDormant numGroups -> dormantJob now numGroups index
+  UngroupedDormant -> dormantUngroupedJob now index
 
 -- | A flaky job on its first attempt. The dispatcher increments attempts at
 -- claim. The retry lands on attempts >= 2 and succeeds.
@@ -344,22 +364,34 @@ data TriggerStats = TriggerStats
   , tsMeanTimeMs :: Double
   }
 
-resetTriggerStats :: Connection -> IO ()
-resetTriggerStats conn =
-  void $
-    PG.execute_
-      conn
-      "DO $$ BEGIN PERFORM pg_stat_reset_single_function_counters(oid) FROM pg_proc WHERE proname LIKE 'maintain_bench_queue_groups%'; END $$"
+-- | A predicate over trigger function names, given the name column.
+type TriggerPredicate = Query -> Query
 
-readTriggerStats :: Connection -> IO [TriggerStats]
-readTriggerStats conn =
+-- | The group-maintenance triggers.
+groupTriggers :: TriggerPredicate
+groupTriggers column = column <> " LIKE 'maintain_bench_queue_groups%'"
+
+-- | The concurrency and rate-limit triggers.
+gateTriggers :: TriggerPredicate
+gateTriggers column = column <> " LIKE 'maintain_bench_%concurrency%' OR " <> column <> " LIKE 'ensure_bench_%rate_limit%'"
+
+resetTriggerStatsWhere :: TriggerPredicate -> Connection -> IO ()
+resetTriggerStatsWhere predicate conn =
+  void
+    $ PG.execute_ conn
+    $ "DO $$ BEGIN PERFORM pg_stat_reset_single_function_counters(oid) FROM pg_proc WHERE "
+      <> predicate "proname"
+      <> "; END $$"
+
+readTriggerStatsWhere :: TriggerPredicate -> Connection -> IO [TriggerStats]
+readTriggerStatsWhere predicate conn =
   map (\(name, calls, total) -> TriggerStats name calls total (if calls > 0 then total / fromIntegral calls else 0))
     <$> PG.query_
       conn
-      "SELECT funcname::text, calls, total_time \
-      \FROM pg_stat_user_functions \
-      \WHERE funcname LIKE 'maintain_bench_queue_groups%' \
-      \ORDER BY funcname"
+      ( "SELECT funcname::text, calls, total_time FROM pg_stat_user_functions WHERE "
+          <> predicate "funcname"
+          <> " ORDER BY funcname"
+      )
 
 formatTriggerStats :: [TriggerStats] -> String
 formatTriggerStats [] = "  (no trigger stats)"
@@ -379,10 +411,9 @@ formatTriggerStats stats =
       )
       stats
 
-multiTrial :: Int -> IO () -> IO Double -> String -> IO String
-multiTrial trials setup measure unit = do
-  samples <- replicateM trials (setup >> measure)
-  pure $ formatStats unit (computeStats samples)
+-- | Run @trials@ setup-then-measure rounds and format the results.
+multiTrialWith :: ([r] -> String) -> Int -> IO () -> IO r -> IO String
+multiTrialWith format trials setup measure = format <$> replicateM trials (setup >> measure)
 
 -- ---------------------------------------------------------------------------
 -- Write-amplification / autovacuum sampling
@@ -403,9 +434,6 @@ data DbSnapshot = DbSnapshot
   , dsGroups :: TableSnap
   }
 
-zeroSnapshot :: DbSnapshot
-zeroSnapshot = DbSnapshot 0 (TableSnap 0 0 0 0) (TableSnap 0 0 0 0)
-
 -- | HOT-update percentage of total updates between two snapshots of a table.
 hotPct :: TableSnap -> TableSnap -> Double
 hotPct before after =
@@ -413,13 +441,9 @@ hotPct before after =
       hotUpdates = fromIntegral (tnHot after - tnHot before) :: Double
    in if updates > 0 then hotUpdates / updates * 100 else 0
 
--- | Dead tuples a table holds at one instant. Autovacuum lowers this.
-deadAt :: TableSnap -> Int64
-deadAt = tnDead
-
--- | 'deadAt' per 1000 jobs.
+-- | Dead tuples per 1000 jobs.
 deadPerK :: TableSnap -> Double -> Double
-deadPerK snap jobs = fromIntegral (deadAt snap) / jobs * 1000
+deadPerK snap jobs = fromIntegral (tnDead snap) / jobs * 1000
 
 -- | A table's snapshot row by relname from a pg_stat_user_tables result.
 snapRow :: [(Text, Int64, Int64, Int64, Int64)] -> Text -> TableSnap
@@ -472,11 +496,11 @@ mkSteadyResult throughput processed before after triggers =
     , srWalPerJob = fromIntegral (dsWal after - dsWal before) / jobs
     , srQueueHotPct = hotPct (dsQueue before) (dsQueue after)
     , srQueueUpdPerJob = fromIntegral (tnUpd (dsQueue after) - tnUpd (dsQueue before)) / jobs
-    , srQueueDead = deadAt (dsQueue after)
+    , srQueueDead = tnDead (dsQueue after)
     , srQueueDeadPerK = deadPerK (dsQueue after) jobs
     , srQueueAutovac = tnAutovac (dsQueue after) - tnAutovac (dsQueue before)
     , srGroupsHotPct = hotPct (dsGroups before) (dsGroups after)
-    , srGroupsDead = deadAt (dsGroups after)
+    , srGroupsDead = tnDead (dsGroups after)
     , srGroupsDeadPerK = deadPerK (dsGroups after) jobs
     , srGroupsAutovac = tnAutovac (dsGroups after) - tnAutovac (dsGroups before)
     , srTriggers = triggers
@@ -518,21 +542,16 @@ formatSteady results =
     meanOf :: (SteadyResult -> Double) -> Double
     meanOf field = sum (map field results) / fromIntegral (length results)
 
-multiTrialSteady :: Int -> IO () -> IO SteadyResult -> IO String
-multiTrialSteady trials setup measure = do
-  results <- replicateM trials (setup >> measure)
-  pure $ formatSteady results
-
 -- | Bracket an action returning (throughput, jobs processed) with trigger-stat
 -- reset and WAL/churn snapshots, yielding a 'SteadyResult'. For trials whose
 -- whole duration is the measurement window, such as the worker benches.
 captureWindow :: Connection -> IO (Double, Int) -> IO SteadyResult
 captureWindow statsConn body = do
-  resetTriggerStats statsConn
+  resetTriggerStatsWhere groupTriggers statsConn
   snap0 <- captureDbSnapshot statsConn
   (throughput, processed) <- body
   snap1 <- captureDbSnapshot statsConn
-  trg <- readTriggerStats statsConn
+  trg <- readTriggerStatsWhere groupTriggers statsConn
   pure (mkSteadyResult throughput processed snap0 snap1 trg)
 
 type RunM m = forall a. m a -> IO a
@@ -630,47 +649,34 @@ runWorkerTrial runM statsConn configs totalJobs durationUs =
 -- | Shared measurement window: run workers and producers, warm up, then
 -- measure one snapshot-bounded interval and report throughput.
 runMeasuredWindow
-  :: snap
-  -> (Connection -> IO snap)
-  -> (Connection -> IO ())
-  -> (Connection -> IO [TriggerStats])
+  :: (Connection -> IO snap)
+  -> TriggerPredicate
   -> [Text]
   -> Connection
   -> IORef Int
   -> [IO ()]
   -> Int
   -> IO (Double, Int, snap, snap, [TriggerStats])
-runMeasuredWindow zeroSnap captureSnap resetTrg readTrg analyzeTables statsConn processedCounter threads durationUs = do
-  startTime <- getCurrentTime
-  startRef <- newIORef startTime
-  endRef <- newIORef startTime
-  snap0Ref <- newIORef zeroSnap
-  snap1Ref <- newIORef zeroSnap
-  trgRef <- newIORef []
-  race_
-    (mapConcurrently_ id threads)
-    ( do
-        threadDelay steadyStateWarmupUs
-        writeIORef processedCounter 0
-        -- Window start. Reset trigger stats and ANALYZE the tables. The WAL/churn
-        -- snapshot follows the ANALYZE.
-        resetTrg statsConn
-        traverse_ (\table -> execute_ statsConn ("ANALYZE " <> benchSchema <> "." <> table)) analyzeTables
-        captureSnap statsConn >>= writeIORef snap0Ref
-        getCurrentTime >>= writeIORef startRef
-        threadDelay durationUs
-        getCurrentTime >>= writeIORef endRef
-        captureSnap statsConn >>= writeIORef snap1Ref
-        readTrg statsConn >>= writeIORef trgRef
-    )
-  processed <- readIORef processedCounter
-  start <- readIORef startRef
-  end <- readIORef endRef
-  snap0 <- readIORef snap0Ref
-  snap1 <- readIORef snap1Ref
-  trg <- readIORef trgRef
-  let elapsed = realToFrac (diffUTCTime end start) :: Double
-  pure (fromIntegral processed / elapsed, processed, snap0, snap1, trg)
+runMeasuredWindow captureSnap triggers analyzeTables statsConn processedCounter threads durationUs =
+  race (mapConcurrently_ id threads) window
+    >>= either (const (die "bench threads exited before the window closed")) pure
+  where
+    window = do
+      threadDelay steadyStateWarmupUs
+      writeIORef processedCounter 0
+      -- Window start. Reset trigger stats and ANALYZE the tables. The WAL/churn
+      -- snapshot follows the ANALYZE.
+      resetTriggerStatsWhere triggers statsConn
+      traverse_ (\table -> execute_ statsConn ("ANALYZE " <> benchSchema <> "." <> table)) analyzeTables
+      snap0 <- captureSnap statsConn
+      start <- getCurrentTime
+      threadDelay durationUs
+      end <- getCurrentTime
+      snap1 <- captureSnap statsConn
+      trg <- readTriggerStatsWhere triggers statsConn
+      processed <- readIORef processedCounter
+      let elapsed = realToFrac (diffUTCTime end start) :: Double
+      pure (fromIntegral processed / elapsed, processed, snap0, snap1, trg)
 
 -- | Steady-state trial. Producers insert continuously while workers consume.
 -- Workers increment a counter per job.
@@ -703,39 +709,14 @@ runSteadyStateTrial runM producerRunM statsConn configs processedCounter produce
         let go = do
               offset <- atomicModifyIORef' batchCounter (\count -> (count + producerBatchSize, count))
               now <- getCurrentTime
-              let jobs = case flavor of
-                    Ungrouped ->
-                      [defaultJob (BenchBatch index) | index <- [1 .. producerBatchSize]]
-                    Grouped numGroups ->
-                      [ defaultGroupedJob (T.pack $ "g" <> show (((offset + index) `mod` numGroups) + 1)) (BenchBatch index)
-                      | index <- [1 .. producerBatchSize]
-                      ]
-                    GroupedSkewed numGroups hotGroups ->
-                      [ defaultGroupedJob (skewedGroupKey numGroups hotGroups (offset + index)) (BenchBatch index)
-                      | index <- [1 .. producerBatchSize]
-                      ]
-                    Mixed numGroups ->
-                      [ if even index
-                          then defaultJob (BenchBatch index)
-                          else defaultGroupedJob (T.pack $ "g" <> show (((offset + index) `mod` numGroups) + 1)) (BenchBatch index)
-                      | index <- [1 .. producerBatchSize]
-                      ]
-                    GroupedBacklog numGroups ->
-                      [backlogJob now numGroups (offset + index) | index <- [1 .. producerBatchSize]]
-                    GroupedDormant numGroups ->
-                      [dormantJob now numGroups (offset + index) | index <- [1 .. producerBatchSize]]
-                    UngroupedDormant ->
-                      [dormantUngroupedJob now (offset + index) | index <- [1 .. producerBatchSize]]
-              producerRunM $ void $ HL.insertJobsBatch_ jobs
+              producerRunM $ void $ HL.insertJobsBatch_ (map (flavorJob flavor now . (offset +)) [1 .. producerBatchSize])
               when (producerDelayUs > 0) $ threadDelay producerDelayUs
               go
          in go
   (throughput, processed, snap0, snap1, trg) <-
     runMeasuredWindow
-      zeroSnapshot
       captureDbSnapshot
-      resetTriggerStats
-      readTriggerStats
+      groupTriggers
       ["bench_queue", "bench_queue_groups"]
       statsConn
       processedCounter
@@ -880,26 +861,6 @@ captureGatedSnap conn = do
   (wal, snapFor) <- captureTableSnaps conn ["arbiter_concurrency", "arbiter_rate_limits"]
   pure $ GatedSnap wal (snapFor "arbiter_concurrency") (snapFor "arbiter_rate_limits")
 
-zeroGatedSnap :: GatedSnap
-zeroGatedSnap = GatedSnap 0 (TableSnap 0 0 0 0) (TableSnap 0 0 0 0)
-
-resetGatedTriggers :: Connection -> IO ()
-resetGatedTriggers conn =
-  void $
-    PG.execute_
-      conn
-      "DO $$ BEGIN PERFORM pg_stat_reset_single_function_counters(oid) FROM pg_proc \
-      \WHERE proname LIKE 'maintain_bench_%concurrency%' OR proname LIKE 'ensure_bench_%rate_limit%'; END $$"
-
-readGatedTriggers :: Connection -> IO [TriggerStats]
-readGatedTriggers conn =
-  map (\(name, calls, total) -> TriggerStats name calls total (if calls > 0 then total / fromIntegral calls else 0))
-    <$> PG.query_
-      conn
-      "SELECT funcname::text, calls, total_time FROM pg_stat_user_functions \
-      \WHERE funcname LIKE 'maintain_bench_%concurrency%' OR funcname LIKE 'ensure_bench_%rate_limit%' \
-      \ORDER BY funcname"
-
 mkGatedResult :: Double -> Int -> GatedSnap -> GatedSnap -> [TriggerStats] -> GatedResult
 mkGatedResult throughput processed (GatedSnap walBefore concBefore rateBefore) (GatedSnap walAfter concAfter rateAfter) triggers =
   GatedResult
@@ -934,9 +895,6 @@ formatGated results =
     meanOf :: (GatedResult -> Double) -> Double
     meanOf field = sum (map field results) / fromIntegral (length results)
 
-multiTrialGated :: Int -> IO () -> IO GatedResult -> IO String
-multiTrialGated trials setup measure = formatGated <$> replicateM trials (setup >> measure)
-
 -- | One steady-state window over a gated queue: 10 producers insert, each 10-worker pool acks.
 runGatedSteadyTrial
   :: ( EncodeJobResult (ResultOf m payload)
@@ -962,10 +920,8 @@ runGatedSteadyTrial runM producerRunM statsConn cfgs processedCounter table mkJo
         producer
   (throughput, processed, snap0, snap1, trg) <-
     runMeasuredWindow
-      zeroGatedSnap
       captureGatedSnap
-      resetGatedTriggers
-      readGatedTriggers
+      gateTriggers
       [table, table <> "_groups"]
       statsConn
       processedCounter
@@ -1049,7 +1005,11 @@ gatingBenches settle trial =
         mode label benchMode pools =
           singleTest label
             $ ThroughputBench
-            $ multiTrialGated trialCount (settle >> cleanupGatedFresh table) (trial benchMode pools table mkJob trialDurationUs)
+            $ multiTrialWith
+              formatGated
+              trialCount
+              (settle >> cleanupGatedFresh table)
+              (trial benchMode pools table mkJob trialDurationUs)
 
 setupQueue :: SimpleEnv BenchRegistry -> Int -> QueueFlavor -> IO ()
 setupQueue simpleEnv totalJobs flavor = do
@@ -1058,29 +1018,7 @@ setupQueue simpleEnv totalJobs flavor = do
   now <- getCurrentTime
 
   let chunkSize = 50000
-      mkJobs offset = case flavor of
-        Ungrouped ->
-          [defaultJob (BenchBatch index) | index <- [offset + 1 .. min (offset + chunkSize) totalJobs]]
-        Grouped numGroups ->
-          [ defaultGroupedJob (T.pack $ "g" <> show ((index `mod` numGroups) + 1)) (BenchBatch index)
-          | index <- [offset + 1 .. min (offset + chunkSize) totalJobs]
-          ]
-        GroupedSkewed numGroups hotGroups ->
-          [ defaultGroupedJob (skewedGroupKey numGroups hotGroups index) (BenchBatch index)
-          | index <- [offset + 1 .. min (offset + chunkSize) totalJobs]
-          ]
-        Mixed numGroups ->
-          [ if even index
-              then defaultJob (BenchBatch index)
-              else defaultGroupedJob (T.pack $ "g" <> show ((index `mod` numGroups) + 1)) (BenchBatch index)
-          | index <- [offset + 1 .. min (offset + chunkSize) totalJobs]
-          ]
-        GroupedBacklog numGroups ->
-          [backlogJob now numGroups index | index <- [offset + 1 .. min (offset + chunkSize) totalJobs]]
-        GroupedDormant numGroups ->
-          [dormantJob now numGroups index | index <- [offset + 1 .. min (offset + chunkSize) totalJobs]]
-        UngroupedDormant ->
-          [dormantUngroupedJob now index | index <- [offset + 1 .. min (offset + chunkSize) totalJobs]]
+      mkJobs offset = map (flavorJob flavor now) [offset + 1 .. min (offset + chunkSize) totalJobs]
       go offset
         | offset >= totalJobs = pure ()
         | otherwise = do
@@ -1107,7 +1045,11 @@ main = do
   let benchPoolConfig = PoolConfig {poolSize = 25, poolIdleTimeout = 60, poolStripes = Just 4}
   simpleEnv <- createSimpleEnvWithConfig (Proxy @BenchRegistry) benchConnStr benchSchema benchPoolConfig
 
-  hasqlEnv <- createHasqlEnvWithConfig (Proxy @BenchRegistry) benchConnStr benchSchema benchPoolConfig
+  hasqlEnvs <-
+    traverse
+      ( \(label, connect) -> (label,) <$> createHasqlEnvWithConfig (Proxy @BenchRegistry) (connect benchConnStr) benchSchema benchPoolConfig
+      )
+      hasqlTransports
 
   let orvilleOptions = createOrvilleConnectionOptions benchConnStr benchPoolConfig
   orvillePool <- O.createConnectionPool orvilleOptions
@@ -1140,95 +1082,45 @@ main = do
       producerRun :: RunM SimpleM
       producerRun = runSimpleDb producerEnv
 
-      -- Prepared claims on, the recommended direct-connection setting.
-      hasqlPreparedRun :: RunM HasqlM
-      hasqlPreparedRun = runHasqlDb (setPreparedStatements True hasqlEnv)
+      hasqlRun :: RunM HasqlM
+      hasqlRun = runHasqlDb (snd (NE.head hasqlEnvs))
+      hasqlGroups (label, env) =
+        let run :: RunM HasqlM
+            run = runHasqlDb env
+         in [ bgroup ("Worker Throughput (" <> label <> ")") $
+                mkWorkerBenches simpleEnv (hasqlWorkerTrial run statsConn)
+            , bgroup ("Steady-State Throughput (" <> label <> ")") $
+                steadyStateBenches $
+                  steadyStateTrial run producerRun statsConn $ \workers counter ->
+                    transactionalWorkerConfig workers $ \(_conn :: Hasql.Connection) job ->
+                      flakyGate (countProcessed counter) job
+            , bgroup ("Gating Overhead (" <> label <> ")") $
+                gatingBenches settleGated (hasqlGatedSteadyTrial run producerRun statsConn)
+            ]
 
       orvilleRun :: RunM OrvilleM
       orvilleRun action = runReaderT (unBenchOrville action) (benchSchema, orvilleState)
 
-  defaultMain $
-    map
+  defaultMain
+    $ map
       (localOption (mkTimeout benchTimeout))
-      [ bgroup "Worker Throughput (simple)" $
-          simpleWorkerBenches statsConn simpleEnv simpleRun
-      , bgroup "Worker Throughput (hasql)" $
-          hasqlWorkerBenches statsConn simpleEnv hasqlPreparedRun
+    $ [ bgroup "Worker Throughput (simple)" $
+          mkWorkerBenches simpleEnv (simpleWorkerTrial simpleRun statsConn)
       , bgroup "Group Cardinality and Skew (hasql)" $
-          groupShapeBenches statsConn simpleEnv hasqlPreparedRun
+          groupShapeBenches statsConn simpleEnv hasqlRun
       , bgroup "Worker Throughput (orville)" $
-          orvilleWorkerBenches statsConn simpleEnv orvilleRun
+          mkWorkerBenches simpleEnv (orvilleWorkerTrial orvilleRun statsConn)
       , bgroup "Steady-State Throughput (simple)" $
           steadyStateBenches $
             steadyStateTrial simpleRun producerRun statsConn $ \workers counter ->
               transactionalWorkerConfig workers $ \(_conn :: Connection) job ->
                 flakyGate (countProcessed counter) job
-      , bgroup "Steady-State Throughput (hasql)" $
-          steadyStateBenches $
-            steadyStateTrial hasqlPreparedRun producerRun statsConn $ \workers counter ->
-              transactionalWorkerConfig workers $ \(_conn :: Hasql.Connection) job ->
-                flakyGate (countProcessed counter) job
       , bgroup "Steady-State Throughput (orville)" $
           steadyStateBenches $
             steadyStateTrial orvilleRun producerRun statsConn $ \workers counter ->
               transactionalWorkerConfig workers $ \job -> flakyGate (countProcessed counter) job
-      , bgroup "Gating Overhead (hasql)" $
-          gatingBenches settleGated (hasqlGatedSteadyTrial hasqlPreparedRun producerRun statsConn)
       ]
-
-_claimBenches :: SimpleEnv BenchRegistry -> Int -> [(String, QueueFlavor)] -> [Benchmark]
-_claimBenches simpleEnv queueSize flavors =
-  flip map flavors $ \(label, flavor) ->
-    let mkBench name action =
-          singleTest name
-            $ ThroughputBench
-            $ multiTrial
-              trialCount
-              (setupQueue simpleEnv queueSize flavor)
-              (claimTrial (runSimpleDb simpleEnv) trialDurationUs action)
-              "claims/sec"
-     in bgroup
-          label
-          [ mkBench "claim 1" $
-              not . null <$> (HL.claimNextVisibleJobs 1 60 :: SimpleDb BenchRegistry IO [JobRead BenchPayload])
-          , mkBench "claim 20x10" $
-              not . null <$> (HL.claimNextVisibleJobsBatched 10 20 60 :: SimpleDb BenchRegistry IO [NonEmpty (JobRead BenchPayload)])
-          ]
-
-claimTrial :: RunM m -> Int -> m Bool -> IO Double
-claimTrial runM durationUs claimAction = do
-  counter <- newIORef (0 :: Int)
-  start <- getCurrentTime
-  race_
-    ( let go = do
-            gotWork <- runM claimAction
-            modifyIORef' counter (+ 1)
-            when gotWork go
-       in go
-    )
-    (threadDelay durationUs)
-  end <- getCurrentTime
-  count <- readIORef counter
-  let elapsed = realToFrac (diffUTCTime end start) :: Double
-  pure (fromIntegral count / elapsed)
-
-simpleWorkerBenches :: Connection -> SimpleEnv BenchRegistry -> RunM SimpleM -> [Benchmark]
-simpleWorkerBenches statsConn simpleEnv runM =
-  mkWorkerBenches
-    simpleEnv
-    (\jobs duration pools workers mode -> simpleWorkerTrial runM statsConn jobs duration pools workers mode)
-
-hasqlWorkerBenches :: Connection -> SimpleEnv BenchRegistry -> RunM HasqlM -> [Benchmark]
-hasqlWorkerBenches statsConn simpleEnv runM =
-  mkWorkerBenches
-    simpleEnv
-    (\jobs duration pools workers mode -> hasqlWorkerTrial runM statsConn jobs duration pools workers mode)
-
-orvilleWorkerBenches :: Connection -> SimpleEnv BenchRegistry -> RunM OrvilleM -> [Benchmark]
-orvilleWorkerBenches statsConn simpleEnv runM =
-  mkWorkerBenches
-    simpleEnv
-    (\jobs duration pools workers mode -> orvilleWorkerTrial runM statsConn jobs duration pools workers mode)
+      <> concatMap hasqlGroups (NE.toList hasqlEnvs)
 
 -- | Measure the group-maintenance cost as group size and key skew increase.
 -- A smaller trial set keeps this diagnostic suite practical.
@@ -1256,7 +1148,8 @@ groupShapeBenches statsConn simpleEnv runM = map profile shapes
         measured name mode =
           singleTest name
             $ ThroughputBench
-            $ multiTrialSteady
+            $ multiTrialWith
+              formatSteady
               shapeTrials
               (setupQueue simpleEnv totalJobs flavor)
               (trial totalJobs shapeDurationUs 4 10 mode)
@@ -1304,7 +1197,8 @@ mkWorkerFlavorBenches simpleEnv trial pools workers flavors =
         let mkBench name mode =
               singleTest name
                 $ ThroughputBench
-                $ multiTrialSteady
+                $ multiTrialWith
+                  formatSteady
                   trialCount
                   (setupQueue simpleEnv numJobs flavor)
                   (trial numJobs trialDurationUs pools workers mode)
@@ -1324,7 +1218,8 @@ steadyStateBenches trial =
             mkBench name mode otel =
               singleTest name
                 $ ThroughputBench
-                $ multiTrialSteady
+                $ multiTrialWith
+                  formatSteady
                   trialCount
                   cleanupFresh
                   (trial trialDurationUs 4 10 producerBatch mode flavor otel)

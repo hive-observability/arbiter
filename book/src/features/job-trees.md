@@ -1,7 +1,7 @@
 # Job Trees (Fan-out/Fan-in)
 
-Children run in parallel. Parents run when all of their children are acked or
-DLQ'd.
+Children run in parallel. A parent runs when every child is acked or in the
+DLQ.
 
 ```haskell
 import Arbiter.Core.JobTree (leaf, rollup, (<~~))
@@ -40,13 +40,7 @@ myTree = rollup (Arb.defaultJob Aggregate)
   )
 ```
 
-A nested rollup does not automatically merge results into the next level. Each
-intermediate finalizer must return the merged value.
-
-A parent reads its immediate child results with `Worker.mergedChildResults`.
-This function merges successful results and reports DLQ entries by the key used
-for `retryFromDLQ`. Arbiter removes intermediate results when it acks the
-parent.
+Each intermediate finalizer returns the value for the level above.
 
 ```haskell
 handler :: Arb.JobHandler (ArbS.SimpleDb PipelineRegistry IO) PipelinePayload [Text]
@@ -66,19 +60,15 @@ handler _conn job =
 config <- Worker.transactionalWorkerConfig 4 handler
 ```
 
-Tree-scoped cancellation:
-
-- `throwTreeCancel` cancels the root and all descendants.
-- `throwBranchCancel` deletes the current job's parent and all descendants of
-  that parent. This includes the current job and its siblings.
+| Exception | Deletes |
+| --- | --- |
+| `throwTreeCancel` | the root and every descendant |
+| `throwBranchCancel` | the current job's parent and every descendant of that parent |
 
 ## Spawning Children at Runtime
 
-`insertJobTree` needs the whole tree up front. A handler that only discovers its
-children while running uses the `spawn` callback instead. It inserts children
-under the running job and suspends that job in one transaction. The job becomes a
-finalizer and wakes once every child has left the main queue,
-where `mergedChildResults` reads what the children stored.
+`spawn` inserts children under the running job and suspends it, in one
+transaction. The job wakes when every child has left the main queue.
 
 ```haskell
 batchHandler jobs cbs = for_ jobs $ \job -> do
@@ -91,36 +81,26 @@ batchHandler jobs cbs = for_ jobs $ \job -> do
     Just cs -> Worker.spawn cbs job (fmap (Arb.defaultJob . ProcessChunk) cs)
 ```
 
-Each spawn drops the previous round's results, so `mergedChildResults` returns
-only the children of the round that just finished.
+With `transactionalWorkerConfig`, call `Arb.spawnChildren` in the handler. The
+worker's ack suspends the job in the same transaction. Every round stores the
+handler's return value. Return `mempty` from a round that spawns.
 
-In `transactionalWorkerConfig`, call `Arb.spawnChildren` in the handler instead.
-The worker's own ack runs in the same transaction and suspends the job the same
-way. That path stores the handler's return value on every round, so return
-`mempty` from a round that spawns.
-
-Spawn rules:
-
-- A spawn round counts as a success and fires `onJobSuccess`.
-- A spawn hands back the attempt its claim consumed, so rounds leave
-  `maxAttempts` for real failures. Nothing bounds the number of rounds, so a
-  handler that always spawns runs forever.
-- A spawn is atomic with the suspension. A crash before the commit reprocesses
-  the job and spawns again, so give the children dedup keys when a repeat insert
-  would be wrong.
-- A child that lands in the DLQ has left the main queue and wakes the finalizer.
-  Its error arrives in `mergedChildResults` for that round. The next spawn detaches
-  it, so a later round never sees it and a retry of it restores it as a root.
-- A dedup conflict on any child aborts the handler and commits nothing. The abort
-  names only the spawning job. Its batch siblings are nack'd, so they hand back the
-  attempt their claim consumed.
-- A settle after a spawn is ignored with a warning. The row is suspended and
-  answers to the next round, not to the claim that spawned.
+- **Hooks.** A spawn round fires `onJobSuccess`.
+- **Attempts.** A spawn refunds the attempt its claim spent. Rounds are
+  unbounded.
+- **Results.** Each spawn deletes the previous round's results.
+- **Crash before commit.** The job is reprocessed and spawns again. Give the
+  children dedup keys when a repeat insert is wrong.
+- **Child in the DLQ.** It wakes the finalizer. Its error is in that round's
+  `mergedChildResults`. The next spawn detaches it. A DLQ retry restores it as
+  a root.
+- **Dedup conflict on a child.** The handler aborts and commits nothing. The
+  abort names the spawning job. Batch siblings are nacked.
+- **Callback after a spawn.** Ignored, with a warning.
 
 ## Chunked Data Migration
 
-To migrate a large table in parts, assign a set of row identifiers to each
-child job. The parent runs after all child jobs finish:
+Each child migrates one set of row ids:
 
 ```haskell
 import Data.List.NonEmpty qualified as NE

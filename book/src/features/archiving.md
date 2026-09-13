@@ -1,20 +1,18 @@
 # Archiving Completed Jobs
 
-Completed jobs are deleted on ack by default. Set `archiveFor` to keep a copy
-in a per-queue archive for that many seconds after completion.
+An acked job is deleted. `archiveFor` keeps a copy in the queue's archive for
+that many seconds:
 
 ```haskell
 job1 = Arb.defaultJob payload & Arb.setArchiveFor (Just Arb.dayRetention)       -- 24h
 job2 = Arb.defaultJob payload & Arb.setArchiveFor (Just $ Arb.dayRetention * 7) -- 1 week
 ```
 
-Archiving is optional for each job. Arbiter automatically removes expired
-entries. An archive entry contains the [result](results.md) from its handler.
-Use the REST API or admin UI to list, re-enqueue, or delete archived jobs.
+The archive entry holds the handler's [result](results.md). The reaper deletes
+expired entries. The REST API and admin UI list, re-enqueue, and delete
+archived jobs.
 
-A re-enqueued job has no parent. It retains its payload and settings.
-Re-enqueueing one member of a completed [tree](job-trees.md) creates one
-independent job. To recover a failed tree, retry it from the
-[dead-letter queue](dead-letter-queue.md).
+A re-enqueued job keeps its payload and settings and has no parent. Retry a
+failed [tree](job-trees.md) from the [dead-letter queue](dead-letter-queue.md).
 
 See the [`Arbiter.Core.Job.Archive` haddocks](https://arbiterq.dev/arbiter-core/Arbiter-Core-Job-Archive.html) for the archive row and its queries.

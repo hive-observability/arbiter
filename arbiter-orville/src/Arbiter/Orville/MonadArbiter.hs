@@ -8,7 +8,6 @@ module Arbiter.Orville.MonadArbiter
   , orvilleRunHandlerWithConnection
   ) where
 
-import Arbiter.Core.Array qualified as Array
 import Arbiter.Core.Codec (Col (..), NullCol (..), ParamType (..), SomeParam (..), runCodec)
 import Arbiter.Core.Exceptions (throwInternal)
 import Arbiter.Core.MonadArbiter (Query (..))
@@ -30,6 +29,8 @@ import Orville.PostgreSQL.Raw.PgTextFormatValue (PgTextFormatValue)
 import Orville.PostgreSQL.Raw.PgTextFormatValue qualified as PgText
 import Orville.PostgreSQL.Raw.SqlValue (SqlValue)
 import Orville.PostgreSQL.Raw.SqlValue qualified as SqlValue
+
+import Arbiter.Orville.Array qualified as Array
 
 -- | Run a query, decoding rows.
 orvilleExecuteQuery
@@ -79,8 +80,7 @@ colToBytes :: Col a -> a -> Either Text ByteString
 colToBytes col value = sqlValueToBytes $ FieldDef.fieldValueToSqlValue (colFieldDef "" col) value
 
 colToNullableBytes :: Col a -> Maybe a -> Either Text (Maybe ByteString)
-colToNullableBytes _ Nothing = Right Nothing
-colToNullableBytes col (Just value) = Just <$> colToBytes col value
+colToNullableBytes col = traverse (colToBytes col)
 
 sqlValueToBytes :: SqlValue -> Either Text ByteString
 sqlValueToBytes =
@@ -126,10 +126,5 @@ jsonbValue =
     O.jsonb
 
 readRowCount :: LibPQ.Result -> IO Int64
-readRowCount res = do
-  mbTuples <- LibPQ.cmdTuples res
-  case mbTuples of
-    Nothing -> pure 0
-    Just bytes -> case SqlValue.toInt (SqlValue.fromRawBytes bytes) of
-      Right count -> pure (fromIntegral count)
-      Left _ -> pure 0
+readRowCount res =
+  maybe 0 (either (const 0) fromIntegral . SqlValue.toInt . SqlValue.fromRawBytes) <$> LibPQ.cmdTuples res

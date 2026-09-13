@@ -109,8 +109,7 @@ import Arbiter.Core.Job.Types (RegistryAdmissionPolicies)
 import Arbiter.Core.QueueRegistry (Queue, QueueSpec (..), RegistryTables (..))
 import Arbiter.Core.Queues (createQueuesTableSQL)
 import Arbiter.Core.RateLimit.Schema
-  ( PolicyRow (..)
-  , addRateLimitColumnsSQL
+  ( addRateLimitColumnsSQL
   , addRateLimitCostColumnSQL
   , alterRateLimitsDurabilitySQL
   , arbiterRateLimitsTableName
@@ -119,11 +118,11 @@ import Arbiter.Core.RateLimit.Schema
   , createRateLimitPoliciesTableSQL
   , createRateLimitsTableSQL
   , createThrottledIndexSQL
-  , toPolicyRow
   , upsertPolicyRowSQL
   )
 import Arbiter.Core.RateLimit.Spec
   ( Durability (..)
+  , Policy (..)
   , registryRateLimitPolicies
   , registryRateLimitTables
   )
@@ -236,7 +235,7 @@ runMigrationsForRegistry proxy connStr schemaName config = do
       -- Policies are collected from each payload's 'rateLimitFor' selector.
       seeds =
         AdmissionSeeds
-          { seedRateLimitPolicies = map toPolicyRow (Set.toList (registryRateLimitPolicies @registry))
+          { seedRateLimitPolicies = Set.toList (registryRateLimitPolicies @registry)
           , seedConcurrencyPolicies = Set.toList (registryConcurrencyPolicies @registry)
           , seedDurability = rateLimitDurability config
           }
@@ -244,7 +243,7 @@ runMigrationsForRegistry proxy connStr schemaName config = do
 
 -- | Admission policy rows to seed after a successful migration.
 data AdmissionSeeds = AdmissionSeeds
-  { seedRateLimitPolicies :: [PolicyRow]
+  { seedRateLimitPolicies :: [Policy]
   , seedConcurrencyPolicies :: [ConcurrencyPolicy]
   , seedDurability :: Durability
   }
@@ -443,18 +442,18 @@ migrateSchema conn schemaName tableNames config (AdmissionSeeds policyRows concR
 -- | Upsert each policy's @default_*@ params into the policies table. Operator
 -- @override_*@ values stay intact. Idempotent. Overrides and removed prefixes survive
 -- a deploy.
-reconcileRateLimitPolicies :: PG.Connection -> SchemaName -> [PolicyRow] -> IO ()
+reconcileRateLimitPolicies :: PG.Connection -> SchemaName -> [Policy] -> IO ()
 reconcileRateLimitPolicies =
-  reconcilePolicyRows "rate-limit policy" "parameters" prefixId policyParamsKey upsertPolicyRowSQL
+  reconcilePolicyRows "rate-limit policy" "parameters" policyPrefix policyParamsKey upsertPolicyRowSQL
 
 -- | 'conflictingPrefixes' specialized to policy rows.
-conflictingPolicyPrefixes :: [PolicyRow] -> [Text]
-conflictingPolicyPrefixes = conflictingPrefixes prefixId policyParamsKey
+conflictingPolicyPrefixes :: [Policy] -> [Text]
+conflictingPolicyPrefixes = conflictingPrefixes policyPrefix policyParamsKey
 
 -- | A canonical conflict key for a policy's params, rendered as text. A NaN compares
 -- equal to itself.
-policyParamsKey :: PolicyRow -> String
-policyParamsKey row = show (maxTokens row, refillAmt row, interval row)
+policyParamsKey :: Policy -> String
+policyParamsKey policy = show (policyMax policy, policyRefill policy, policyInterval policy)
 
 -- | Upsert each pool's @default_limit@, leaving operator overrides intact. Two pools
 -- with the same prefix but different limits fail the migration.

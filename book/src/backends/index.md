@@ -1,9 +1,9 @@
 # Backend Integration
 
-The `MonadArbiter` typeclass separates the core from database libraries.
-Arbiter provides three adapters: [arbiter-simple](simple.md),
-[arbiter-orville](orville.md), and [arbiter-hasql](hasql.md). Use the adapter for
-the database library in your application if you want to share connections.
+`MonadArbiter` separates the core from the database library. Three adapters
+ship: [arbiter-simple](simple.md), [arbiter-orville](orville.md), and
+[arbiter-hasql](hasql.md). Use the one for your application's library to share
+connections.
 
 ## Benchmarks
 

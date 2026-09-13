@@ -7,10 +7,8 @@ module Arbiter.Core.Sql.Archive
   , updateArchiveResultSQL
   , updateArchiveResultsBatchSQL
   , purgeArchiveSQL
-  , archivePurgeBatch
   , listArchiveFilteredSQL
   , countArchiveFilteredSQL
-  , deleteArchiveJobSQL
   , deleteArchiveJobsBatchSQL
   , reEnqueueFromArchiveSQL
   , allArchiveColumns
@@ -23,7 +21,7 @@ import Data.Text qualified as T
 import Data.Time (UTCTime)
 import NeatInterpolation (text)
 
-import Arbiter.Core.Codec (archiveRowCodec, jobRowCodec)
+import Arbiter.Core.Codec (archiveRowCodec, codecColumns, jobRowCodec, joinColumns)
 import Arbiter.Core.Job.Schema (jobQueueArchiveTable, jobQueueTable)
 import Arbiter.Core.Job.Types (JobRead)
 import Arbiter.Core.Sql.Jobs (enqueuedAgainCols, jobColsExceptId, jobColumns)
@@ -33,14 +31,7 @@ import Arbiter.Core.Sql.Query (Query, rows)
 -- | The archive read columns, in codec order. The archive uses @job_id@ for the
 -- main-table @id@.
 allArchiveColumns :: Text
-allArchiveColumns =
-  [text|
-    id, completed_at, job_id, payload, group_key, inserted_at, updated_at, attempts, last_error, priority,
-    last_attempted_at, not_visible_until, dedup_key, dedup_strategy, max_attempts,
-    parent_id, parent_state, traceparent, tracestate, suspended, claimed_by, claim_seq,
-    archive_for, kind, rate_limit_key, rate_limit_prefix, concurrency_key, concurrency_prefix,
-    result
-  |]
+allArchiveColumns = joinColumns (codecColumns (archiveRowCodec ""))
 
 -- | The @archived@ CTE teeing rows from the named @ack@ CTE into the archive, per-row
 -- on @archive_for@. @archive_expires_at@ is precomputed. Shared by single and batch ack.
@@ -115,12 +106,6 @@ countArchiveFilteredSQL :: Text -> Text -> Query () -> Query Int64
 countArchiveFilteredSQL schema tableName whereFrag =
   let archiveTbl = jobQueueArchiveTable schema tableName
    in [sql|SELECT COUNT(*) AS @{count :: CInt8} FROM ${archiveTbl} ${whereFrag}|]
-
--- | Delete one archived job by its archive primary key.
-deleteArchiveJobSQL :: Text -> Text -> Int64 -> Query ()
-deleteArchiveJobSQL schema tableName archiveId =
-  let archiveTbl = jobQueueArchiveTable schema tableName
-   in [sql|DELETE FROM ${archiveTbl} WHERE id = #{archiveId :: CInt8}|]
 
 -- | Delete archived jobs by archive primary key.
 deleteArchiveJobsBatchSQL :: Text -> Text -> [Int64] -> Query ()

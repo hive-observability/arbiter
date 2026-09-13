@@ -1,0 +1,42 @@
+cabal-version:   3.0
+name:            arbiter-libpq
+version:         0.1.0.0
+synopsis:        libpq listener connection for arbiter
+description:
+  The LISTEN/NOTIFY connection adapter and dedicated listener for Arbiter
+  backends that talk to PostgreSQL through @postgresql-libpq@.
+
+license:         MIT
+license-file:    LICENSE
+author:          Joshua Miller
+maintainer:      joshua.ian.miller@pm.me
+category:        Database
+build-type:      Simple
+tested-with:     GHC >=9.10 && <9.11 || >=9.12 && <9.13 || >=9.14 && <9.15
+extra-doc-files: README.md
+homepage:        https://github.com/velveteer/arbiter
+bug-reports:     https://github.com/velveteer/arbiter/issues
+
+source-repository head
+  type:     git
+  location: https://github.com/velveteer/arbiter.git
+
+common shared-properties
+  default-language: GHC2024
+  ghc-options:
+    -Wall -Wcompat -Widentities -Wincomplete-record-updates
+    -Wincomplete-uni-patterns -Wmissing-home-modules -Wpartial-fields
+    -Wredundant-constraints -Werror=incomplete-patterns
+    -Wunused-packages -Wmissing-export-lists -Wunused-type-patterns
+    -Wderiving-defaults -Wmissing-deriving-strategies
+    -Wmissing-signatures
+
+library
+  import:          shared-properties
+  hs-source-dirs:  src
+  exposed-modules: Arbiter.LibPQ
+  build-depends:
+    , arbiter-core      >=0.1  && <0.2
+    , base              >=4.20 && <5
+    , bytestring        >=0.10 && <0.13
+    , postgresql-libpq  >=0.10 && <0.12

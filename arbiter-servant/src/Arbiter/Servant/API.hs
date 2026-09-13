@@ -23,7 +23,7 @@ module Arbiter.Servant.API
   , ConcurrencyAPI (..)
   ) where
 
-import Arbiter.Core.Job.Types (JobStatus, jobStatusToText)
+import Arbiter.Core.Job.Types (JobRead, JobStatus, jobStatusToText)
 import Arbiter.Core.QueueRegistry (JobPayloadRegistry, SpecName, SpecPayload, SpecResult)
 import Arbiter.Core.Sql.Jobs
   ( ArchiveSortColumn
@@ -107,7 +107,7 @@ data JobsAPI payload result mode = JobsAPI
     insertJob
       :: mode
         :- ReqBody '[JSON] (ApiJobWrite payload)
-          :> Post '[JSON] (JobResponse (ApiJob payload))
+          :> Post '[JSON] (JobResponse (JobRead payload))
   , -- POST /:table/jobs/batch (insert multiple jobs)
     insertJobsBatch
       :: mode

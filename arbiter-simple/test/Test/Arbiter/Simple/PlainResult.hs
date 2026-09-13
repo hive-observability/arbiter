@@ -6,7 +6,7 @@
 -- | Covers two paths 'Arbiter.Worker.TestKit.workerSpec' cannot reach. One is a
 -- plain non-@Maybe@ result type. The other is a @Queue@ entry whose
 -- 'Arbiter.Core.ResultOf' is @()@.
-module Test.Arbiter.Worker.PlainResult (spec) where
+module Test.Arbiter.Simple.PlainResult (spec) where
 
 import Arbiter.Core.HighLevel qualified as HL
 import Arbiter.Core.Job.Archive qualified as Archive
@@ -23,9 +23,8 @@ import Arbiter.Core.JobTree ((<~~))
 import Arbiter.Core.JobTree qualified as JT
 import Arbiter.Core.MonadArbiter (JobHandler)
 import Arbiter.Core.QueueRegistry (Queue, QueueSpec (..))
-import Arbiter.Simple (SimpleDb, createSimpleEnv, destroySimpleEnv, runSimpleDb)
 import Arbiter.Test.Poll (waitUntil, withLinkedAsync)
-import Arbiter.Test.Setup (addQueueTable, cleanupData, setupOnce)
+import Arbiter.Test.Setup (addQueueTable, cleanupData, setupOnce, withConn)
 import Arbiter.Worker (mergedChildResults, runWorkerPool)
 import Arbiter.Worker.BackoffStrategy (Jitter (NoJitter))
 import Arbiter.Worker.Config
@@ -46,10 +45,11 @@ import Data.Map.Strict qualified as Map
 import Data.Maybe (isJust)
 import Data.Proxy (Proxy (..))
 import Data.Text (Text)
-import Database.PostgreSQL.Simple (close, connectPostgreSQL)
 import GHC.Generics (Generic)
 import Test.Hspec (Spec, beforeAll, describe, it, shouldBe, shouldMatchList, shouldReturn)
 import UnliftIO (bracket)
+
+import Arbiter.Simple (SimpleDb, createSimpleEnv, destroySimpleEnv, runSimpleDb)
 
 newtype NoResultPayload = NoResultTask Text
   deriving stock (Eq, Generic, Show)
@@ -74,11 +74,8 @@ resultTable :: Text
 resultTable = "plain_result"
 
 cleanup :: ByteString -> IO ()
-cleanup connStr = do
-  conn <- connectPostgreSQL connStr
-  cleanupData testSchema noResultTable conn
-  cleanupData testSchema resultTable conn
-  close conn
+cleanup connStr =
+  withConn connStr $ \conn -> cleanupData testSchema noResultTable conn *> cleanupData testSchema resultTable conn
 
 spec :: ByteString -> Spec
 spec connStr =

@@ -38,7 +38,7 @@ reportWaitMicros = 5_000_000
 listenerSpec :: Spec
 listenerSpec = describe "Listener logging" $
   it "reports a connection failure once for all registrants" $ do
-    listener <- Listen.newPoolListener (const (throwIO (ErrorCall "connect failed")))
+    listener <- Listen.newListener (const (throwIO (ErrorCall "connect failed")))
     first <- newTVarIO ([] :: [Text])
     second <- newTVarIO ([] :: [Text])
     Listen.withChannels listener (reportingTo first) [("arbiter_logging_test_a", const (pure ()))] $ \_ ->

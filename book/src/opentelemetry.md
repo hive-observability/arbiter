@@ -1,8 +1,7 @@
 # OpenTelemetry
 
-Arbiter includes spans and W3C trace-context propagation. These features do not
-require configuration. The `arbiter-otel` package adds metrics, gauges, and
-OTel log records over OTLP:
+Spans and W3C trace-context propagation are built in. `arbiter-otel` adds
+metrics, gauges, and OTel log records over OTLP:
 
 ```haskell
 import Arbiter.Otel qualified as Otel
@@ -15,67 +14,63 @@ main = do
     Otel.runWorkerPools [namedWorkerPool emailCfg, namedWorkerPool imageCfg]
 ```
 
-Use `Otel.runWorkerPools` in place of `runWorkerPools`. The arguments are the
-same. It installs the SDK, instruments the pools, and starts the gauges. Call it
-one time in each process.
+`Otel.runWorkerPools` replaces `runWorkerPools` with the same arguments. It
+installs the SDK, instruments the pools, and starts the gauges. Call it once
+per process.
 
-Standard `OTEL_*` variables configure exporters, endpoints, and intervals.
-Set `OTEL_SDK_DISABLED=true` to disable the SDK. Arbiter sends logs to OTel and to the configured
-log destination. Each log contains the job trace, ID, queue, and attempt.
+Standard `OTEL_*` variables configure the SDK. `OTEL_SDK_DISABLED=true` turns
+it off. Logs go to OTel and to the configured log destination, with the job
+trace, id, queue, and attempt.
 
-Use `runWorkerPoolsWith` and a bracket from `Arbiter.Otel` to manage the
-telemetry handle, install a separate SDK, or start pools by another method. The
-`With` functions also accept the base log configuration for the gauge loop.
+`runWorkerPoolsWith` and the brackets in `Arbiter.Otel` take a telemetry
+handle, a separate SDK, or another pool runner, plus the base log config for
+the gauge loop.
 
 ## Traces
 
-Each enqueue records the current span. Each claim starts a `process <queue>`
-consumer span and links it to the enqueue span. The link works across processes
-and for jobs that a handler enqueues. A REST API enqueue joins the request trace
-when the server uses `newOpenTelemetryWaiMiddleware`
+An enqueue records the current span. A claim starts a `process <queue>`
+consumer span linked to it, across processes and for jobs a handler enqueues.
+A REST API enqueue joins the request trace under `newOpenTelemetryWaiMiddleware`
 (`hs-opentelemetry-instrumentation-wai`).
 
-Both spans carry the job's [payload kind](features/kinds.md) as `arbiter.kind`.
-The producer span derives it from the payload. The consumer span reads the
-stored label.
+Both spans carry the [payload kind](features/kinds.md) as `arbiter.kind`.
 
-`Arbiter.Core.Trace` has the helpers for annotating a job's span, opening child
-spans, and wrapping an enqueue made outside a handler.
+`Arbiter.Core.Trace` annotates a job's span, opens child spans, and wraps an
+enqueue made outside a handler.
 
 ## Metrics
 
 `arbiter-otel` reports job activity, queue depth, admission policies, reaper
-activity, Arbiter table health, and PostgreSQL health. The
+activity, Arbiter table health, and PostgreSQL health.
 [`Arbiter.Otel.MetricNames`](https://arbiterq.dev/arbiter-otel/Arbiter-Otel-MetricNames.html)
-module defines the name and unit of each instrument.
+lists each instrument with its unit.
 
-Admission metrics use the policy as the key. They do not use admission keys.
-On these metrics, `policy_kind` is the policy type: `rate_limit` or `concurrency`.
+Admission metrics are keyed by policy, with `policy_kind` of `rate_limit` or
+`concurrency`.
 
-Queue depth and the job counters set `kind` only to a label from the payload's
-`kindsFor` set. A payload that declares no labels exports no `kind`. The number
-of series is therefore bounded by that set.
+`kind` on queue depth and the job counters is one of the payload's `kindsFor`
+labels, or absent.
 
-Grant `pg_read_all_stats` to collect PostgreSQL health data outside the Arbiter
-role. One replica scans during each interval. The other replicas export that
-reading. Across replicas, use `max` for queue depth and PostgreSQL health. Use
-`sum` for per-process counters and latencies.
+PostgreSQL health outside the Arbiter role needs `pg_read_all_stats`. One
+replica scans per interval and the rest export that reading.
 
-Queue and Postgres gauges are scanned once per `OTEL_METRIC_EXPORT_INTERVAL`
+| Aggregate across replicas with | Metrics |
+| --- | --- |
+| `max` | queue depth, PostgreSQL health |
+| `sum` | per-process counters and latencies |
+
+Queue and PostgreSQL gauges scan once per `OTEL_METRIC_EXPORT_INTERVAL`
 (default 60s).
 
 ## Prometheus
 
-Arbiter sends metrics over OTLP. Configure Prometheus to scrape an OTel
-collector. Arbiter does not support `OTEL_METRICS_EXPORTER=prometheus`. This
-setting disables metrics.
+Metrics leave over OTLP. Scrape an OTel collector.
+`OTEL_METRICS_EXPORTER=prometheus` turns metrics off.
 
-## Local stack
+## Local Stack
 
-`arbiter-demo/run-local.sh` runs this repository's demo against Grafana's
+`arbiter-demo/run-local.sh` runs the demo against Grafana's
 [LGTM stack](https://github.com/grafana/docker-otel-lgtm) at
-http://localhost:8000, with the dashboard at /dash. The
-[live demo](https://demo.arbiterq.dev/) runs the same stack.
-
-The dashboard and the alert rules assume metrics arrive over OTLP through a
-collector.
+http://localhost:8000, dashboard at /dash. The
+[live demo](https://demo.arbiterq.dev/) runs the same stack. The dashboard and
+alert rules expect metrics over OTLP through a collector.

@@ -19,6 +19,7 @@ module Arbiter.Core.Codec
   , ncol
   , runCodec
   , codecColumns
+  , joinColumns
 
     -- * Parameter encoding
   , ParamType (..)
@@ -31,7 +32,6 @@ module Arbiter.Core.Codec
 
     -- * Bidirectional job write codec
   , Codec
-  , cDecode
   , cColumns
   , cScalar
   , cArray
@@ -63,6 +63,7 @@ import Data.Aeson (Value)
 import Data.Int (Int32, Int64)
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
+import Data.Text qualified as T
 import Data.Time (UTCTime)
 import Data.UUID.Types (UUID)
 
@@ -130,6 +131,10 @@ codecColumns = runAp_ colName
     colName (NotNull name _) = [name]
     colName (Nullable name _) = [name]
 
+-- | Column names as a comma-separated SQL list.
+joinColumns :: [Text] -> Text
+joinColumns = T.intercalate ", "
+
 -- | How a parameter is shaped: scalar, nullable, or array.
 data ParamType a where
   PScalar :: Col a -> ParamType a
@@ -170,6 +175,7 @@ data Codec s a = Codec
   -- ^ The read side.
   , cWrite :: [WriteCol s]
   }
+  deriving stock (Functor)
 
 -- | One writable column: its name, 'Col', and accessor. Split by nullability.
 data WriteCol s where
@@ -203,9 +209,6 @@ lmap project (Codec decode writes) = Codec decode (map retarget writes)
   where
     retarget (WCol name colType get) = WCol name colType (get . project)
     retarget (WNCol name colType get) = WNCol name colType (get . project)
-
-instance Functor (Codec s) where
-  fmap mapper (Codec decode writes) = Codec (fmap mapper decode) writes
 
 instance Applicative (Codec s) where
   pure value = Codec (pure value) []

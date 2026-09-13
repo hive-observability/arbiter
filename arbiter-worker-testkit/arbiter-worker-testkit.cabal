@@ -41,47 +41,27 @@ common shared-properties
 library
   import:          shared-properties
   hs-source-dirs:  src
-  exposed-modules: Arbiter.Worker.TestKit
+  exposed-modules:
+    Arbiter.Worker.TestKit
+    Arbiter.Worker.TestKit.Backend
+    Arbiter.Worker.TestKit.ConnectionRecovery
+    Arbiter.Worker.TestKit.Cron
+    Arbiter.Worker.TestKit.Deadline
+    Arbiter.Worker.TestKit.Lifecycle
+    Arbiter.Worker.TestKit.Reclaim
+    Arbiter.Worker.TestKit.Rows
   build-depends:
-    , aeson              >=2.0  && <2.3
-    , arbiter-core       >=0.1  && <0.2
-    , arbiter-worker     >=0.1  && <0.2
-    , base               >=4.20 && <5
-    , bytestring         >=0.10 && <0.13
-    , containers         >=0.6  && <0.9
-    , hspec              >=2.0  && <2.12
-    , postgresql-simple  >=0.6  && <0.8
-    , text               >=1.2  && <2.2
-    , time               >=1.11 && <1.16
-    , unliftio           >=0.2  && <0.3
-
-test-suite arbiter-worker-testkit-tests
-  import:         shared-properties
-  type:           exitcode-stdio-1.0
-  hs-source-dirs: test
-  main-is:        Spec.hs
-  ghc-options:    -threaded -rtsopts -with-rtsopts=-N
-  other-modules:
-    Test.Arbiter.Worker
-    Test.Arbiter.Worker.MultiQueueListener
-    Test.Arbiter.Worker.PlainResult
-    Test.Arbiter.Worker.SharedListener
-
-  build-depends:
-    , aeson
-    , arbiter-core            >=0.1 && <0.2
-    , arbiter-simple          >=0.1 && <0.2
-    , arbiter-test-common     >=0.1 && <0.2
-    , arbiter-worker          >=0.1 && <0.2
-    , arbiter-worker-testkit
-    , base
-    , bytestring
-    , containers
-    , directory
-    , hspec
-    , postgresql-simple
-    , resource-pool
-    , text
-    , time
-    , unliftio
-    , uuid
+    , aeson                >=2.0  && <2.3
+    , arbiter-core         >=0.1  && <0.2
+    , arbiter-test-common  >=0.1  && <0.2
+    , arbiter-worker       >=0.1  && <0.2
+    , base                 >=4.20 && <5
+    , bytestring           >=0.10 && <0.13
+    , containers           >=0.6  && <0.9
+    , directory            >=1.3  && <1.4
+    , hspec                >=2.0  && <2.12
+    , postgresql-simple    >=0.6  && <0.8
+    , text                 >=1.2  && <2.2
+    , time                 >=1.11 && <1.16
+    , unliftio             >=0.2  && <0.3
+    , uuid                 >=1.3  && <1.4

@@ -44,14 +44,14 @@ import Arbiter.Core.JobResult
 
 import Arbiter.Worker.BackoffStrategy
 import Arbiter.Worker.Config
-import Arbiter.Worker.Cron
+import Arbiter.Worker.Cron.Scheduler (initCronSchedules)
+import Arbiter.Worker.Cron.Types
   ( BackfillPolicy (..)
   , CronJob (..)
   , OverlapPolicy (..)
   , TickKind (..)
   , cronJob
   , cronJobInTimezone
-  , initCronSchedules
   , overlapPolicyFromText
   , overlapPolicyToText
   , updateCronScheduleChecked

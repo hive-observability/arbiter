@@ -13,11 +13,18 @@
 module Arbiter.Hasql.HasqlDb
   ( -- * Database Monad
     HasqlDb (..)
-  , HasqlEnv (..)
+  , HasqlEnv
+  , Db
+  , Env (..)
+  , HasqlConfig (..)
+  , PoolState (..)
+  , HasPoolState (..)
   , runHasqlDb
   , inTransaction
 
     -- * Environment Creation
+  , HasqlConnect
+  , toHasqlConnect
   , createHasqlEnv
   , createHasqlEnvWithConfig
   , createHasqlEnvWithPool
@@ -33,29 +40,43 @@ module Arbiter.Hasql.HasqlDb
   , HasqlConnectionError (..)
   ) where
 
+import Arbiter.Core.Backend
+  ( Db
+  , Driver (..)
+  , Env (..)
+  , HasPoolState (..)
+  , PoolState (..)
+  , createEnvWithConfig
+  , createEnvWithPool
+  , destroyEnv
+  , disableListener
+  , runDb
+  )
+import Arbiter.Core.Backend qualified as Backend
 import Arbiter.Core.Job.Schema (SchemaName)
-import Arbiter.Core.Listen (Listener, dedicatedListener, newDedicatedListen, newPoolListener)
 import Arbiter.Core.MonadArbiter (MonadArbiter (..))
-import Arbiter.Core.PoolConfig (PoolConfig (..))
+import Arbiter.Core.PoolConfig (PoolConfig)
 import Arbiter.Core.PoolConfig qualified as PC
 import Arbiter.Core.QueueRegistry (JobPayloadRegistry)
 import Control.Exception (Exception, throwIO)
 import Control.Monad.Catch (MonadCatch, MonadMask, MonadThrow)
-import Control.Monad.IO.Class (MonadIO, liftIO)
-import Control.Monad.Reader (MonadReader, asks, local)
-import Control.Monad.Trans.Reader (ReaderT (..), runReaderT)
-import Data.ByteString (ByteString)
-import Data.Foldable (traverse_)
-import Data.Pool (Pool, defaultPoolConfig, destroyAllResources, newPool, setNumStripes, withResource)
+import Control.Monad.IO.Class (MonadIO)
+import Control.Monad.Reader (MonadReader, asks)
+import Data.Pool (Pool)
 import Data.Proxy (Proxy (..))
 import Hasql.Connection qualified as Hasql
 import UnliftIO (MonadUnliftIO)
 
-import Arbiter.Hasql.Compat qualified as Compat
+import Arbiter.Hasql.Compat
+  ( HasqlConnect
+  , acquireConnect
+  , hasqlSettings
+  , toHasqlConnect
+  , withDedicatedListenConn
+  , withHasqlListenConn
+  )
 import Arbiter.Hasql.MonadArbiter
-  ( HasHasqlPool (..)
-  , HasqlConnectionPool (..)
-  , hasqlExecuteQuery
+  ( hasqlExecuteQuery
   , hasqlExecuteQueryPrepared
   , hasqlExecuteStatement
   , hasqlRunHandlerWithConnection
@@ -68,20 +89,20 @@ newtype HasqlConnectionError = HasqlConnectionError String
   deriving anyclass (Exception)
 
 -- | Schema name and connection pool for 'HasqlDb'.
-data HasqlEnv (registry :: JobPayloadRegistry) = HasqlEnv
-  { schema :: SchemaName
-  -- ^ Schema name
-  , hasqlPool :: HasqlConnectionPool
-  -- ^ The connection pool state
-  , listener :: Maybe Listener
-  -- ^ Resolved LISTEN source. 'Nothing' runs poll-only.
-  }
+type HasqlEnv = Env Hasql.Connection HasqlConfig
+
+-- | The env state only hasql has.
+newtype HasqlConfig = HasqlConfig {preparedStatements :: Bool}
+
+hasqlDriver :: Driver Hasql.Connection HasqlConfig
+hasqlDriver = Driver {withListenConn = withHasqlListenConn, initialConfig = HasqlConfig True}
 
 -- | The hasql database monad.
-newtype HasqlDb (registry :: JobPayloadRegistry) m a = HasqlDb {unHasqlDb :: ReaderT (HasqlEnv registry) m a}
+newtype HasqlDb (registry :: JobPayloadRegistry) m a = HasqlDb {unHasqlDb :: Db Hasql.Connection HasqlConfig registry m a}
   deriving newtype
     ( Applicative
     , Functor
+    , HasPoolState Hasql.Connection
     , Monad
     , MonadCatch
     , MonadFail
@@ -92,16 +113,12 @@ newtype HasqlDb (registry :: JobPayloadRegistry) m a = HasqlDb {unHasqlDb :: Rea
     , MonadUnliftIO
     )
 
-instance (Monad m) => HasHasqlPool (HasqlDb registry m) where
-  getHasqlPool = asks hasqlPool
-  localHasqlPool adjust = local (\env -> env {hasqlPool = adjust (hasqlPool env)})
-
 instance (MonadUnliftIO m) => MonadArbiter (HasqlDb registry m) where
   type RegistryOf (HasqlDb registry m) = registry
   type Handler (HasqlDb registry m) job result = Hasql.Connection -> job -> HasqlDb registry m result
   getSchema = asks schema
   executeQuery = hasqlExecuteQuery
-  executeQueryPrepared = hasqlExecuteQueryPrepared
+  executeQueryPrepared query = asks (preparedStatements . driverConfig) >>= (`hasqlExecuteQueryPrepared` query)
   executeStatement = hasqlExecuteStatement
   withDbTransaction = hasqlWithDbTransaction
   runHandlerWithConnection = hasqlRunHandlerWithConnection
@@ -109,31 +126,13 @@ instance (MonadUnliftIO m) => MonadArbiter (HasqlDb registry m) where
 
 -- | Release the env's connection pool, closing its open connections.
 destroyHasqlEnv :: (MonadIO m) => HasqlEnv registry -> m ()
-destroyHasqlEnv env =
-  liftIO $ traverse_ destroyAllResources (connectionPool (hasqlPool env))
-
--- | Turn off the shared LISTEN listener for an env, running poll-only.
-disableListener :: HasqlEnv registry -> HasqlEnv registry
-disableListener env = env {listener = Nothing}
-
--- | Give the env a dedicated LISTEN connection opened from a connection string.
--- The listener takes no pool slot.
-useDedicatedListener :: (MonadIO m) => ByteString -> HasqlEnv registry -> m (HasqlEnv registry)
-useDedicatedListener connStr env = do
-  dedicated <- newDedicatedListen connStr
-  pure env {listener = Just (dedicatedListener dedicated)}
-
--- | A listener that borrows one pool connection for the hub's lifetime.
-poolListener :: Pool Hasql.Connection -> IO Listener
-poolListener pool = newPoolListener (\action -> withResource pool (`Compat.withHasqlLibPQConnection` action))
+destroyHasqlEnv = destroyEnv
 
 -- | Run a 'HasqlDb' action in its env.
 runHasqlDb :: HasqlEnv registry -> HasqlDb registry m a -> m a
-runHasqlDb env action = runReaderT (unHasqlDb action) env
+runHasqlDb env = runDb env . unHasqlDb
 
--- | Run a 'HasqlDb' action on one connection without a pool. The connection is pinned
--- as an open transaction. 'Arbiter.Core.MonadArbiter.withDbTransaction' nests through
--- savepoints. The caller owns the transaction.
+-- | Run a 'HasqlDb' action on one connection pinned as the caller's open transaction.
 --
 -- @
 -- _ <- Hasql.use conn (Session.script "BEGIN")
@@ -145,110 +144,48 @@ inTransaction
   :: forall registry m a
    . Hasql.Connection
   -> SchemaName
-  -- ^ Schema name
   -> HasqlDb registry m a
   -> m a
-inTransaction conn schemaName action =
-  let env =
-        HasqlEnv
-          { schema = schemaName
-          , hasqlPool =
-              HasqlConnectionPool
-                { connectionPool = Nothing
-                , activeConn = Just conn
-                , transactionDepth = 1
-                , preparedStatements = True
-                }
-          , listener = Nothing
-          }
-   in runHasqlDb env action
+inTransaction conn schemaName = Backend.inTransaction hasqlDriver conn schemaName . unHasqlDb
 
--- | Create a 'HasqlEnv' with conservative pool defaults. Size worker pools with
--- 'createHasqlEnvWithConfig' and @poolConfigForWorkers@.
+-- | Create a 'HasqlEnv' with conservative pool defaults.
 createHasqlEnv
   :: forall registry m
    . (MonadIO m)
   => Proxy registry
-  -> ByteString
-  -- ^ PostgreSQL connection string
+  -> HasqlConnect
   -> SchemaName
-  -- ^ Schema name
   -> m (HasqlEnv registry)
-createHasqlEnv proxy connStr schemaName =
-  createHasqlEnvWithConfig proxy connStr schemaName PC.defaultPoolConfig
+createHasqlEnv proxy connect schemaName = createHasqlEnvWithConfig proxy connect schemaName PC.defaultPoolConfig
 
 -- | Create a 'HasqlEnv' with custom pool settings.
 createHasqlEnvWithConfig
   :: forall registry m
    . (MonadIO m)
   => Proxy registry
-  -> ByteString
-  -- ^ PostgreSQL connection string
+  -> HasqlConnect
   -> SchemaName
-  -- ^ Schema name
   -> PoolConfig
   -> m (HasqlEnv registry)
-createHasqlEnvWithConfig _proxy connStr schemaName config = liftIO $ do
-  connPool <-
-    newPool
-      $ setNumStripes (poolStripes config)
-      $ defaultPoolConfig
-        ( do
-            result <- Hasql.acquire (hasqlSettings connStr)
-            case result of
-              Right conn -> pure conn
-              Left err -> throwIO $ HasqlConnectionError (show err)
-        )
-        Hasql.release
-        (fromIntegral $ poolIdleTimeout config)
-        (poolSize config)
-  lstn <- poolListener connPool
-  pure
-    HasqlEnv
-      { schema = schemaName
-      , hasqlPool =
-          HasqlConnectionPool
-            { connectionPool = Just connPool
-            , activeConn = Nothing
-            , transactionDepth = 0
-            , preparedStatements = True
-            }
-      , listener = Just lstn
-      }
+createHasqlEnvWithConfig _proxy connect = createEnvWithConfig hasqlDriver (acquireOrThrow connect) Hasql.release
 
--- | Create a 'HasqlEnv' over a caller's own connection pool. The shared listener
--- holds one pool connection for the env's lifetime. Size the pool for the worker
--- load plus one. 'disableListener' runs poll-only and frees that slot.
--- 'useDedicatedListener' gives the listener its own connection.
+-- | Give the env a dedicated LISTEN connection that takes no pool slot.
+useDedicatedListener :: (MonadIO m) => HasqlConnect -> HasqlEnv registry -> m (HasqlEnv registry)
+useDedicatedListener = Backend.useDedicatedListener . withDedicatedListenConn
+
+acquireOrThrow :: HasqlConnect -> IO Hasql.Connection
+acquireOrThrow connect = acquireConnect connect >>= either (throwIO . HasqlConnectionError) pure
+
+-- | Create a 'HasqlEnv' over a caller's own connection pool. The listener holds one pool slot.
 createHasqlEnvWithPool
   :: forall registry m
    . (MonadIO m)
   => Proxy registry
   -> Pool Hasql.Connection
   -> SchemaName
-  -- ^ Schema name
   -> m (HasqlEnv registry)
-createHasqlEnvWithPool _proxy connPool schemaName = liftIO $ do
-  lstn <- poolListener connPool
-  pure
-    HasqlEnv
-      { schema = schemaName
-      , hasqlPool =
-          HasqlConnectionPool
-            { connectionPool = Just connPool
-            , activeConn = Nothing
-            , transactionDepth = 0
-            , preparedStatements = True
-            }
-      , listener = Just lstn
-      }
+createHasqlEnvWithPool _proxy = createEnvWithPool hasqlDriver
 
--- | Enable or disable prepared hot statements (the claim). Each pooled connection
--- prepares once and reuses the plan. Requires direct connections or a pooler that
--- supports server-side prepared statements.
+-- | Enable or disable prepared hot statements. Needs direct connections or a pooler that supports them.
 setPreparedStatements :: Bool -> HasqlEnv registry -> HasqlEnv registry
-setPreparedStatements flag env = env {hasqlPool = (hasqlPool env) {preparedStatements = flag}}
-
--- | Re-exported from "Arbiter.Hasql.Compat".
-hasqlSettings :: ByteString -> Compat.HasqlSettings
-hasqlSettings = Compat.hasqlSettings
+setPreparedStatements flag env = env {driverConfig = HasqlConfig flag}

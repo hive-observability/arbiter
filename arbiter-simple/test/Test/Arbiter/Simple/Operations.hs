@@ -10,22 +10,18 @@ import Arbiter.Core.Job.Types
 import Arbiter.Core.QueueRegistry (QueueSpec (..))
 import Arbiter.Test.Fixtures (TestPayload (..))
 import Arbiter.Test.Operations (operationsSpec)
-import Arbiter.Test.Setup (execute_, setupOnce)
+import Arbiter.Test.Setup (cleanupData, createSharedPool, execute_, setupOnce)
 import Control.Concurrent (threadDelay)
 import Control.Exception (SomeException, catch, throwIO)
 import Data.ByteString (ByteString)
-import Data.Maybe (fromJust)
 import Data.Pool (withResource)
-import Data.Pool qualified as Pool
 import Data.Proxy (Proxy (..))
 import Data.Text (Text)
 import Database.PostgreSQL.Simple qualified as PG
 import Test.Hspec
 import UnliftIO.Async (async, wait)
 
-import Arbiter.Simple.MonadArbiter (SimpleConnectionPool (..))
-import Arbiter.Simple.SimpleDb (SimpleEnv (..), createSimpleEnvWithPool, inTransaction, runSimpleDb)
-import Test.Arbiter.Simple.TestHelpers (cleanupSimpleTest, createSimplePool)
+import Arbiter.Simple.SimpleDb (createSimpleEnvWithPool, inTransaction, runSimpleDb)
 
 testSchema :: Text
 testSchema = "arbiter_simple_test"
@@ -35,17 +31,11 @@ type SimpleOpsTestRegistry = '[QueueWithResult "arbiter_simple_test" TestPayload
 testTable :: Text
 testTable = "arbiter_simple_test"
 
-withCleanup
-  :: Pool.Pool PG.Connection -> (SimpleEnv SimpleOpsTestRegistry -> IO a) -> IO a
-withCleanup sharedPool action = do
-  env <- createSimpleEnvWithPool (Proxy @SimpleOpsTestRegistry) sharedPool testSchema
-  cleanupSimpleTest env testSchema testTable
-  action env
-
 spec :: ByteString -> Spec
 spec connStr = beforeAll (setupOnce connStr testSchema testTable False) $ do
-  sharedPool <- runIO (createSimplePool 5 connStr)
-  around (withCleanup sharedPool) $ do
+  sharedPool <- runIO (createSharedPool connStr)
+  sharedEnv <- runIO (createSimpleEnvWithPool (Proxy @SimpleOpsTestRegistry) sharedPool testSchema)
+  around (\action -> withResource sharedPool (cleanupData testSchema testTable) >> action sharedEnv) $ do
     operationsSpec @TestPayload TestMessage pure runSimpleDb
 
     describe "Transaction Participation (localConnection)" $ do
@@ -53,8 +43,7 @@ spec connStr = beforeAll (setupOnce connStr testSchema testTable False) $ do
         let job = setGroupKey (Just "g1") $ defaultJob (TestMessage "InTx")
 
         -- Start a user transaction and insert a job with localConnection
-        let connPool = fromJust (connectionPool (simplePool env))
-        withResource connPool $ \conn -> do
+        withResource sharedPool $ \conn -> do
           PG.withTransaction conn $ do
             -- Insert job using localConnection to share the transaction
             Just _inserted <- inTransaction @SimpleOpsTestRegistry conn testSchema $ HL.insertJob job
@@ -70,9 +59,8 @@ spec connStr = beforeAll (setupOnce connStr testSchema testTable False) $ do
         let job = setGroupKey (Just "g1") $ defaultJob (TestMessage "RollbackTest")
 
         -- Start a user transaction and intentionally fail it
-        let connPool = fromJust (connectionPool (simplePool env))
         result <-
-          ( withResource connPool $ \conn -> do
+          ( withResource sharedPool $ \conn -> do
               PG.withTransaction conn $ do
                 -- Insert job using localConnection to share the transaction
                 Just _inserted <- inTransaction @SimpleOpsTestRegistry conn testSchema $ HL.insertJob job
@@ -91,8 +79,7 @@ spec connStr = beforeAll (setupOnce connStr testSchema testTable False) $ do
         let job = setGroupKey (Just "g1") $ defaultJob (TestMessage "SharedTx")
 
         -- Use the same connection for creating table, transaction, and verification
-        let connPool = fromJust (connectionPool (simplePool env))
-        withResource connPool $ \conn -> do
+        withResource sharedPool $ \conn -> do
           -- Create a test table
           execute_ conn "CREATE TEMP TABLE test_tx_table (value TEXT)"
 
@@ -117,8 +104,7 @@ spec connStr = beforeAll (setupOnce connStr testSchema testTable False) $ do
         let job = setGroupKey (Just "g1") $ defaultJob (TestMessage "BothRollback")
 
         -- Use the same connection for creating table, transaction, and verification
-        let connPool = fromJust (connectionPool (simplePool env))
-        withResource connPool $ \conn -> do
+        withResource sharedPool $ \conn -> do
           -- Create a temp table
           execute_ conn "CREATE TEMP TABLE test_rollback_table (value TEXT)"
 

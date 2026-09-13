@@ -7,8 +7,7 @@ module Arbiter.Core.Job.Kind
   ( HasKind (..)
   , constructorKind
   , constructorKinds
-  , GKindOf (..)
-  , GKindsOf (..)
+  , GKind (..)
   ) where
 
 import Data.Proxy (Proxy (..))
@@ -21,12 +20,12 @@ import GHC.TypeLits (KnownSymbol, symbolVal)
 class HasKind payload where
   -- | The label stored for a job.
   kindOf :: payload -> Maybe Text
-  default kindOf :: (GKindOf (Rep payload), Generic payload) => payload -> Maybe Text
+  default kindOf :: (GKind (Rep payload), Generic payload) => payload -> Maybe Text
   kindOf = Just . constructorKind
 
   -- | Every label 'kindOf' can return. Empty when the set is not known.
   kindsFor :: [Text]
-  default kindsFor :: (GKindsOf (Rep payload)) => [Text]
+  default kindsFor :: (GKind (Rep payload)) => [Text]
   kindsFor = constructorKinds @payload
 
 instance {-# OVERLAPPABLE #-} HasKind payload where
@@ -41,42 +40,31 @@ instance {-# OVERLAPPABLE #-} HasKind payload where
 --   kindOf = Just . constructorKind . envelopePayload
 --   kindsFor = constructorKinds \@EmailPayload
 -- @
-constructorKind :: (GKindOf (Rep a), Generic a) => a -> Text
+constructorKind :: (GKind (Rep a), Generic a) => a -> Text
 constructorKind = gKindOf . from
 
 -- | Every constructor name of a type, in declaration order.
-constructorKinds :: forall a. (GKindsOf (Rep a)) => [Text]
+constructorKinds :: forall a. (GKind (Rep a)) => [Text]
 constructorKinds = gKindsOf @(Rep a)
 
--- | The constructor name of a generic value.
-class GKindOf f where
+-- | Constructor names of a generic representation, in declaration order.
+class GKind f where
   gKindOf :: f a -> Text
-
-instance (GKindOf f) => GKindOf (D1 d f) where
-  gKindOf (M1 inner) = gKindOf inner
-
-instance (GKindOf f, GKindOf g) => GKindOf (f :+: g) where
-  gKindOf (L1 inner) = gKindOf inner
-  gKindOf (R1 inner) = gKindOf inner
-
-instance (KnownSymbol n) => GKindOf (C1 (MetaCons n fx s) f) where
-  gKindOf _ = T.pack (symbolVal (Proxy @n))
-
-instance GKindOf V1 where
-  gKindOf empty = case empty of {}
-
--- | Every constructor name of a generic representation, in declaration order.
-class GKindsOf f where
   gKindsOf :: [Text]
 
-instance (GKindsOf f) => GKindsOf (D1 d f) where
+instance (GKind f) => GKind (D1 d f) where
+  gKindOf (M1 inner) = gKindOf inner
   gKindsOf = gKindsOf @f
 
-instance (GKindsOf f, GKindsOf g) => GKindsOf (f :+: g) where
+instance (GKind f, GKind g) => GKind (f :+: g) where
+  gKindOf (L1 inner) = gKindOf inner
+  gKindOf (R1 inner) = gKindOf inner
   gKindsOf = gKindsOf @f <> gKindsOf @g
 
-instance (KnownSymbol n) => GKindsOf (C1 (MetaCons n fx s) f) where
+instance (KnownSymbol n) => GKind (C1 (MetaCons n fx s) f) where
+  gKindOf _ = T.pack (symbolVal (Proxy @n))
   gKindsOf = [T.pack (symbolVal (Proxy @n))]
 
-instance GKindsOf V1 where
+instance GKind V1 where
+  gKindOf empty = case empty of {}
   gKindsOf = []

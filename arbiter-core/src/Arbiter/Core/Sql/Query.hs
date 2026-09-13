@@ -43,6 +43,7 @@ data Query a = Query
   , qDecode :: RowCodec a
   -- ^ Decoder for the result rows.
   }
+  deriving stock (Functor)
 
 -- | A query from its pieces, parameters and decoder.
 mkQuery :: [Piece] -> Params -> RowCodec a -> Query a
@@ -56,9 +57,6 @@ render hole = T.concat . snd . mapAccumL step 1
   where
     step !index (Lit literal) = (index, literal)
     step !index Hole = (index + 1, hole index)
-
-instance Functor Query where
-  fmap fn query = query {qDecode = fmap fn (qDecode query)}
 
 -- | Concatenation is defined for @Query ()@, a fragment with text and parameters and no output columns.
 instance Semigroup (Query ()) where

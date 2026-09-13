@@ -9,9 +9,8 @@ module Arbiter.Core.Sql.Insert
   ) where
 
 import Data.Text (Text)
-import Data.Text qualified as T
 
-import Arbiter.Core.Codec (Codec, cArray, cColumns, cScalar)
+import Arbiter.Core.Codec (Codec, cArray, cColumns, cScalar, joinColumns)
 import Arbiter.Core.Sql.QQ (sql)
 import Arbiter.Core.Sql.Query (Query, param, sepBy)
 
@@ -36,4 +35,4 @@ batchFrag codec rows =
        in [sql|unnest(${arrayParam}::${sqlType}[]) AS ${name}|]
 
 columnList :: Codec s a -> Text
-columnList = T.intercalate ", " . map fst . cColumns
+columnList = joinColumns . map fst . cColumns

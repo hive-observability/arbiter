@@ -1,3 +1,5 @@
+{-# LANGUAGE OverloadedStrings #-}
+
 -- | Dead-letter queue types. Arbiter moves jobs here after their last retry.
 -- Recover a job with 'Arbiter.Core.HighLevel.retryFromDLQ' or delete it with
 -- 'Arbiter.Core.HighLevel.deleteDLQJob'.
@@ -6,6 +8,7 @@ module Arbiter.Core.Job.DLQ
   , JobSnapshot
   ) where
 
+import Data.Aeson (FromJSON (..), ToJSON (..), object, withObject, (.:), (.=))
 import Data.Int (Int64)
 import Data.Time (UTCTime)
 import GHC.Generics (Generic)
@@ -27,3 +30,15 @@ data DLQJob payload = DLQJob
   -- accumulated child results captured before the cascade delete.
   }
   deriving stock (Eq, Generic, Show)
+
+instance (ToJSON payload) => ToJSON (DLQJob payload) where
+  toJSON dlq =
+    object
+      [ "dlqPrimaryKey" .= dlqPrimaryKey dlq
+      , "failedAt" .= failedAt dlq
+      , "jobSnapshot" .= jobSnapshot dlq
+      ]
+
+instance (FromJSON payload) => FromJSON (DLQJob payload) where
+  parseJSON = withObject "DLQJob" $ \obj ->
+    DLQJob <$> obj .: "dlqPrimaryKey" <*> obj .: "failedAt" <*> obj .: "jobSnapshot"

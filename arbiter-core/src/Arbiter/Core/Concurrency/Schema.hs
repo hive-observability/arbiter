@@ -34,6 +34,7 @@ import Arbiter.Core.Job.Schema
   ( SchemaName
   , TableName
   , createMaintenanceTriggersSQL
+  , indexSQL
   , jobQueueDLQTable
   , jobQueueTable
   , maintenanceFunctionNames
@@ -100,11 +101,11 @@ addConcurrencyColumnsSQL schemaName tableName =
 -- | Index backing the per-key in-flight recount, over claimed jobs.
 createConcurrencyIndexSQL :: SchemaName -> TableName -> Text
 createConcurrencyIndexSQL schemaName tableName =
-  T.unlines
-    [ "CREATE INDEX IF NOT EXISTS " <> quoteIdentifier ("idx_" <> tableName <> "_concurrency")
-    , "ON " <> jobQueueTable schemaName tableName <> " (concurrency_key)"
-    , "WHERE concurrency_key IS NOT NULL;"
-    ]
+  indexSQL
+    ("idx_" <> tableName <> "_concurrency")
+    (jobQueueTable schemaName tableName)
+    "concurrency_key"
+    (Just "concurrency_key IS NOT NULL")
 
 -- | Per-queue triggers maintaining each key's @in_flight@.
 createConcurrencyTriggerFunctionsSQL :: SchemaName -> TableName -> Text

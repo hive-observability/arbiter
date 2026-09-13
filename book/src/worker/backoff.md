@@ -11,18 +11,10 @@ config { Worker.jitter = EqualJitter }  -- delay/2 + random(0, delay/2) (default
 config { Worker.jitter = NoJitter }
 ```
 
-The claim operation increments the attempt count before the handler starts.
-Arbiter calculates the delay from the new count. The first failure is attempt
-1. Therefore, `exponentialBackoff 2.0` gives a two-second delay before the
-first retry.
+The first failure is attempt 1. `exponentialBackoff 2.0` waits two seconds
+before the first retry.
 
-Jitter changes the calculated delay. The default `EqualJitter` selects a value
-between one half and all of the calculated delay. The strategy value is the
-maximum delay.
-
-A nack does not use the backoff strategy. The job remains unavailable for the
-rest of its lease. Set the job visibility timeout before the nack to control
-this period. See
-[Error Handling](../features/error-handling.md).
+A nack skips the backoff. The job stays invisible for the rest of its lease.
+Set the visibility timeout before the nack to change that.
 
 See the [`Arbiter.Worker.BackoffStrategy` haddocks](https://arbiterq.dev/arbiter-worker/Arbiter-Worker-BackoffStrategy.html) for every strategy and jitter mode.

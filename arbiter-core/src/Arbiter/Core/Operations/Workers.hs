@@ -19,9 +19,8 @@ import Data.UUID.Types (UUID)
 
 import Arbiter.Core.Exceptions (throwParsing)
 import Arbiter.Core.Job.Schema (SchemaName)
-import Arbiter.Core.MonadArbiter (MonadArbiter)
+import Arbiter.Core.MonadArbiter (MonadArbiter, countOr0)
 import Arbiter.Core.MonadArbiter qualified as MA
-import Arbiter.Core.Sql.Query (Query)
 import Arbiter.Core.Sql.Workers qualified as Sql
 import Arbiter.Core.Worker (WorkerRow (..), workerHealthFromText)
 
@@ -49,7 +48,7 @@ heartbeatWorker schema workerId =
 -- | Set a worker's pause flag.
 setWorkerPaused :: (MonadArbiter m) => SchemaName -> UUID -> Bool -> m Int64
 setWorkerPaused schema workerId paused =
-  countOrZero (Sql.setWorkerPausedSQL schema paused workerId)
+  countOr0 (Sql.setWorkerPausedSQL schema paused workerId)
 
 -- | Mark a worker as gracefully draining.
 markWorkerShuttingDown :: (MonadArbiter m) => SchemaName -> UUID -> m Int64
@@ -84,10 +83,3 @@ listWorkers schema queue liveSecs = do
 -- | Delete workers older than their recorded stale threshold.
 sweepStaleWorkers :: (MonadArbiter m) => SchemaName -> m Int64
 sweepStaleWorkers schema = MA.executeStatement (Sql.deleteStaleWorkersSQL schema)
-
-countOrZero :: (MonadArbiter m) => Query Int64 -> m Int64
-countOrZero query = do
-  rows <- MA.executeQuery query
-  pure $ case rows of
-    [count] -> count
-    _ -> 0

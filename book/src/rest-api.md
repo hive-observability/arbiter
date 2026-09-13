@@ -1,8 +1,8 @@
 # REST API and Admin UI
 
-The `arbiter-servant` and `arbiter-servant-ui` packages provide a REST API and
-admin dashboard. Use them as standalone WAI applications or integrate them
-into an existing Servant API.
+`arbiter-servant` and `arbiter-servant-ui` provide the REST API and admin
+dashboard, as standalone WAI applications or as routes in an existing Servant
+API.
 
 ```haskell
 import Arbiter.Servant qualified as Servant
@@ -24,9 +24,7 @@ type MyAPI =
 
 See the [arbiter-servant-ui haddocks](https://arbiterq.dev/arbiter-servant-ui/Arbiter-Servant-UI.html) for the UI's route type.
 
-`POST jobs` and `POST jobs/batch` enqueue jobs. Services in other languages can
-use these endpoints without an Arbiter library. The admin UI uses the other
-per-queue endpoints for operator functions.
+`POST jobs` and `POST jobs/batch` enqueue from any language.
 
 ## Endpoints
 
@@ -37,29 +35,29 @@ Per-queue endpoints under `/api/v1/:queue/`:
 | `GET` | `jobs` | List jobs |
 | `POST` | `jobs` | Insert a job |
 | `POST` | `jobs/batch` | Insert multiple jobs |
-| `GET` | `jobs/:id` | Get job by ID |
-| `DELETE` | `jobs/:id` | Cancel job (cascade-deletes children) |
-| `POST` | `jobs/:id/force-cancel` | Cascade-delete and interrupt the running handler |
+| `GET` | `jobs/:id` | Get a job by ID |
+| `DELETE` | `jobs/:id` | Cancel a job and delete its children |
+| `POST` | `jobs/:id/force-cancel` | Cancel a job, delete its children, and interrupt the running handler |
 | `POST` | `jobs/:id/promote` | Make a delayed job immediately visible |
-| `POST` | `jobs/:id/move-to-dlq` | Move job to dead-letter queue |
-| `POST` | `claim` | Lease visible jobs, returning each job with its lease |
-| `POST` | `jobs/:id/ack` | Complete a job the lease still holds, storing its result |
+| `POST` | `jobs/:id/move-to-dlq` | Move a job to the dead-letter queue |
+| `POST` | `claim` | Lease visible jobs and return each job with its lease |
+| `POST` | `jobs/:id/ack` | Complete a job the lease still holds and store its result |
 | `POST` | `jobs/:id/nack` | Hand a job back without spending its attempt |
-| `POST` | `jobs/:id/extend` | Push out a held lease |
-| `POST` | `jobs/:id/suspend` | Suspend job |
-| `POST` | `jobs/:id/resume` | Resume suspended job |
+| `POST` | `jobs/:id/extend` | Extend a held lease |
+| `POST` | `jobs/:id/suspend` | Suspend a job |
+| `POST` | `jobs/:id/resume` | Resume a suspended job |
 | `POST` | `jobs/:id/pause-children` | Pause all visible children of a job |
 | `POST` | `jobs/:id/resume-children` | Resume all suspended children |
 | `GET` | `dlq` | List DLQ entries |
-| `POST` | `dlq/:id/retry` | Retry from DLQ |
-| `DELETE` | `dlq/:id` | Delete from DLQ |
-| `POST` | `dlq/batch-delete` | Batch delete multiple DLQ entries |
-| `GET` | `archive` | List archived (completed) jobs |
-| `POST` | `archive/:id/reenqueue` | Re-run an archived job as a fresh job |
-| `DELETE` | `archive/:id` | Purge one archive entry |
-| `POST` | `archive/batch-delete` | Batch purge archive entries |
+| `POST` | `dlq/:id/retry` | Retry a job from the DLQ |
+| `DELETE` | `dlq/:id` | Delete one DLQ entry |
+| `POST` | `dlq/batch-delete` | Delete multiple DLQ entries |
+| `GET` | `archive` | List archived jobs |
+| `POST` | `archive/:id/reenqueue` | Re-enqueue an archived job as a new job |
+| `DELETE` | `archive/:id` | Delete one archive entry |
+| `POST` | `archive/batch-delete` | Delete multiple archive entries |
 | `GET` | `stats` | Queue statistics |
-| `GET` | `kinds` | List the payload variant labels the queue declares |
+| `GET` | `kinds` | List the kind labels the queue declares |
 
 Global endpoints under `/api/v1/`:
 
@@ -72,7 +70,7 @@ Global endpoints under `/api/v1/`:
 | `POST` | `queues/:queue/resume` | Resume a paused queue |
 | `GET` | `events/stream` | SSE stream for real-time notifications |
 | `GET` | `cron/schedules` | List cron schedules |
-| `PATCH` | `cron/schedules/:name` | Override cron expression at runtime |
+| `PATCH` | `cron/schedules/:name` | Override a schedule's expression, overlap policy, time zone, or enabled state |
 | `POST` | `cron/schedules/:name/run` | Run an enabled schedule once, out of band |
 | `GET` | `workers` | List registered workers |
 | `POST` | `workers/:id/pause` | Pause a single worker pool |
@@ -80,7 +78,7 @@ Global endpoints under `/api/v1/`:
 | `GET` | `rate-limits` | List policies with bucket and throttle stats |
 | `GET` | `rate-limits/:prefix/buckets` | List a prefix's per-key buckets |
 | `PATCH` | `rate-limits/:prefix` | Set or clear a policy's override params |
-| `POST` | `rate-limits/:prefix/reset` | Reset (clear) a prefix's buckets |
+| `POST` | `rate-limits/:prefix/reset` | Reset a prefix's buckets |
 | `GET` | `concurrency` | List pools with limit and in-flight stats |
 | `GET` | `concurrency/:prefix/keys` | List a pool's per-key in-flight counts |
 | `PATCH` | `concurrency/:prefix` | Set or clear a pool's override limit |
@@ -91,10 +89,9 @@ Global endpoints under `/api/v1/`:
 
 ## Consuming over HTTP
 
-`POST claim` applies the worker-pool claim operation. It uses admission tokens,
-increments the attempt count, records a claimant, and makes each job invisible
-for the lease period. A paused queue does not return leases. The pause applies
-to HTTP consumers and worker pools.
+`POST claim` is the worker-pool claim: it spends admission tokens, increments
+the attempt count, records a claimant, and hides each job for the lease. A
+paused queue returns no leases.
 
 ```http
 POST /api/v1/email_queue/claim
@@ -104,67 +101,59 @@ POST /api/v1/email_queue/claim
 `maxJobs` defaults to 1 and clamps to 1000. `leaseSeconds` defaults to 60 and
 clamps to 3600.
 
-Each response job contains `claimSeq` and `claimedBy`. These fields identify the
-lease. Each finalization request must include them:
+`claimSeq` and `claimedBy` in each returned job identify the lease. Every
+finalization request carries them:
 
 ```http
 POST /api/v1/email_queue/jobs/41/ack
 {"claimSeq": 7, "claimedBy": "0f5e...c31"}
 ```
 
-On a queue declared with `QueueWithResult`, `ack` also takes the result:
+On a `QueueWithResult` queue, `ack` takes the result:
 
 ```http
 POST /api/v1/email_queue/jobs/41/ack
 {"claimSeq": 7, "claimedBy": "0f5e...c31", "result": ["delivered"]}
 ```
 
-Arbiter stores the result in the parent rollup for a child job, or in the
-archive entry for an archived root job. This is the same behavior as
-`ackWith`. A body that does not match the queue result type returns 400. Omit
-`result` to store no result. Mounting this route requires `FromJSON` and
-`ToJSON` for the result type.
+The result is stored as [`ackWith`](features/results.md) stores it. A body
+that does not match the result type returns 400. Omit `result` to store none. The route needs
+`FromJSON` and `ToJSON` on the result type.
 
-`ack` completes the job. `nack` restores the used attempt and keeps the job
-invisible for the remainder of its lease. `extend` sets a later lease
-expiration, as a worker heartbeat does. The request body requires `seconds`.
-Arbiter limits the value to 3600 and measures it from the request time. If the
-lease fields do not match the row, the endpoint returns 409. A previous lease
-holder cannot ack a reclaimed job.
+| Route | Effect |
+| --- | --- |
+| `ack` | completes the job |
+| `nack` | refunds the attempt. The job stays invisible for the rest of the lease. |
+| `extend` | moves the lease expiry to `seconds` from now, at most 3600 |
 
-These routes finalize leases created by `POST claim`. They return 409 for a
-lease held by a worker pool.
+A mismatched lease, or one held by a worker pool, returns 409.
 
-The server does not renew an HTTP lease automatically. The consumer must call
-`extend`. After an unextended lease expires, another consumer can claim the
-job. This behavior provides at-least-once delivery after a consumer failure.
+The server does not renew an HTTP lease. After it expires another consumer can
+claim the job.
 
 > [!IMPORTANT]
-> Arbiter does not authenticate claim or finalization requests. Add
-> authentication before exposing these routes. Use WAI middleware, a Servant
-> authentication combinator, or an authenticating proxy.
+> These routes have no authentication. Add WAI middleware, a Servant
+> authentication combinator, or an authenticating proxy before you expose them.
 
 ## Maintenance
 
-`POST maintenance` performs one pass of schema maintenance. It processes stale
-workers, exhausted and cancelled jobs, rate-limit buckets, concurrency counts,
-archive retention, and group summaries.
+`POST maintenance` runs one pass over stale workers, exhausted and cancelled
+jobs, rate-limit buckets, concurrency counts, archive retention, and group
+summaries. Each operation runs in one caller at a time.
 
-Concurrent callers cannot run the same operation. The default has no minimum
-interval. Set `maintenanceInterval` in the server configuration to define the
-minimum interval for each operation. `maintenanceTimeout` limits one statement.
+| Server setting | Meaning |
+| --- | --- |
+| `maintenanceInterval` | minimum gap between runs of one operation (default: none) |
+| `maintenanceSparseInterval` | minimum gap for schema-wide operations |
+| `maintenanceTimeout` | statement timeout |
+| `maintenanceBucketIdle` | idle time before a rate-limit bucket is removed |
 
-`maintenanceSparseInterval` defines a separate minimum interval for
-schema-wide operations. `maintenanceBucketIdle` specifies how long a
-rate-limit bucket must be inactive before removal.
-
-The response gives the affected row count for each completed operation and the
-names of failed operations. Operations absent from both lists were skipped:
+The response lists the affected row count per completed operation and the
+names of failed operations. Skipped operations appear in neither:
 
 ```json
 {"ops": {"sweep-stale-workers": 2, "purge-archives": 140}, "failed": []}
 ```
 
-Worker pools run this maintenance in their reaper. Use the endpoint when a
-deployment does not run a worker pool.
-
+Worker pools run the same pass in their reaper. Use the endpoint when no pool
+runs.

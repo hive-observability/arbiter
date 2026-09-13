@@ -5,7 +5,6 @@
 module Arbiter.Core.Sql.Tree
   ( pauseChildrenSQL
   , resumeChildrenSQL
-  , descendantsCte
   , lockedByIdsCte
   , lockJobTreesSQL
   , lockJobTreesFromRootSQL
@@ -21,9 +20,8 @@ module Arbiter.Core.Sql.Tree
   , beginSpawnSQL
   , spawnedAlreadySQL
   , rollupIdsSQL
-  , jobExistsSQL
-  , getParentIdSQL
   , getParentIdsSQL
+  , jobExistsSQL
   , insertResultSQL
   , insertResultsBatchSQL
   , getResultsByParentSQL
@@ -404,12 +402,6 @@ jobExistsSQL :: Text -> Text -> Int64 -> Query Bool
 jobExistsSQL schema tableName jobId =
   let tbl = jobQueueTable schema tableName
    in [sql|SELECT EXISTS (SELECT 1 FROM ${tbl} WHERE id = #{jobId :: CInt8}) AS @{result :: CBool}|]
-
--- | Fetch a job's parent id.
-getParentIdSQL :: Text -> Text -> Int64 -> Query (Maybe Int64)
-getParentIdSQL schema tableName jobId =
-  let tbl = jobQueueTable schema tableName
-   in [sql|SELECT @{parent_id :: Maybe CInt8} FROM ${tbl} WHERE id = #{jobId :: CInt8}|]
 
 -- | Fetch the parent ids of several jobs.
 getParentIdsSQL :: Text -> Text -> [Int64] -> Query (Maybe Int64)

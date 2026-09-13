@@ -10,8 +10,7 @@ module Arbiter.Core.Sql.RateLimit
   , wakeThrottledJobsSQL
   , wakeThrottledJobsForKeySQL
   , refilledExpr
-  , listRateLimitPoliciesSQL
-  , getRateLimitPolicySQL
+  , rateLimitPoliciesSQL
   , rateLimitPolicyExistsSQL
   , listRateLimitBucketsSQL
   , updateRateLimitOverridesSQL
@@ -152,16 +151,6 @@ refilledBucketTokens =
     "bucket.last_refill"
     (effectivePolicyCol "policy" "refill_amount")
     (effectivePolicyCol "policy" "interval")
-
--- | List every policy with its default/override params and per-prefix bucket
--- aggregates (count, min and average of lazily-refilled tokens, live throttled
--- count over the given queue tables).
-listRateLimitPoliciesSQL :: SchemaName -> [TableName] -> Query RateLimitPolicyView
-listRateLimitPoliciesSQL schema tableNames = rateLimitPoliciesSQL schema tableNames Nothing
-
--- | Single-prefix variant of 'listRateLimitPoliciesSQL'.
-getRateLimitPolicySQL :: SchemaName -> [TableName] -> Text -> Query RateLimitPolicyView
-getRateLimitPolicySQL schema tableNames prefix = rateLimitPoliciesSQL schema tableNames (Just prefix)
 
 -- | Whether a rate-limit policy exists for a prefix.
 rateLimitPolicyExistsSQL :: SchemaName -> Text -> Query Bool

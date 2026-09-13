@@ -40,6 +40,9 @@ module Arbiter.Test.StateMachine
   , holViolTbl
   , holInstallSql
   , holRemoveSql
+  , installHolDetector
+  , holViolations
+  , removeHolDetector
   ) where
 
 import Arbiter.Core.Concurrency.Spec
@@ -74,7 +77,7 @@ import Arbiter.Core.JobTree ((<~~))
 import Arbiter.Core.MonadArbiter (MonadArbiter, RegistryOf, withDbTransaction)
 import Arbiter.Core.Operations qualified as Ops
 import Arbiter.Core.QueueRegistry (RegistryTables, TableForPayload)
-import Arbiter.Core.RateLimit.Schema (toPolicyRow, upsertPolicyRowSQL)
+import Arbiter.Core.RateLimit.Schema (upsertPolicyRowSQL)
 import Arbiter.Core.RateLimit.Spec
   ( HasRateLimit (..)
   , Policy
@@ -94,11 +97,12 @@ import Data.Foldable (traverse_)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.Int (Int32, Int64)
 import Data.Kind (Type)
-import Data.List (isInfixOf, nub)
+import Data.List (isInfixOf)
 import Data.List.NonEmpty (NonEmpty (..))
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (catMaybes, fromJust, isJust, listToMaybe)
+import Data.Set qualified as Set
 import Data.String (fromString)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -517,7 +521,7 @@ seedConcurrencyPools schema withConn = withConn $ \conn ->
 -- | Seed the rate-limit policy. Idempotent.
 seedRateLimitPolicies :: Text -> (forall a. (PG.Connection -> IO a) -> IO a) -> IO ()
 seedRateLimitPolicies schema withConn = withConn $ \conn ->
-  void $ PG.execute_ conn (fromString (T.unpack (upsertPolicyRowSQL schema (toPolicyRow smBucket))))
+  void $ PG.execute_ conn (fromString (T.unpack (upsertPolicyRowSQL schema smBucket)))
 
 -- | Reset the tables, then re-seed both admission policies.
 resetSeeded :: IO () -> Text -> (forall a. (PG.Connection -> IO a) -> IO a) -> IO ()
@@ -609,7 +613,7 @@ cClaim run schema table withConn =
         -- A claimed id is never a DLQ row. Untracked jobs are claimable and absent
         -- from the model.
         let dlqIds = map concrete (Map.keys (mDlq post))
-        nub (filter (`elem` dlqIds) ids) === []
+        filter (`elem` dlqIds) ids === []
     ]
 
 claimBatchSize :: Int
@@ -1381,21 +1385,23 @@ withRetry act = go (5 :: Int)
 isRetryableError :: SomeException -> Bool
 isRetryableError err = any (`isInfixOf` show err) ["40P01", "40001"]
 
--- | Install the gap-free HOL detector through the raw-connection accessor.
-installHolDetector :: Text -> Text -> (forall a. (PG.Connection -> IO a) -> IO a) -> IO ()
-installHolDetector schema table withConn = withConn $ \conn ->
+-- | Install the gap-free HOL violation detector on a raw connection.
+installHolDetector :: PG.Connection -> Text -> Text -> IO ()
+installHolDetector conn schema table =
   traverse_ (void . PG.execute_ conn . fromString . T.unpack) (holInstallSql schema table)
 
-countHolViolations :: Text -> Text -> (forall a. (PG.Connection -> IO a) -> IO a) -> IO [String]
-countHolViolations schema table withConn = withConn $ \conn -> do
+-- | One message per violation the HOL detector trigger recorded.
+holViolations :: PG.Connection -> Text -> Text -> IO [String]
+holViolations conn schema table = do
   rows <- PG.query_ conn (fromString (T.unpack ("SELECT group_key, job_id FROM " <> holViolTbl schema table)))
   pure
     [ "HOL violation: job " <> show (jid :: Int64) <> " claimed while group " <> T.unpack groupName <> " already in-flight"
     | (groupName, jid) <- rows
     ]
 
-removeHolDetector :: Text -> Text -> (forall a. (PG.Connection -> IO a) -> IO a) -> IO ()
-removeHolDetector schema table withConn = withConn $ \conn ->
+-- | Remove the HOL detector trigger, function, and violations table.
+removeHolDetector :: PG.Connection -> Text -> Text -> IO ()
+removeHolDetector conn schema table =
   traverse_ (void . PG.execute_ conn . fromString . T.unpack) (holRemoveSql schema table)
 
 -- ---------------------------------------------------------------------------
@@ -1465,7 +1471,7 @@ prop_concurrent run schema table withConn reset = withTests 100 $ withShrinks 0 
       (traverse_ (\act -> withRetry (run (interpret @sm schema table withConn act))))
       branches
     void (run (runReaper @sm schema table))
-    (,) <$> countHolViolations schema table withConn <*> queryViolations schema table withConn
+    (,) <$> withConn (\conn -> holViolations conn schema table) <*> queryViolations schema table withConn
   (hol <> settled) === []
 
 -- | Set a wall-clock time limit for a concurrent test.
@@ -1552,8 +1558,8 @@ serializationGuard
   -> IO ()
 serializationGuard run schema table withConn reset = do
   resetSeeded reset schema withConn
-  installHolDetector schema table withConn
-  flip finally (removeHolDetector schema table withConn) $ do
+  withConn $ \conn -> installHolDetector conn schema table
+  flip finally (withConn $ \conn -> removeHolDetector conn schema table) $ do
     truncateHol schema table withConn
     let rounds = 800 :: Int
         nActors = 16 :: Int
@@ -1562,7 +1568,7 @@ serializationGuard run schema table withConn reset = do
           withRetry (run act)
         reaper = replicateM_ (rounds * 2) $ withRetry (run (void (HL.refreshAllGroupsFully @sm)))
     mapConcurrently_ id (reaper : replicate nActors actor)
-    hol <- countHolViolations schema table withConn
+    hol <- withConn $ \conn -> holViolations conn schema table
     hol `shouldBe` []
 
 -- | Concurrent churn with no reaper, then assert the group summary matches a fresh recompute.
@@ -1866,8 +1872,8 @@ concurrentReclaimGuard
   -> IO ()
 concurrentReclaimGuard run schema table withConn reset = do
   reset
-  installHolDetector schema table withConn
-  flip finally (removeHolDetector schema table withConn) $ do
+  withConn $ \conn -> installHolDetector conn schema table
+  flip finally (withConn $ \conn -> removeHolDetector conn schema table) $ do
     truncateHol schema table withConn
     let groups = [Just ("crg" <> T.pack (show index)) | index <- [1 .. 5 :: Int]]
         seeds = [(Nothing, prio) | prio <- [0 .. 29 :: Int]] <> [(group, prio) | group <- groups, prio <- [0 .. 1 :: Int]]
@@ -1889,8 +1895,8 @@ concurrentReclaimGuard run schema table withConn reset = do
     mapConcurrently_ id (replicate 10 drain)
     got <- readIORef acked
     length got `shouldBe` total
-    length (nub got) `shouldBe` total
-    hol <- countHolViolations schema table withConn
+    Set.size (Set.fromList got) `shouldBe` total
+    hol <- withConn $ \conn -> holViolations conn schema table
     hol `shouldBe` []
 
 -- | Deterministic guard that claims honor priority. Ungrouped jobs come out in
@@ -2135,10 +2141,10 @@ stateMachineSpec run schema table withConn reset = do
     passed `shouldBe` True
   it "no serialization or summary violation under N concurrent generated streams" $
     withinSecs 180 $ do
-      installHolDetector schema table withConn
+      withConn $ \conn -> installHolDetector conn schema table
       passed <-
         check (prop_concurrent @sm run schema table withConn reset)
-          `finally` removeHolDetector schema table withConn
+          `finally` withConn (\conn -> removeHolDetector conn schema table)
       passed `shouldBe` True
   it "concurrent cross-group operations never deadlock" $
     withinSecs 150 (deadlockGuard @sm run reset)

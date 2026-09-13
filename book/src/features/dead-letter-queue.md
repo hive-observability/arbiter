@@ -1,12 +1,10 @@
 # Dead-Letter Queue
 
-Arbiter moves a job to its queue's DLQ after its last attempt or after a
-handler calls `throwPermanent`. See [Error Handling](error-handling.md).
+A job moves to its queue's DLQ after its last attempt or after
+`throwPermanent`. See [Error Handling](error-handling.md).
 
-A `DLQJob` contains two identifiers. `dlqPrimaryKey` identifies the DLQ row.
-`jobSnapshot` contains the failed job, including its identifier, payload,
-attempt count, and last error. `retryFromDLQ` and `deleteDLQJob` accept the DLQ
-row identifier.
+`dlqPrimaryKey` is the DLQ row id, which `retryFromDLQ` and `deleteDLQJob`
+take. `jobSnapshot` is the failed job.
 
 ```haskell
 import Arbiter.Core.Job.DLQ qualified as DLQ
@@ -19,41 +17,36 @@ traverse_
 
 ## Retry
 
-`retryFromDLQ` takes a DLQ row id and returns the requeued job.
-
 ```haskell
 requeued <- Arb.retryFromDLQ @OrderPayload dlqId
 ```
 
-A retry recovers the applicable DLQ tree in one statement. The specified row
-can be any member of the tree. Arbiter restores the root, all descendants in
-the DLQ, and their finalizers. A retry of one failed fan-out child also restores
-failed siblings.
+One retry restores the whole tree that contains the row, in one statement:
 
-A restored finalizer is suspended if it has children in the DLQ or main queue.
-A finalizer with no children is ready and uses its stored snapshot. Arbiter
-suspends a queued rollup parent when it restores children below that parent.
-Arbiter refuses to restore a child if its parent is no longer in the main queue.
-This rule prevents orphan jobs.
+- The root, every descendant in the DLQ, and their finalizers return to the
+  main queue.
+- A retry of one fan-out child also restores its failed siblings.
+- A restored finalizer is suspended while it has children in the DLQ or main
+  queue. With no children it is ready and uses its stored snapshot.
+- A queued rollup parent is suspended when children are restored below it.
+- A child whose parent has left the main queue is not restored.
 
-A retried job retains its job identifier, payload, priority, group key, parent
-link, attempt limit, retention, and admission keys. Arbiter clears its attempt
-count and error, and makes it immediately visible. The retained identifier
-preserves parent links in the restored tree.
+A retried job keeps its id, payload, priority, group key, parent link, attempt
+limit, retention, and admission keys. Its attempt count and error are cleared.
+It is visible at once.
 
-The `parentState` in a DLQ rollup finalizer snapshot contains the collected
-child results. Arbiter records this state before it deletes the children.
+`parentState` in a rollup finalizer snapshot holds the child results collected
+before the children were deleted.
 
 > [!IMPORTANT]
-> A retry removes the deduplication key. After a job has entered the DLQ, a new
-> insert can use the old [`IgnoreDuplicate`](deduplication.md) key.
+> A retry drops the deduplication key. After a job enters the DLQ, a new insert
+> can reuse its [`IgnoreDuplicate`](deduplication.md) key.
 
 ## Deletion
 
-`deleteDLQJob` removes one entry and `deleteDLQJobsBatch` removes several. Both
+`deleteDLQJob` removes one entry. `deleteDLQJobsBatch` removes several. Both
 are permanent.
 
-The [REST API and admin UI](../rest-api.md) expose the same list, retry, and
-delete operations.
+The [REST API and admin UI](../rest-api.md) expose list, retry, and delete.
 
 See the [`Arbiter.Core.Job.DLQ` haddocks](https://arbiterq.dev/arbiter-core/Arbiter-Core-Job-DLQ.html) for the entry type.

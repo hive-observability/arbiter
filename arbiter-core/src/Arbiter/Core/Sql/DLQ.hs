@@ -8,7 +8,6 @@ module Arbiter.Core.Sql.DLQ
   , selectExhaustedJobsSQL
   , retryFromDLQSQL
   , dlqJobExistsSQL
-  , deleteDLQJobSQL
   , moveToDLQBatchSQL
   , deleteDLQJobsBatchSQL
   , cascadeChildrenToDLQSQL
@@ -178,12 +177,6 @@ dlqJobExistsSQL :: Text -> Text -> Int64 -> Query Bool
 dlqJobExistsSQL schema tableName dlqId =
   let dlqTbl = jobQueueDLQTable schema tableName
    in [sql|SELECT EXISTS (SELECT 1 FROM ${dlqTbl} WHERE id = #{dlqId :: CInt8}) AS @{result :: CBool}|]
-
--- | Delete a DLQ job, returning its parent id.
-deleteDLQJobSQL :: Text -> Text -> Int64 -> Query (Maybe Int64)
-deleteDLQJobSQL schema tableName dlqId =
-  let dlqTbl = jobQueueDLQTable schema tableName
-   in [sql|DELETE FROM ${dlqTbl} WHERE id = #{dlqId :: CInt8} RETURNING @{parent_id :: Maybe CInt8}|]
 
 -- | 'moveToDLQSQL' over @unnest@ed @(id, claim_seq, error_msg)@ arrays, locking
 -- descending to match ack. Returns the ids moved.

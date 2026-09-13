@@ -13,6 +13,7 @@ import Arbiter.Concurrency (HasConcurrency (..), concurrencyBy, concurrencyPool)
 import Arbiter.Core.HighLevel qualified as HL
 import Arbiter.Core.Job.Types
   ( HasKind
+  , JobWrite
   , defaultJob
   , payload
   , primaryKey
@@ -23,6 +24,7 @@ import Arbiter.Core.Job.Types
   , setPriority
   )
 import Arbiter.Core.JobTree qualified as JT
+import Arbiter.Core.MonadArbiter (ResultOf)
 import Arbiter.Core.QueueRegistry (Queue, QueueSpec (..))
 import Arbiter.Migrations (MigrationConfig (..), MigrationResult (..), defaultMigrationConfig, runMigrationsForRegistry)
 import Arbiter.Otel qualified as Otel
@@ -35,7 +37,11 @@ import Arbiter.Servant.UI (AdminUI, adminUIServer, adminUIServerDev)
 import Arbiter.Simple
 import Arbiter.Worker
   ( BatchCallbacks (..)
+  , CronJob
+  , OverlapPolicy (..)
+  , TickKind
   , WorkerConfig (..)
+  , cronJob
   , defaultBatchedWorkerConfig
   , defaultLogConfig
   , mergedChildResults
@@ -44,10 +50,9 @@ import Arbiter.Worker
   , shutdownPools
   , transactionalWorkerConfig
   )
-import Arbiter.Worker.Cron (OverlapPolicy (..), cronJob)
 import Control.Concurrent (forkIO, threadDelay)
 import Control.Concurrent.Async (race_)
-import Control.Monad (forM_, void, when)
+import Control.Monad (replicateM_, void, when)
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Data.Aeson (FromJSON, ToJSON)
 import Data.ByteString.Char8 qualified as BS
@@ -62,7 +67,7 @@ import Data.Proxy (Proxy (..))
 import Data.String (fromString)
 import Data.Text (Text)
 import Data.Text qualified as T
-import Data.Time (addUTCTime, diffTimeToPicoseconds, getCurrentTime, utctDayTime)
+import Data.Time (NominalDiffTime, UTCTime, addUTCTime, diffTimeToPicoseconds, getCurrentTime, utctDayTime)
 import Database.PostgreSQL.Simple qualified as PG
 import GHC.Generics (Generic)
 import Network.Wai.Handler.Warp
@@ -233,9 +238,9 @@ runDemo tel = do
 
   -- Create worker configs with cron jobs
   putStrLn "Creating worker configs..."
-  demoWorkerCfg <- mkDemoWorker
-  emailWorkerCfg <- mkEmailWorker
-  notifWorkerCfg <- mkNotifWorker
+  demoWorkerCfg <- simpleWorker 5 2 10 [demoTicker]
+  emailWorkerCfg <- simpleWorker 3 2 10 [emailDigest]
+  notifWorkerCfg <- simpleWorker 1 0.05 2 [notifBroadcast]
   bulkWorkerCfg <- mkBulkWorker
   pipelineWorkerCfg <- mkPipelineWorker
   putStrLn "Workers configured"
@@ -323,65 +328,48 @@ simulateWork mean = do
   uniform <- randomRIO (1.0e-6, 1.0)
   threadDelay (round (mean * negate (log uniform) * 1e6))
 
-mkDemoWorker :: IO (WorkerConfig DemoM DemoPayload)
-mkDemoWorker = do
-  cfg <- transactionalWorkerConfig 5 handler
-  pure
-    cfg
-      { cronJobs = demoCrons
-      , pollInterval = 10
-      , livenessFile = Nothing
-      }
-  where
-    handler _conn _job = liftIO $ simulateWork 2
-    demoCrons =
-      [ either error id $
-          cronJob
-            "demo-ticker"
-            "* * * * *" -- every minute
-            AllowOverlap
-            (\_ tickTime -> defaultJob (TestMessage $ "tick:" <> tshow tickTime))
-      ]
+-- | A transactional worker pool whose handler sleeps for @mean@ seconds on average.
+simpleWorker
+  :: (ResultOf DemoM payload ~ ())
+  => Int
+  -- ^ Worker count
+  -> Double
+  -- ^ Mean handler delay (seconds)
+  -> NominalDiffTime
+  -- ^ Poll interval
+  -> [CronJob payload]
+  -> IO (WorkerConfig DemoM payload)
+simpleWorker count mean poll crons = do
+  cfg <- transactionalWorkerConfig count (\_conn _job -> liftIO $ simulateWork mean)
+  pure cfg {cronJobs = crons, pollInterval = poll, livenessFile = Nothing}
 
-mkEmailWorker :: IO (WorkerConfig DemoM EmailPayload)
-mkEmailWorker = do
-  cfg <- transactionalWorkerConfig 3 handler
-  pure
-    cfg
-      { cronJobs = emailCrons
-      , pollInterval = 10
-      , livenessFile = Nothing
-      }
-  where
-    handler _conn _job = liftIO $ simulateWork 2
-    emailCrons =
-      [ either error id $
-          cronJob
-            "email-digest"
-            "*/2 * * * *" -- every 2 minutes
-            SkipOverlap
-            (\_ _ -> defaultJob (SendEmail "scheduled-digest"))
-      ]
+-- | 'cronJob' for a literal expression. A bad expression is a crash.
+mustCron :: Text -> Text -> OverlapPolicy -> (TickKind -> UTCTime -> JobWrite payload) -> CronJob payload
+mustCron name expr policy = either error id . cronJob name expr policy
 
-mkNotifWorker :: IO (WorkerConfig DemoM NotificationPayload)
-mkNotifWorker = do
-  cfg <- transactionalWorkerConfig 1 handler
-  pure
-    cfg
-      { cronJobs = notifCrons
-      , pollInterval = 2
-      , livenessFile = Nothing
-      }
-  where
-    handler _conn _job = liftIO $ simulateWork 0.05
-    notifCrons =
-      [ either error id $
-          cronJob
-            "notif-broadcast"
-            "*/3 * * * *" -- every 3 minutes
-            AllowOverlap
-            (\_ tickTime -> defaultJob (PushNotification $ "broadcast:" <> tshow tickTime))
-      ]
+demoTicker :: CronJob DemoPayload
+demoTicker =
+  mustCron
+    "demo-ticker"
+    "* * * * *" -- every minute
+    AllowOverlap
+    (\_ tickTime -> defaultJob (TestMessage $ "tick:" <> tshow tickTime))
+
+emailDigest :: CronJob EmailPayload
+emailDigest =
+  mustCron
+    "email-digest"
+    "*/2 * * * *" -- every 2 minutes
+    SkipOverlap
+    (\_ _ -> defaultJob (SendEmail "scheduled-digest"))
+
+notifBroadcast :: CronJob NotificationPayload
+notifBroadcast =
+  mustCron
+    "notif-broadcast"
+    "*/3 * * * *" -- every 3 minutes
+    AllowOverlap
+    (\_ tickTime -> defaultJob (PushNotification $ "broadcast:" <> tshow tickTime))
 
 -- | Drains the burst queue. Many workers claim large batches with a near-zero
 -- handler. Sized by BURST_WORKERS and BURST_BATCH.
@@ -491,15 +479,18 @@ seedQueues = do
   void $
     HL.insertJob
       (setGroupKey (Just "ingest") $ setMaxAttempts (Just 5) $ defaultJob (TestMessage "corrupt-record"))
-  forM_ ([1 .. 4] :: [Int]) $ \_ -> do
+  replicateM_ 4 $ do
     [failed] <- HL.claimNextVisibleJobs @DemoPayload 1 60
     void $ HL.updateJobForRetry 0 "unparseable payload" failed
   [doomed] <- HL.claimNextVisibleJobs @DemoPayload 1 60
   void $ HL.moveToDLQ "unparseable payload after 5 attempts" doomed
 
   -- demo_queue: ready jobs with varied priority and group keys
-  forM_ (zip [0 :: Int ..] demoTasks) $ \(index, (grp, msg)) ->
-    void $ HL.insertJob (setGroupKey (Just grp) $ setPriority (fromIntegral (index `mod` 5)) $ defaultJob (TestMessage msg))
+  traverse_
+    ( \(index, (grp, msg)) ->
+        void $ HL.insertJob (setGroupKey (Just grp) $ setPriority (fromIntegral (index `mod` 5)) $ defaultJob (TestMessage msg))
+    )
+    (zip [0 :: Int ..] demoTasks)
   -- scheduled (not visible yet) and suspended (paused)
   void $
     HL.insertJob
@@ -514,13 +505,15 @@ seedQueues = do
   void $ HL.insertJob (setMaxAttempts (Just 2) $ defaultJob (SendEmail "nobody@invalid.test"))
   [rejected] <- HL.claimNextVisibleJobs @EmailPayload 1 60
   void $ HL.updateJobForRetry 0 "recipient rejected (550)" rejected
-  forM_ (["welcome@acme.test", "receipt@acme.test", "reset@acme.test"] :: [Text]) $ \addr ->
-    void $ HL.insertJob (defaultJob (SendEmail addr))
+  traverse_
+    (void . HL.insertJob . defaultJob . SendEmail)
+    (["welcome@acme.test", "receipt@acme.test", "reset@acme.test"] :: [Text])
   void $ HL.insertJob (setNotVisibleUntil (Just (addUTCTime 1800 now)) $ defaultJob (SendEmail "weekly-digest"))
 
   -- notifications: a few ready
-  forM_ (["deploy finished", "build green", "nightly backup ok"] :: [Text]) $ \msg ->
-    void $ HL.insertJob (defaultJob (PushNotification msg))
+  traverse_
+    (void . HL.insertJob . defaultJob . PushNotification)
+    (["deploy finished", "build green", "nightly backup ok"] :: [Text])
   where
     need :: Maybe a -> DemoM a
     need = maybe (liftIO (die "demo seed: insert returned Nothing")) pure

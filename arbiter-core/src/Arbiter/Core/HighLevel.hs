@@ -166,21 +166,9 @@ import Arbiter.Core.Admission (AdmissionPolicy (..))
 import Arbiter.Core.Concurrency.Spec (ConcurrencyPolicy)
 import Arbiter.Core.Concurrency.Stats (ConcurrencyKeyView, ConcurrencyPolicyUpdate (..), ConcurrencyPolicyView)
 import Arbiter.Core.CronSchedule (CronScheduleRow, CronScheduleUpdate)
-import Arbiter.Core.HighLevel.Runtime
-  ( deregisterWorker
-  , ensureQueue
-  , getQueue
-  , heartbeatWorker
-  , listQueues
-  , listWorkers
-  , markWorkerShuttingDown
-  , registerWorker
-  , setQueuePaused
-  , setWorkerPaused
-  , sweepStaleWorkers
-  )
 import Arbiter.Core.Job.Archive qualified as Archive
 import Arbiter.Core.Job.DLQ qualified as DLQ
+import Arbiter.Core.Job.Schema (SchemaName, TableName)
 import Arbiter.Core.Job.Types
   ( ClaimSeq
   , HasKind
@@ -214,10 +202,7 @@ type QueueOperation m payload =
   )
 
 -- | Constraints for job operations (table name stored in job).
-type JobOperation m payload =
-  ( JobPayload payload
-  , MonadArbiter m
-  )
+type JobOperation m payload = (JobPayload payload, MonadArbiter m)
 
 -- | The table name @payload@'s entry in this monad's registry declares.
 queueTable :: forall payload m. (KnownSymbol (TableForPayload payload (RegistryOf m))) => Text
@@ -230,6 +215,22 @@ onQueue
   => (Text -> Text -> m a)
   -> m a
 onQueue operation = getSchema >>= \schemaName -> operation schemaName (queueTable @payload @m)
+
+-- | Run an operation against the schema.
+onSchema :: (MonadArbiter m) => (SchemaName -> m a) -> m a
+onSchema = (getSchema >>=)
+
+-- | Run an operation against the schema and every table the registry names.
+onRegistry
+  :: forall m a
+   . (MonadArbiter m, RegistryTables (RegistryOf m))
+  => (SchemaName -> [TableName] -> m a)
+  -> m a
+onRegistry operation = getSchema >>= \schemaName -> operation schemaName (registryTableNames (Proxy @(RegistryOf m)))
+
+-- | Run an operation against the schema and the table a job came from.
+onJob :: (MonadArbiter m) => JobRead payload -> (SchemaName -> TableName -> m a) -> m a
+onJob job operation = getSchema >>= \schemaName -> operation schemaName (Job.queueName job)
 
 publishSpan
   :: forall payload m a
@@ -288,11 +289,9 @@ addRateLimitTokens
   => RateLimitKey
   -> Double
   -> m ()
-addRateLimitTokens key amount = withDbTransaction $ do
-  schemaName <- getSchema
-  Ops.addRateLimitTokens schemaName key amount
-  let queues = registryTableNames (Proxy @(RegistryOf m))
-  void $ Ops.wakeThrottledJobsForKey schemaName queues key
+addRateLimitTokens key amount =
+  withDbTransaction $ onRegistry $ \schemaName queues ->
+    Ops.addRateLimitTokens schemaName key amount >> void (Ops.wakeThrottledJobsForKey schemaName queues key)
 
 -- | Override a policy with this shape, until it is cleared. Returns rows affected.
 setRateLimit :: (MonadArbiter m, RegistryTables (RegistryOf m)) => Policy -> m Int64
@@ -321,9 +320,7 @@ pruneRateLimitBuckets
    . (MonadArbiter m)
   => NominalDiffTime
   -> m Int64
-pruneRateLimitBuckets idle = do
-  schemaName <- getSchema
-  Ops.pruneRateLimitBuckets schemaName idle
+pruneRateLimitBuckets idle = onSchema $ \schemaName -> Ops.pruneRateLimitBuckets schemaName idle
 
 -- | Reset every bucket for a prefix to full and wake its throttled jobs. Returns
 -- the number of buckets reset. A manual (0-refill) policy plus a cron calling this
@@ -333,12 +330,9 @@ resetRateLimitBuckets
    . (MonadArbiter m, RegistryTables (RegistryOf m))
   => Text
   -> m Int64
-resetRateLimitBuckets prefix = withDbTransaction $ do
-  schemaName <- getSchema
-  resetCount <- Ops.resetRateLimitBuckets schemaName prefix
-  let queues = registryTableNames (Proxy @(RegistryOf m))
-  _ <- Ops.wakeThrottledJobs schemaName queues prefix
-  pure resetCount
+resetRateLimitBuckets prefix =
+  withDbTransaction $ onRegistry $ \schemaName queues ->
+    Ops.resetRateLimitBuckets schemaName prefix <* Ops.wakeThrottledJobs schemaName queues prefix
 
 -- | List every rate-limit policy with its params, bucket stats, and a live count
 -- of currently-throttled jobs per prefix across the registry's queues.
@@ -346,9 +340,7 @@ listRateLimitPolicies
   :: forall m
    . (MonadArbiter m, RegistryTables (RegistryOf m))
   => m [RateLimitPolicyView]
-listRateLimitPolicies = do
-  schemaName <- getSchema
-  Ops.listRateLimitPolicies schemaName (registryTableNames (Proxy @(RegistryOf m)))
+listRateLimitPolicies = onRegistry Ops.listRateLimitPolicies
 
 -- | One prefix's rate-limit policy with its params, bucket stats, and live throttled
 -- count. 'Nothing' when the prefix has no policy.
@@ -357,9 +349,7 @@ getRateLimitPolicy
    . (MonadArbiter m, RegistryTables (RegistryOf m))
   => Text
   -> m (Maybe RateLimitPolicyView)
-getRateLimitPolicy prefix = do
-  schemaName <- getSchema
-  Ops.getRateLimitPolicy schemaName (registryTableNames (Proxy @(RegistryOf m))) prefix
+getRateLimitPolicy prefix = onRegistry $ \schemaName queues -> Ops.getRateLimitPolicy schemaName queues prefix
 
 -- | Whether a rate-limit policy exists for a prefix.
 rateLimitPolicyExists
@@ -367,9 +357,7 @@ rateLimitPolicyExists
    . (MonadArbiter m)
   => Text
   -> m Bool
-rateLimitPolicyExists prefix = do
-  schemaName <- getSchema
-  Ops.rateLimitPolicyExists schemaName prefix
+rateLimitPolicyExists prefix = onSchema $ \schemaName -> Ops.rateLimitPolicyExists schemaName prefix
 
 -- | List a prefix's buckets with fill levels, paginated.
 listRateLimitBuckets
@@ -379,9 +367,7 @@ listRateLimitBuckets
   -> Int
   -> Int
   -> m [RateLimitBucketView]
-listRateLimitBuckets prefix limit offset = do
-  schemaName <- getSchema
-  Ops.listRateLimitBuckets schemaName prefix limit offset
+listRateLimitBuckets prefix limit offset = onSchema $ \schemaName -> Ops.listRateLimitBuckets schemaName prefix limit offset
 
 -- | Set or clear a policy's override params and wake the prefix's parked jobs. Returns
 -- rows affected (0 if absent).
@@ -391,13 +377,10 @@ updateRateLimitPolicyOverrides
   => Text
   -> RateLimitPolicyUpdate
   -> m Int64
-updateRateLimitPolicyOverrides prefix upd = do
-  schemaName <- getSchema
+updateRateLimitPolicyOverrides prefix upd = onRegistry $ \schemaName queues -> do
   affected <- Ops.updateRateLimitPolicyOverrides schemaName prefix upd
   -- Wake after the override commits.
-  when (affected > 0) $ do
-    let queues = registryTableNames (Proxy @(RegistryOf m))
-    void $ Ops.wakeThrottledJobs schemaName queues prefix
+  when (affected > 0) $ void $ Ops.wakeThrottledJobs schemaName queues prefix
   pure affected
 
 -- | List every concurrency pool with its default/override limit and live key and
@@ -406,9 +389,7 @@ listConcurrencyPolicies
   :: forall m
    . (MonadArbiter m)
   => m [ConcurrencyPolicyView]
-listConcurrencyPolicies = do
-  schemaName <- getSchema
-  Ops.listConcurrencyPolicies schemaName
+listConcurrencyPolicies = onSchema Ops.listConcurrencyPolicies
 
 -- | One prefix's concurrency pool with its default/override limit and live aggregates.
 -- 'Nothing' when the prefix has no pool.
@@ -417,9 +398,7 @@ getConcurrencyPolicy
    . (MonadArbiter m)
   => Text
   -> m (Maybe ConcurrencyPolicyView)
-getConcurrencyPolicy prefix = do
-  schemaName <- getSchema
-  Ops.getConcurrencyPolicy schemaName prefix
+getConcurrencyPolicy prefix = onSchema $ \schemaName -> Ops.getConcurrencyPolicy schemaName prefix
 
 -- | List a prefix's keys with effective cap and in-flight fill fraction, paginated.
 listConcurrencyKeys
@@ -429,9 +408,7 @@ listConcurrencyKeys
   -> Int
   -> Int
   -> m [ConcurrencyKeyView]
-listConcurrencyKeys prefix limit offset = do
-  schemaName <- getSchema
-  Ops.listConcurrencyKeys schemaName prefix limit offset
+listConcurrencyKeys prefix limit offset = onSchema $ \schemaName -> Ops.listConcurrencyKeys schemaName prefix limit offset
 
 -- | Apply a pool's override-limit patch on its policy row, retuning every key under
 -- the prefix live. Lowering it does not preempt in-flight jobs until they drain.
@@ -442,9 +419,7 @@ updateConcurrencyPolicyOverrides
   => Text
   -> ConcurrencyPolicyUpdate
   -> m Int64
-updateConcurrencyPolicyOverrides prefix upd = do
-  schemaName <- getSchema
-  Ops.updateConcurrencyPolicyOverrides schemaName prefix upd
+updateConcurrencyPolicyOverrides prefix upd = onSchema $ \schemaName -> Ops.updateConcurrencyPolicyOverrides schemaName prefix upd
 
 -- | Override a declared pool's limit for every key under it. Returns rows affected.
 setConcurrencyLimit :: (MonadArbiter m) => ConcurrencyPolicy -> Int32 -> m Int64
@@ -461,18 +436,14 @@ pruneConcurrencyKeys
   :: forall m
    . (MonadArbiter m, RegistryTables (RegistryOf m))
   => m Int64
-pruneConcurrencyKeys = do
-  schemaName <- getSchema
-  Ops.pruneConcurrencyKeys schemaName (registryTableNames (Proxy @(RegistryOf m)))
+pruneConcurrencyKeys = onRegistry Ops.pruneConcurrencyKeys
 
 -- | Recompute the concurrency counts from live jobs, repairing any trigger drift.
 reconcileConcurrencyCounts
   :: forall m
    . (MonadArbiter m, RegistryTables (RegistryOf m))
   => m Int64
-reconcileConcurrencyCounts = do
-  schemaName <- getSchema
-  Ops.reconcileConcurrencyCounts schemaName (registryTableNames (Proxy @(RegistryOf m)))
+reconcileConcurrencyCounts = onRegistry Ops.reconcileConcurrencyCounts
 
 -- | Rebuild the concurrency counts when a crash truncated the UNLOGGED table. The
 -- reaper runs this periodically.
@@ -480,18 +451,14 @@ reconcileConcurrencyCountsIfStale
   :: forall m
    . (MonadArbiter m, RegistryTables (RegistryOf m))
   => m Int64
-reconcileConcurrencyCountsIfStale = do
-  schemaName <- getSchema
-  Ops.reconcileConcurrencyCountsIfStale schemaName (registryTableNames (Proxy @(RegistryOf m)))
+reconcileConcurrencyCountsIfStale = onRegistry Ops.reconcileConcurrencyCountsIfStale
 
 -- | Reconcile then prune. The reaper runs this.
 reconcileAndPruneConcurrency
   :: forall m
    . (MonadArbiter m, RegistryTables (RegistryOf m))
   => m Int64
-reconcileAndPruneConcurrency = do
-  schemaName <- getSchema
-  Ops.reconcileAndPruneConcurrency schemaName (registryTableNames (Proxy @(RegistryOf m)))
+reconcileAndPruneConcurrency = onRegistry Ops.reconcileAndPruneConcurrency
 
 -- | Assemble a pool's statements once. Batch size 1 is the single-job claim.
 mkJobStatements
@@ -504,7 +471,7 @@ mkJobStatements
   -> m Ops.JobStatements
 mkJobStatements batchSize poolSize timeout workerId =
   onQueue @payload $ \schemaName tableName ->
-    pure $ Ops.mkJobStatements (Proxy @payload) schemaName tableName batchSize poolSize timeout workerId
+    pure $ Ops.mkJobStatements @payload schemaName tableName batchSize poolSize timeout workerId
 
 -- | 'claimNextVisibleJobs' under a given worker id. The dispatcher claims this way.
 claimNextVisibleJobsAs
@@ -539,80 +506,64 @@ claimNextVisibleJobsBatched batchSize maxGroups timeout =
 -- running. Returns 1, or 0 for a job already gone.
 ackJob
   :: forall payload m
-   . (JobOperation m payload)
+   . (MonadArbiter m)
   => JobRead payload
   -> m Int64
-ackJob job = do
-  schemaName <- getSchema
-  let tableName = Job.queueName job
-  Ops.ackJob schemaName tableName job
+ackJob job = onJob job $ \schemaName tableName -> Ops.ackJob schemaName tableName job
 
 -- | 'ackJob' over a batch from one queue in one statement, returning the ids acked.
 -- Reclaimed jobs are absent.
 ackJobsBatch
   :: forall payload m
-   . (JobOperation m payload)
+   . (MonadArbiter m)
   => [JobRead payload]
   -> m [Int64]
 ackJobsBatch [] = pure []
-ackJobsBatch jobs@(firstJob : _) = do
-  schemaName <- getSchema
-  let tableName = Job.queueName firstJob
-  Ops.ackJobsBatch schemaName tableName jobs
+ackJobsBatch jobs@(firstJob : _) = onJob firstJob $ \schemaName tableName -> Ops.ackJobsBatch schemaName tableName jobs
 
 -- | Park a failed job for its retry backoff. Returns 0 for a job another worker holds.
 updateJobForRetry
   :: forall payload m
-   . (JobOperation m payload)
+   . (MonadArbiter m)
   => NominalDiffTime
   -- ^ The delay before this job becomes visible again for retry.
   -> Text
   -- ^ An error message to store with the job.
   -> JobRead payload
   -> m Int64
-updateJobForRetry delay errorMsg job = do
-  schemaName <- getSchema
-  let tableName = Job.queueName job
-  Ops.updateJobForRetry schemaName tableName delay errorMsg job
+updateJobForRetry delay errorMsg job =
+  onJob job $ \schemaName tableName -> Ops.updateJobForRetry schemaName tableName delay errorMsg job
 
 -- | Soft-nack a job. It is reprocessed once its visibility timeout lapses. No failure
 -- is recorded and no attempt is consumed. Returns 0 for a job another worker holds.
 nackJob
   :: forall payload m
-   . (JobOperation m payload)
+   . (MonadArbiter m)
   => JobRead payload
   -> m Int64
-nackJob job = do
-  schemaName <- getSchema
-  let tableName = Job.queueName job
-  Ops.nackJob schemaName tableName job
+nackJob job = onJob job $ \schemaName tableName -> Ops.nackJob schemaName tableName job
 
 -- | 'nackJob' over a batch from one queue in one statement, returning the ids nacked.
 -- Jobs another worker holds are absent.
 nackJobsBatch
   :: forall payload m
-   . (JobOperation m payload)
+   . (MonadArbiter m)
   => [JobRead payload]
   -> m [Int64]
 nackJobsBatch [] = pure []
-nackJobsBatch jobs@(firstJob : _) = do
-  schemaName <- getSchema
-  Ops.nackJobsBatch schemaName (Job.queueName firstJob) jobs
+nackJobsBatch jobs@(firstJob : _) = onJob firstJob $ \schemaName tableName -> Ops.nackJobsBatch schemaName tableName jobs
 
 -- | Extend a job's visibility timeout by hand, for a long-running job. Returns 0 for a
 -- job that is gone, reclaimed or suspended. 'setVisibilityTimeoutBatch' tells them
 -- apart.
 setVisibilityTimeout
   :: forall payload m
-   . (JobOperation m payload)
+   . (MonadArbiter m)
   => NominalDiffTime
   -- ^ The new visibility timeout (in seconds) from the current time.
   -> JobRead payload
   -> m Int64
-setVisibilityTimeout timeout job = do
-  schemaName <- getSchema
-  let tableName = Job.queueName job
-  Ops.setVisibilityTimeout schemaName tableName timeout job
+setVisibilityTimeout timeout job = onJob job $ \schemaName tableName -> Ops.setVisibilityTimeout schemaName tableName timeout job
 
 -- | Result of setting visibility timeout for a single job in a batch.
 data SetVisibilityResult
@@ -634,44 +585,40 @@ data SetVisibilityResult
 -- | 'setVisibilityTimeout' over a batch from one queue.
 setVisibilityTimeoutBatch
   :: forall payload m
-   . (JobOperation m payload)
+   . (MonadArbiter m)
   => NominalDiffTime
   -- ^ The new visibility timeout (in seconds) from the current time.
   -> [JobRead payload]
   -- ^ Jobs to heartbeat (all must be from the same queue)
   -> m [SetVisibilityResult]
 setVisibilityTimeoutBatch _ [] = pure []
-setVisibilityTimeoutBatch timeout jobs@(firstJob : _) = do
-  schemaName <- getSchema
-  let tableName = Job.queueName firstJob
-  infos <- Ops.setVisibilityTimeoutBatch schemaName tableName timeout jobs
-  let jobMap = Map.fromList [(primaryKey job, job) | job <- jobs]
-      toResult (Ops.VisibilityUpdateInfo jobId heartbeated mActual cancelled suspended holder) =
-        let mJob = Map.lookup jobId jobMap
-            expected = maybe 0 claimSeq mJob
-            heldHere = maybe False (\job -> claimedBy job == holder) mJob
-         in case mActual of
-              Nothing -> JobGone jobId
-              Just actual
-                | cancelled, heldHere, actual == expected + 1 -> JobCancelled jobId
-                | actual /= expected -> JobReclaimed jobId expected actual
-                | suspended -> JobSuspended jobId
-                | heartbeated -> VisibilityExtended jobId
-                | otherwise -> VisibilityUnchanged jobId
-  pure $ map toResult infos
+setVisibilityTimeoutBatch timeout jobs@(firstJob : _) =
+  onJob firstJob $ \schemaName tableName ->
+    map toResult <$> Ops.setVisibilityTimeoutBatch schemaName tableName timeout jobs
+  where
+    jobMap = Map.fromList [(primaryKey job, job) | job <- jobs]
+    toResult (Ops.VisibilityUpdateInfo jobId heartbeated mActual cancelled suspended holder) =
+      let mJob = Map.lookup jobId jobMap
+          expected = maybe 0 claimSeq mJob
+          heldHere = maybe False (\job -> claimedBy job == holder) mJob
+       in case mActual of
+            Nothing -> JobGone jobId
+            Just actual
+              | cancelled, heldHere, actual == expected + 1 -> JobCancelled jobId
+              | actual /= expected -> JobReclaimed jobId expected actual
+              | suspended -> JobSuspended jobId
+              | heartbeated -> VisibilityExtended jobId
+              | otherwise -> VisibilityUnchanged jobId
 
 -- | Move a job to the DLQ. Returns 0 for a job another worker holds.
 moveToDLQ
   :: forall payload m
-   . (JobOperation m payload)
+   . (MonadArbiter m)
   => Text
   -- ^ Error message (the final error that caused the DLQ move)
   -> JobRead payload
   -> m Int64
-moveToDLQ errorMsg job = do
-  schemaName <- getSchema
-  let tableName = Job.queueName job
-  Ops.moveToDLQ Ops.TakeLocks schemaName tableName errorMsg job
+moveToDLQ errorMsg job = onJob job $ \schemaName tableName -> Ops.moveToDLQ Ops.TakeLocks schemaName tableName errorMsg job
 
 -- | List DLQ jobs, most recently failed first.
 listDLQJobs
@@ -778,15 +725,13 @@ deleteDLQJob dlqId = onQueue @payload $ \schemaName tableName -> Ops.deleteDLQJo
 -- number moved.
 moveToDLQBatch
   :: forall payload m
-   . (JobOperation m payload)
+   . (MonadArbiter m)
   => [(JobRead payload, Text)]
   -- ^ List of (job, error message) pairs. All jobs must be from the same queue.
   -> m Int64
 moveToDLQBatch [] = pure 0
-moveToDLQBatch jobsWithErrors@((firstJob, _) : _) = do
-  schemaName <- getSchema
-  let tableName = Job.queueName firstJob
-  Ops.moveToDLQBatch schemaName tableName jobsWithErrors
+moveToDLQBatch jobsWithErrors@((firstJob, _) : _) =
+  onJob firstJob $ \schemaName tableName -> Ops.moveToDLQBatch schemaName tableName jobsWithErrors
 
 -- | Delete DLQ jobs by id. Returns the number deleted.
 deleteDLQJobsBatch
@@ -1161,9 +1106,68 @@ refreshAllGroupsFully
   :: forall m
    . (MonadArbiter m, RegistryTables (RegistryOf m))
   => m (Int64, [Text])
-refreshAllGroupsFully = do
-  schemaName <- getSchema
-  Ops.refreshAllGroupsFully schemaName (registryTableNames (Proxy @(RegistryOf m)))
+refreshAllGroupsFully = onRegistry Ops.refreshAllGroupsFully
+
+-- ---------------------------------------------------------------------------
+-- Worker Registry
+-- ---------------------------------------------------------------------------
+
+-- | Register or refresh a worker and return its effective pause state.
+registerWorker
+  :: (MonadArbiter m)
+  => UUID
+  -> Text
+  -> Maybe Text
+  -> Maybe Int32
+  -> NominalDiffTime
+  -> Maybe Value
+  -> m (Maybe Bool)
+registerWorker workerId queue host threads staleThreshold metadata =
+  onSchema $ \schemaName -> Ops.registerWorker schemaName workerId queue host threads staleThreshold metadata
+
+-- | Record a heartbeat and return the worker's effective pause state.
+heartbeatWorker :: (MonadArbiter m) => UUID -> m (Maybe Bool)
+heartbeatWorker workerId = onSchema $ \schemaName -> Ops.heartbeatWorker schemaName workerId
+
+-- | Set a worker's pause flag.
+setWorkerPaused :: (MonadArbiter m) => UUID -> Bool -> m Int64
+setWorkerPaused workerId paused = onSchema $ \schemaName -> Ops.setWorkerPaused schemaName workerId paused
+
+-- | Mark a worker as gracefully draining.
+markWorkerShuttingDown :: (MonadArbiter m) => UUID -> m Int64
+markWorkerShuttingDown workerId = onSchema $ \schemaName -> Ops.markWorkerShuttingDown schemaName workerId
+
+-- | Remove a worker registry row.
+deregisterWorker :: (MonadArbiter m) => UUID -> m Int64
+deregisterWorker workerId = onSchema $ \schemaName -> Ops.deregisterWorker schemaName workerId
+
+-- | List workers, optionally filtered by queue and heartbeat age.
+listWorkers :: (MonadArbiter m) => Maybe Text -> Maybe NominalDiffTime -> m [WorkerRow]
+listWorkers queue liveSecs = onSchema $ \schemaName -> Ops.listWorkers schemaName queue liveSecs
+
+-- | Delete workers older than their recorded stale threshold.
+sweepStaleWorkers :: (MonadArbiter m) => m Int64
+sweepStaleWorkers = onSchema Ops.sweepStaleWorkers
+
+-- ---------------------------------------------------------------------------
+-- Queue Registry
+-- ---------------------------------------------------------------------------
+
+-- | Ensure a queue registry row exists.
+ensureQueue :: (MonadArbiter m) => Text -> m Int64
+ensureQueue queue = onSchema $ \schemaName -> Ops.ensureQueue schemaName queue
+
+-- | Set a queue's pause flag and notify its workers.
+setQueuePaused :: (MonadArbiter m) => Text -> Bool -> m Int64
+setQueuePaused queue paused = onSchema $ \schemaName -> Ops.setQueuePaused schemaName queue paused
+
+-- | Get one queue registry row.
+getQueue :: (MonadArbiter m) => Text -> m (Maybe QueueRow)
+getQueue queue = onSchema $ \schemaName -> Ops.getQueue schemaName queue
+
+-- | List all queues registered in the schema.
+listQueues :: (MonadArbiter m) => m [QueueRow]
+listQueues = onSchema Ops.listQueues
 
 -- ---------------------------------------------------------------------------
 -- Cron Schedules
@@ -1176,9 +1180,7 @@ listCronSchedules
   => Maybe Text
   -- ^ Queue filter. 'Nothing' returns schedules for all queues.
   -> m [CronScheduleRow]
-listCronSchedules mQueue = do
-  schemaName <- getSchema
-  Ops.listCronSchedules schemaName mQueue
+listCronSchedules mQueue = onSchema $ \schemaName -> Ops.listCronSchedules schemaName mQueue
 
 -- | Get a single cron schedule by name.
 getCronScheduleByName
@@ -1187,9 +1189,7 @@ getCronScheduleByName
   => Text
   -- ^ Schedule name
   -> m (Maybe CronScheduleRow)
-getCronScheduleByName scheduleName = do
-  schemaName <- getSchema
-  Ops.getCronScheduleByName schemaName scheduleName
+getCronScheduleByName scheduleName = onSchema $ \schemaName -> Ops.getCronScheduleByName schemaName scheduleName
 
 -- | Patch a cron schedule, writing the overrides as given. Returns rows affected, 0 for
 -- a name that is not there. @Arbiter.Worker.updateCronScheduleChecked@ rejects overrides
@@ -1201,9 +1201,7 @@ updateCronScheduleUnchecked
   -- ^ Schedule name
   -> CronScheduleUpdate
   -> m Int64
-updateCronScheduleUnchecked scheduleName upd = do
-  schemaName <- getSchema
-  Ops.updateCronSchedule schemaName scheduleName upd
+updateCronScheduleUnchecked scheduleName upd = onSchema $ \schemaName -> Ops.updateCronSchedule schemaName scheduleName upd
 
 -- ---------------------------------------------------------------------------
 -- Global Gate
@@ -1219,9 +1217,7 @@ runGated
   -> NominalDiffTime
   -> m a
   -> m (Maybe a)
-runGated task interval work = do
-  schemaName <- getSchema
-  Ops.runGated schemaName task interval work
+runGated task interval work = onSchema $ \schemaName -> Ops.runGated schemaName task interval work
 
 -- ---------------------------------------------------------------------------
 -- Job Tree DSL
@@ -1245,6 +1241,6 @@ spawnChildren
   -> NonEmpty (JobWrite payload)
   -> m (NonEmpty (JobRead payload))
 spawnChildren job children =
-  withPublishSpan (Job.queueName job) (toList children) $ do
-    schemaName <- getSchema
-    Ops.spawnChildren schemaName (Job.queueName job) job children
+  withPublishSpan (Job.queueName job) (toList children) $
+    onJob job $
+      \schemaName tableName -> Ops.spawnChildren schemaName tableName job children

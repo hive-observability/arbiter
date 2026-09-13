@@ -9,12 +9,12 @@ module Arbiter.Otel.Gauges.Cache
   , lastScan
   , retire
   , GaugeCache (..)
-  , Baseline
-  , SeriesKey
   , newGaugeCache
   , publishSnapshot
   , setReachable
   , retireCache
+  , SeriesKey
+  , Baseline
   , riseSince
   ) where
 
@@ -26,7 +26,6 @@ import Control.Concurrent.STM (STM, TVar, modifyTVar', newTVarIO, writeTVar)
 import Data.Aeson (FromJSON, ToJSON)
 import Data.HashMap.Strict (HashMap)
 import Data.HashMap.Strict qualified as HM
-import Data.IORef (IORef, newIORef)
 import Data.Text (Text)
 import GHC.Generics (Generic)
 
@@ -67,20 +66,10 @@ lastScan = \case
 retire :: Export -> Export
 retire = Idle . lastScan
 
--- | One counter series: its instrument and attributes.
-type SeriesKey = (Text, [(Text, Text)])
-
--- | The scan a counter series was last counted from, and the total it stood at.
-data Baseline = Baseline
-  { countedFrom :: !Double
-  , countedTotal :: !Double
-  }
-
 -- | Mutable gauge state and its registration time.
 data GaugeCache = GaugeCache
   { export :: TVar Export
   , databaseReachable :: TVar (Maybe Bool)
-  , counterBaselines :: IORef (HashMap SeriesKey Baseline)
   , registeredAt :: Double
   }
 
@@ -90,7 +79,6 @@ newGaugeCache now =
   GaugeCache
     <$> newTVarIO (Idle Nothing)
     <*> newTVarIO Nothing
-    <*> newIORef HM.empty
     <*> pure now
 
 -- | Publish a snapshot to the observable instruments.
@@ -105,9 +93,16 @@ setReachable cache = writeTVar (databaseReachable cache) . Just
 retireCache :: GaugeCache -> STM ()
 retireCache cache = modifyTVar' (export cache) retire
 
--- | What a total scanned at @scannedAt@ adds to its series. The first reading and an
--- already counted reading add nothing. A reset counter adds the whole total. Any other
--- reading adds the difference.
+-- | One counter series: its instrument and attributes.
+type SeriesKey = (Text, [(Text, Text)])
+
+-- | The scan a counter series was last counted from, and the total it stood at.
+data Baseline = Baseline
+  { countedFrom :: !Double
+  , countedTotal :: !Double
+  }
+
+-- | What a total scanned at @scannedAt@ adds to its series.
 riseSince
   :: SeriesKey
   -> Double

@@ -41,7 +41,7 @@ import Arbiter.RateLimit (HasRateLimit)
 import Arbiter.Simple (SimpleDb, createSimpleEnv, runSimpleDb)
 import Arbiter.Test.Config (getTestConnectionString)
 import Arbiter.Test.Poll (waitUntil)
-import Arbiter.Test.Setup (execute_)
+import Arbiter.Test.Setup (execute_, withConn)
 import Arbiter.Worker
   ( MaintenanceOp (..)
   , WorkerConfig (..)
@@ -66,7 +66,6 @@ import Data.Text qualified as T
 import Data.Text.Encoding (encodeUtf8)
 import Data.Text.IO qualified as TIO
 import Data.Time (getCurrentTime)
-import Database.PostgreSQL.Simple (close, connectPostgreSQL)
 import GHC.Generics (Generic)
 import OpenTelemetry.Attributes (Attributes, emptyAttributes, lookupAttributeByKey)
 import OpenTelemetry.Attributes.Key (AttributeKey)
@@ -151,7 +150,7 @@ withAttachedSpan traceparent action = do
 -- | Drop and re-migrate the test schema.
 freshSchema :: ByteString -> IO ()
 freshSchema connStr = do
-  bracket (connectPostgreSQL connStr) close $ \conn -> do
+  withConn connStr $ \conn -> do
     execute_ conn "SET client_min_messages = warning"
     execute_ conn ("DROP SCHEMA IF EXISTS " <> quoteIdentifier schema <> " CASCADE")
   migrated <- runMigrationsForRegistry (Proxy @Reg) connStr schema defaultMigrationConfig

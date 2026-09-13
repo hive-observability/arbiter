@@ -2,9 +2,7 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE TypeFamilies #-}
--- A type named only in an instance head does not count as a use. GHC reports the
--- imports the schema instances need as redundant.
-{-# OPTIONS_GHC -Wno-orphans -Wno-unused-imports #-}
+{-# OPTIONS_GHC -Wno-orphans #-}
 
 -- | OpenAPI 3 description of 'Arbiter.Servant.API.ArbiterAPI'. The route types
 -- define paths, methods, parameters, bodies, responses, and status codes.
@@ -28,13 +26,7 @@ module Arbiter.Servant.OpenApi
   ) where
 
 import Arbiter.Core.Concurrency.Spec (ConcurrencyKey (ConcurrencyKey))
-import Arbiter.Core.Concurrency.Stats
-  ( ConcurrencyKeyView
-  , ConcurrencyPolicyUpdate
-  , ConcurrencyPolicyView
-  )
-import Arbiter.Core.CronSchedule (CronScheduleRow, CronScheduleUpdate)
-import Arbiter.Core.Health (PgDbHealth, PgTableHealth)
+import Arbiter.Core.Health (PgTableHealth)
 import Arbiter.Core.Job.Archive qualified as Archive
 import Arbiter.Core.Job.DLQ qualified as DLQ
 import Arbiter.Core.Job.Dedup (DedupKey (IgnoreDuplicate))
@@ -53,14 +45,8 @@ import Arbiter.Core.Job.Types
   , setPriority
   )
 import Arbiter.Core.Job.Types.Internal (JobRecord (Job))
-import Arbiter.Core.Operations (QueueOverview, QueueStats)
-import Arbiter.Core.Queues (QueueRow)
+import Arbiter.Core.Operations (QueueStats)
 import Arbiter.Core.RateLimit.Spec (RateLimitKey (RateLimitKey))
-import Arbiter.Core.RateLimit.Stats
-  ( RateLimitBucketView
-  , RateLimitPolicyUpdate
-  , RateLimitPolicyView
-  )
 import Arbiter.Core.Sql.Jobs
   ( ArchiveSortColumn
   , DLQSortColumn
@@ -71,10 +57,9 @@ import Arbiter.Core.Sql.Jobs
   , jobSortColumnName
   , sortDirSql
   )
-import Arbiter.Core.Worker (WorkerHealth, WorkerRow)
+import Arbiter.Core.Worker (WorkerHealth)
 import Arbiter.Servant.API (ArbiterAPI)
 import Arbiter.Servant.Types
-import Control.Applicative (liftA2)
 import Data.Aeson (ToJSON (..), Value)
 import Data.HashMap.Strict.InsOrd qualified as InsOrd
 import Data.HashSet.InsOrd qualified as InsOrdSet
@@ -84,7 +69,6 @@ import Data.Maybe (fromMaybe, isJust)
 import Data.OpenApi
   ( Definitions
   , Info (..)
-  , MediaTypeObject
   , NamedSchema (..)
   , OpenApi (..)
   , OpenApiType (..)
@@ -356,7 +340,7 @@ instance ToSchema WorkerHealth where
     pure (NamedSchema (Just "WorkerHealth") (stringEnum ["live", "stale", "draining"]))
 
 instance ToSchema HealthStatus where
-  declareNamedSchema _ = pure (NamedSchema (Just "HealthStatus") (stringEnum ["ok", "down"]))
+  declareNamedSchema = pure . NamedSchema (Just "HealthStatus") . enumSchema healthStatusToText
 
 instance ToSchema DedupKey where
   declareNamedSchema _ =
@@ -378,7 +362,7 @@ admissionKeySchema
 admissionKeySchema mkKey name =
   closedSchema name (mkKey <$> prop @Text "prefix" <*> prop @Text "suffix")
 
--- | Fields written by 'Arbiter.Servant.Types.apiJobPairs'. The record
+-- | Fields written by the 'JobRead' encoder. The record
 -- constructor checks their types and order. Reconstruct the trace context and
 -- payload keys from their flattened fields. The encoder derives @isRollup@.
 jobFields :: forall payload. (ToSchema payload) => Fields (JobRead payload)
@@ -411,7 +395,7 @@ jobFields =
         )
     <* prop @Bool "isRollup"
 
-instance (ToSchema payload) => ToSchema (ApiJob payload) where
+instance (ToSchema payload) => ToSchema (JobRead payload) where
   declareNamedSchema _ = objectSchema (carrying @payload "Job") [] (jobFields @payload)
 
 instance (ToSchema payload) => ToSchema (ApiJobWithStatus payload) where
@@ -441,15 +425,15 @@ instance (ToSchema payload) => ToSchema (ApiJobWrite payload) where
         <*> prop @(Maybe Int32) "maxAttempts"
         <*> prop @(Maybe Int32) "archiveFor"
 
-instance (ToSchema payload) => ToSchema (ApiDLQJob payload) where
+instance (ToSchema payload) => ToSchema (DLQ.DLQJob payload) where
   declareNamedSchema _ =
     closedSchema (carrying @payload "DLQEntry") $
       DLQ.DLQJob
         <$> prop @Int64 "dlqPrimaryKey"
         <*> prop @UTCTime "failedAt"
-        <*> (unApiJob <$> prop @(ApiJob payload) "jobSnapshot")
+        <*> prop @(JobRead payload) "jobSnapshot"
 
-instance (ToSchema payload) => ToSchema (ApiArchiveJob payload) where
+instance (ToSchema payload) => ToSchema (Archive.ArchiveJob payload) where
   declareNamedSchema _ =
     objectSchema
       (carrying @payload "ArchiveEntry")
@@ -457,19 +441,8 @@ instance (ToSchema payload) => ToSchema (ApiArchiveJob payload) where
       $ Archive.ArchiveJob
         <$> prop @Int64 "archivePrimaryKey"
         <*> prop @UTCTime "completedAt"
-        <*> (unApiJob <$> prop @(ApiJob payload) "jobSnapshot")
+        <*> prop @(JobRead payload) "jobSnapshot"
         <*> prop @(Maybe Value) "result"
-
--- | Schema for claimed jobs under the JSON field @jobs@.
-instance (ToSchema payload) => ToSchema (ClaimResponse payload) where
-  declareNamedSchema _ =
-    closedSchema (carrying @payload "ClaimResponse") $
-      ClaimResponse <$> prop @[ApiJob payload] "jobs"
-
-instance ToSchema ClaimRequest where
-  declareNamedSchema _ =
-    objectSchema "ClaimRequest" [] $
-      ClaimRequest <$> prop @(Maybe Int) "maxJobs" <*> prop @(Maybe Double) "leaseSeconds"
 
 instance ToSchema JobLease where
   declareNamedSchema _ = closedSchema "JobLease" leaseFields
@@ -581,6 +554,7 @@ instance ToSchema PgTableHealth
 instance ToSchema RateLimitPolicyView
 instance ToSchema ConcurrencyPolicyView
 
+instance ToSchema ClaimRequest
 instance ToSchema BatchDeleteRequest
 instance ToSchema BatchDeleteResponse
 instance ToSchema StatsResponse
@@ -600,8 +574,11 @@ instance ToSchema LivenessResponse
 instance (ToSchema payload) => ToSchema (JobsResponse payload) where
   declareNamedSchema = renamed (carrying @payload "JobsResponse")
 
-instance (ToSchema payload) => ToSchema (JobResponse (ApiJob payload)) where
+instance (ToSchema payload) => ToSchema (JobResponse (JobRead payload)) where
   declareNamedSchema = renamed (carrying @payload "JobResponse")
+
+instance (ToSchema payload) => ToSchema (ClaimResponse payload) where
+  declareNamedSchema = renamed (carrying @payload "ClaimResponse")
 
 instance (ToSchema payload) => ToSchema (JobResponse (ApiJobWithStatus payload)) where
   declareNamedSchema = renamed (carrying @payload "JobWithStatusResponse")

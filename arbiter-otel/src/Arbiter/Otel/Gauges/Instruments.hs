@@ -1,9 +1,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 
 -- | OpenTelemetry instruments backed by the gauge snapshot cache.
-module Arbiter.Otel.Gauges.Instruments
-  ( registerInstruments
-  ) where
+module Arbiter.Otel.Gauges.Instruments (registerInstruments) where
 
 import Arbiter.Core.Concurrency.Stats qualified as Conc (ConcurrencyPolicyView (..))
 import Arbiter.Core.Health qualified as Health
@@ -19,7 +17,8 @@ import Control.Monad (void)
 import Data.Bifunctor (first)
 import Data.Foldable (toList, traverse_)
 import Data.HashMap.Strict (HashMap)
-import Data.IORef (IORef, atomicModifyIORef')
+import Data.HashMap.Strict qualified as HM
+import Data.IORef (IORef, atomicModifyIORef', newIORef)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
@@ -51,6 +50,7 @@ import Arbiter.Otel.Metrics (attrs, concurrencyKind, rateLimitKind)
 -- that carries a freshly published reading onto the counters.
 registerInstruments :: Meter -> GaugeCache -> IO (Cached -> IO ())
 registerInstruments meter cache = do
+  baselines <- newIORef HM.empty
   let withCached emit = [\res -> readTVarIO (export cache) >>= traverse_ (emit res) . live]
       callback emit = withCached (\res -> emit res . reading)
       -- Every replica exports the winner's reading. Aggregate with max.
@@ -75,7 +75,7 @@ registerInstruments meter cache = do
             defaultAdvisoryParameters
         pure $ \cached ->
           traverse_
-            (addRise (counterBaselines cache) (Name.metricName name) counter (takenAt cached))
+            (addRise baselines (Name.metricName name) counter (takenAt cached))
             (series (reading cached))
 
   reg Name.QueueDepth "{job}" "Jobs in a queue by status" $
