@@ -1,60 +1,52 @@
 # Worker Configuration
 
-A `WorkerConfig` defines a handler, thread count, timing values, and callbacks.
-Configuration constructors return this record. Update its fields before pool
-creation.
+A `WorkerConfig` holds the handler, thread count, timings, and callbacks. The
+constructors below return one. Set fields before the pool starts.
 
-`poolConfigForWorkers` calculates the database pool size from a list of worker
-pools. Pass the same list to `poolConfigForWorkers` and `runWorkerPools`.
+`poolConfigForWorkers` sizes the database pool for a list of worker pools. Pass
+the same list to `poolConfigForWorkers`, `runWorkerPools`, and
+[`shutdownPools`](shutdown.md).
 
 ## Multiple Queues
 
-One process can run one pool for each queue. Create each configuration and name
-it with `namedWorkerPool`. Pass the same list to `poolConfigForWorkers`,
-`runWorkerPools`, and [`shutdownPools`](shutdown.md).
+One pool per queue, named with `namedWorkerPool`:
 
-If one pool exits, Arbiter stops the other pools. After all pools stop, Arbiter
-throws the first recorded failure.
+```haskell
+let workers = [Worker.namedWorkerPool emailConfig, Worker.namedWorkerPool imageConfig]
+```
 
-`ARBITER_ENABLED_QUEUES` is a comma-separated list of pool names.
-`runWorkerPools` starts the named pools. If the variable is not set, it starts
-all configured pools. This variable permits different deployments to use the
-same binary.
+When one pool exits, the others stop. `runWorkerPools` then throws the first
+failure.
+
+`ARBITER_ENABLED_QUEUES` selects pools by name. Unset, every pool starts. An
+unknown name throws at startup.
 
 ```bash
 ARBITER_ENABLED_QUEUES=email_queue,image_queue
 ```
 
-Arbiter checks the names against the configured pools at startup. An unknown
-name causes an exception.
-
 ## Configuration Types
 
-`transactionalWorkerConfig` runs the handler in a transaction. A normal return
-acks the job and stores the returned result. An exception rolls back the work
-before Arbiter retries the job or moves it to the DLQ. Arbiter finalizes the job
-on each path.
+| Constructor | Transaction | Finalization |
+| --- | --- | --- |
+| `transactionalWorkerConfig` | wraps the handler | a return acks and stores the result. An exception rolls back, then retries or moves to the DLQ. |
+| `manualWorkerConfig` | none | callbacks, one job per call |
+| `defaultBatchedWorkerConfig` | none | callbacks, up to `batchSize` jobs per call |
 
-`manualWorkerConfig` and `defaultBatchedWorkerConfig` do not start a handler
-transaction. They supply finalization callbacks. Create a transaction for the
-writes that require one. For example, an HTTP request can run without a held
-database connection. The handler must ack, fail, or nack each job. Arbiter
-reprocesses jobs that the handler does not finalize before visibility expires.
+A manual or batched handler must ack, fail, or nack each job. An unfinalized
+job is redelivered after its visibility timeout.
 
-Wrap a callback in `withDbTransaction` to commit the ack and application writes
-atomically. The callback's transaction becomes a savepoint. The success hook
-runs when Arbiter releases that savepoint. It can run before the outer
-transaction commits. If the outer transaction rolls back, Arbiter can process
-the job again after the hook has run.
-
-Batching is independent of transaction mode. Use
-`defaultBatchedWorkerConfig` when per-job overhead is too high and each job
-requires a separate disposition in one claim.
+`withDbTransaction` around a callback commits the ack with the application
+writes. Inside an outer transaction the callback is a savepoint. `onJobSuccess`
+fires at the savepoint release, before the outer commit.
 
 ## Timings
 
-`visibilityTimeout` is how long a claim holds a job, and `jobHeartbeatInterval`
-is how often the worker renews that hold. `maxJobDuration` caps how long a
-handler may run at all. See [Leases and Deadlines](deadlines.md).
+| Field | Meaning |
+| --- | --- |
+| `visibilityTimeout` | how long a claim holds a job |
+| `jobHeartbeatInterval` | how often the worker renews the hold |
+| `maxJobDuration` | longest a handler can run |
 
-See the [`WorkerConfig` haddocks](https://arbiterq.dev/arbiter-worker/Arbiter-Worker-Config.html) for all options.
+See [Leases and Deadlines](deadlines.md) and the
+[`WorkerConfig` haddocks](https://arbiterq.dev/arbiter-worker/Arbiter-Worker-Config.html).

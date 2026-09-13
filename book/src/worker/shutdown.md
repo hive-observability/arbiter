@@ -1,7 +1,7 @@
 # Graceful Shutdown
 
-Install signal handlers after construction of the worker configurations. Pass
-the same pool list to `shutdownPools` and `runWorkerPools`:
+Install signal handlers after the worker configurations exist. Pass the same
+pool list to `shutdownPools` and `runWorkerPools`:
 
 ```haskell
 import System.Posix.Signals qualified as Signals
@@ -19,7 +19,7 @@ env <- ArbS.createSimpleEnvWithConfig (Proxy @AppRegistry) connStr "arbiter" poo
 ArbS.runSimpleDb env $ Worker.runWorkerPools workers
 ```
 
-The dispatcher stops new claims and waits for in-flight jobs.
-`runWorkerPools` returns when those jobs finish or when
-`gracefulShutdownTimeout` expires. Arbiter does not finalize a job that still
-runs at the timeout. It redelivers the job after its visibility period expires.
+The dispatcher stops claiming and waits for in-flight jobs. `runWorkerPools`
+returns when they finish or after `gracefulShutdownTimeout`. A job still
+running at the timeout is left unfinalized and redelivered after its
+visibility timeout.

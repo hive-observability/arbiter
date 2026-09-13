@@ -1,30 +1,24 @@
 # Job Results
 
-A handler can produce a **result**. With `transactionalWorkerConfig`, return the
-result. With a manual or batched configuration, pass it to `ackWith` or
-`ackAllWith`.
+A handler can return a **result**. With `transactionalWorkerConfig`, return it.
+With a manual or batched configuration, pass it to `ackWith` or `ackAllWith`.
 
-Arbiter stores a result only in these conditions:
+| Job | Where the result goes |
+| --- | --- |
+| Has a parent | Stored for the parent. Deleted when the parent completes. |
+| Root, archiving on | Stored in the [archive](archiving.md) entry. |
+| Root, archiving off | Discarded. |
 
-- **Job with a parent:** Arbiter stores the result for the parent to read with
-  `Worker.childResults` or `Worker.mergedChildResults`. It removes the result
-  after the parent completes.
-- **Standalone root job:** Arbiter stores the result in the job
-  [archive](archiving.md) entry if archiving is enabled for that job. If
-  archiving is disabled, Arbiter discards the result.
+Result types need `ToJSON` and `FromJSON`.
 
-Arbiter uses `ToJSON` to store a result and `FromJSON` to read it. Records and
-sum types with these instances can be result types.
+A parent reads its children with one of:
 
-A parent can use `Worker.childResults` or `Worker.mergedChildResults`.
-`Worker.mergedChildResults` requires a `Monoid` result type and combines the
-child results. It replaces a result that it cannot decode with `mempty`. A
-change to the result format can therefore cause an incomplete rollup.
-`Worker.childResults` returns an `Either` for each child and lets the caller
-handle decode errors.
+| Function | Returns |
+| --- | --- |
+| `Worker.childResults` | One `Either` per child. |
+| `Worker.mergedChildResults` | The `Monoid` sum of the results and the DLQ failures. A result that fails to decode counts as `mempty`. |
 
-Use a `Maybe` result type to make storage conditional for each run. `Nothing`
-does not create an archive result or a result row for a parent.
+`Nothing` in a `Maybe` result stores nothing:
 
 ```haskell
 data SyncReport = SyncReport
@@ -42,4 +36,4 @@ syncHandler _conn job = do
   pure $ if rowsChanged report == 0 then Nothing else Just report
 ```
 
-See the [`Arbiter.Core.JobResult` haddocks](https://arbiterq.dev/arbiter-core/Arbiter-Core-JobResult.html) for how a result is encoded.
+See the [`Arbiter.Core.JobResult` haddocks](https://arbiterq.dev/arbiter-core/Arbiter-Core-JobResult.html) for the encoding.

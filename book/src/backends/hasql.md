@@ -1,7 +1,7 @@
 # arbiter-hasql (hasql)
 
-This backend uses `hasql` and `resource-pool`. Handlers receive a
-`Hasql.Connection` for typed queries in the worker transaction.
+`hasql` and `resource-pool`. Handlers receive a `Hasql.Connection` in the
+worker transaction.
 
 ```haskell
 import Pqi.Ffi qualified as Ffi
@@ -10,8 +10,8 @@ env <- ArbH.createHasqlEnv (Proxy @AppRegistry) Ffi.adapter connStr "arbiter"
 ArbH.runHasqlDb env $ Arb.insertJob (Arb.defaultJob $ SendWelcome "alice@example.com" "Alice")
 ```
 
-The adapter is the transport. `pqi-ffi` wraps libpq. `pqi-native` is pure
-Haskell and needs no C library. On hasql 1.x the constructors take no adapter.
+The adapter is the transport: `pqi-ffi` wraps libpq, `pqi-native` is pure
+Haskell. hasql 1.x constructors take no adapter.
 
 Share a transaction with external hasql work:
 
@@ -23,8 +23,7 @@ ArbH.inTransaction @AppRegistry conn "arbiter" $
 _ <- Hasql.use conn (Session.script "COMMIT")
 ```
 
-Bring your own pool. The env borrows one pool connection for `LISTEN/NOTIFY`,
-whichever adapter opened it:
+Bring your own pool. The env borrows one pool connection for `LISTEN/NOTIFY`:
 
 ```haskell
 import Data.Pool (defaultPoolConfig, newPool)

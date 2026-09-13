@@ -1,20 +1,6 @@
 # arbiter-servant
 
-REST API for managing and monitoring Arbiter job queues using Servant.
-
-## Installation
-
-Add to your `package.yaml` or `.cabal` file:
-
-```yaml
-dependencies:
-  - arbiter-servant
-  - arbiter-simple
-```
-
-## Quick Start
-
-### Basic API Server
+REST API for managing and monitoring Arbiter job queues, built on Servant.
 
 ```haskell
 {-# LANGUAGE DataKinds #-}
@@ -30,23 +16,22 @@ import Data.Proxy (Proxy (..))
 import Data.Text (Text)
 import GHC.Generics (Generic)
 
--- Define your job types
-data EmailJob = SendEmail {to :: Text, subject :: Text, body :: Text}
+data EmailPayload = SendEmail {to :: Text, subject :: Text, body :: Text}
   deriving stock (Generic)
   deriving anyclass (FromJSON, ToJSON)
 
-type MyRegistry = '[Queue "email_jobs" EmailJob]
+type AppRegistry = '[Queue "email_queue" EmailPayload]
 
 main :: IO ()
 main = do
-  -- Run Arbiter migrations first. connStr is your libpq connection string and
-  -- "public" is the migrated schema. Live SSE updates also need
+  -- Run the Arbiter migrations first. connStr is a libpq connection string and
+  -- "arbiter" is the migrated schema. Live SSE updates also need
   -- enableEventStreaming = True.
-  config <- initArbiterServer (Proxy @MyRegistry) connStr "public"
+  config <- initArbiterServer (Proxy @AppRegistry) connStr "arbiter"
   runArbiterAPI 8080 config
 ```
 
-A queue that stores a handler result uses `QueueWithResult "email_jobs" EmailJob
-Report` in place of `Queue`, importing `QueueSpec (..)` for the constructor. See
-the [Arbiter guide](https://arbiterq.dev/docs/) for the worker side and the full
-feature set.
+A queue with a handler result is `QueueWithResult "email_queue" EmailPayload
+Report`. Import `QueueSpec (..)` for the constructor.
+
+See the [Arbiter guide](https://arbiterq.dev/docs/) for installation, setup, and examples.

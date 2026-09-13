@@ -1,22 +1,16 @@
 # Priority
 
-Each job has an integer `priority`. Arbiter claims lower numbers first. The
-default is `0`. Use a higher number for background work.
+Lower numbers claim first. The default is `0`.
 
 ```haskell
--- runs behind default-priority work
-job = Arb.defaultJob payload & Arb.setPriority 10
+job = Arb.defaultJob payload & Arb.setPriority 10  -- runs behind priority 0
 ```
 
-For equal priorities, Arbiter uses insertion order.
+| Case | Order |
+| --- | --- |
+| Equal priorities | Insertion order |
+| Job in flight | No preemption. A new high-priority job waits for a free worker. |
+| Retrying job in a group | Stays first in its group until it succeeds or moves to the DLQ, at any priority. |
+| Group rank | The lowest priority number in the group, delayed jobs included. |
 
-Priority applies during a claim. It does not preempt work that is in flight. A
-new high-priority job waits for an available worker.
-
-In a [group](../architecture.md#group-ordering), a retrying job remains first
-until it succeeds or moves to the DLQ. This rule has precedence over the
-priority of other jobs in that group.
-
-A group is eligible when it has a ready job. Arbiter ranks the group by the
-lowest priority number in that group, including delayed jobs. A delayed
-high-priority job therefore increases the rank of its group.
+A group is eligible when it has a ready job.

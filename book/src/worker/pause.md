@@ -1,22 +1,18 @@
 # Pausing Work
 
-A pause stops new claims. It does not stop in-flight jobs. These jobs can
-complete while the queue is paused.
+A pause stops new claims. In-flight jobs run to completion.
 
 | Scope | Function | Effect |
 | --- | --- | --- |
-| Queue | `setQueuePaused` | Every pool stops claiming from that queue. |
-| Pool | `setWorkerPaused` | One pool stops claiming. Other pools continue. |
-| Job | `suspendJob`, `resumeJob` | One job stays invisible until it is resumed. |
-| Subtree | `pauseChildren`, `resumeChildren` | Every claimable job below a job, at any depth. |
+| Queue | `setQueuePaused` | every pool stops claiming from the queue |
+| Pool | `setWorkerPaused` | one pool stops claiming |
+| Job | `suspendJob`, `resumeJob` | one job stays invisible until resumed |
+| Subtree | `pauseChildren`, `resumeChildren` | every claimable job below a job, at any depth |
 
-`pauseChildren` does not suspend in-flight jobs or jobs that have a delay or
-backoff. `resumeChildren` keeps a finalizer suspended if its children are still
-queued. Arbiter resumes the finalizer after its children finish.
+`pauseChildren` skips in-flight jobs and jobs in a delay or backoff.
+`resumeChildren` leaves a finalizer suspended while its children are queued.
 
-`LISTEN/NOTIFY` sends a pause notification to running pools. Without a listener,
-each pool reads the pause state at its next worker heartbeat. This can take one
-`workerHeartbeatInterval`. See [Wakeups](wakeups.md).
+`LISTEN/NOTIFY` delivers a pause at once. Without a listener, each pool reads
+the pause state at its next worker heartbeat. See [Wakeups](wakeups.md).
 
-The [REST API and admin UI](../rest-api.md) provide the same controls. An
-operator can pause work without a deployment.
+The [REST API and admin UI](../rest-api.md) expose the same controls.
