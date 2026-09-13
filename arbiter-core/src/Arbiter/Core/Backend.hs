@@ -171,21 +171,21 @@ withSavepointTransaction
   -> (conn -> IO a -> IO a)
   -> m a
   -> m a
-withSavepointTransaction runSql transaction action = withConn $ \conn -> do
-  depth <- transactionDepth <$> getPoolState
-  case depth of
-    0 -> withRunInIO $ \run ->
-      transaction conn
-        $ run
-        $ localPoolState (\st -> st {activeConn = Just conn, transactionDepth = 1}) action
-    _ -> mask $ \restore -> do
+withSavepointTransaction runSql transaction action = do
+  st <- getPoolState
+  case (activeConn st, transactionDepth st) of
+    (Just conn, depth) | depth > 0 -> mask $ \restore -> do
       let spName = "arbiter_sp_" <> BSC.pack (show depth)
       liftIO $ runSql conn ("SAVEPOINT " <> spName)
       result <-
-        restore (localPoolState (\st -> st {transactionDepth = depth + 1}) action)
+        restore (localPoolState (\s -> s {transactionDepth = depth + 1}) action)
           `onException` liftIO (runSql conn ("ROLLBACK TO SAVEPOINT " <> spName))
       liftIO $ runSql conn ("RELEASE SAVEPOINT " <> spName)
       pure result
+    _ -> withConn $ \conn -> withRunInIO $ \run ->
+      transaction conn
+        $ run
+        $ localPoolState (\s -> s {activeConn = Just conn, transactionDepth = 1}) action
 
 noConnection :: Text
 noConnection = "No active connection and no connection pool available"

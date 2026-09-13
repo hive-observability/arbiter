@@ -50,14 +50,14 @@ import Hasql.Connection.Setting.Connection qualified as ConnSetting
 -- | Run a bare SQL command, such as @BEGIN@ or @COMMIT@.
 runSQL :: Hasql.Connection -> ByteString -> IO ()
 runSQL conn sql =
-  Hasql.use conn (runScript (TE.decodeUtf8With TE.lenientDecode sql))
+  Hasql.use conn (runScript sql)
     >>= either (\err -> throwInternal $ "hasql runSQL error: " <> T.pack (show err)) pure
 
 #if MIN_VERSION_hasql(1,10,0)
-runScript :: T.Text -> Session.Session ()
-runScript = Session.script
+runScript :: ByteString -> Session.Session ()
+runScript = Session.script . TE.decodeUtf8With TE.lenientDecode
 #else
-runScript :: T.Text -> Session.Session ()
+runScript :: ByteString -> Session.Session ()
 runScript = Session.sql
 #endif
 
@@ -68,7 +68,7 @@ data HasqlConnect = HasqlConnect PQ.Adapter ByteString
 toHasqlConnect :: PQ.Adapter -> ByteString -> HasqlConnect
 toHasqlConnect = HasqlConnect
 
--- | Open a connection, describing any failure.
+-- | Open a connection. A failure comes back as its description.
 acquireConnect :: HasqlConnect -> IO (Either String Hasql.Connection)
 acquireConnect (HasqlConnect adapter connStr) = either (Left . show) Right <$> Hasql.acquire adapter (hasqlSettings connStr)
 
@@ -82,7 +82,7 @@ newtype HasqlConnect = HasqlConnect ByteString
 toHasqlConnect :: ByteString -> HasqlConnect
 toHasqlConnect = HasqlConnect
 
--- | Open a connection, describing any failure.
+-- | Open a connection. A failure comes back as its description.
 acquireConnect :: HasqlConnect -> IO (Either String Hasql.Connection)
 acquireConnect (HasqlConnect connStr) = either (Left . show) Right <$> Hasql.acquire (hasqlSettings connStr)
 
