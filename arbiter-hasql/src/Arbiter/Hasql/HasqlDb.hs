@@ -24,7 +24,8 @@ module Arbiter.Hasql.HasqlDb
   , inTransaction
 
     -- * Environment Creation
-  , WithConnect
+  , HasqlConnect
+  , toHasqlConnect
   , createHasqlEnv
   , createHasqlEnvWithConfig
   , createHasqlEnvWithPool
@@ -68,10 +69,10 @@ import Hasql.Connection qualified as Hasql
 import UnliftIO (MonadUnliftIO)
 
 import Arbiter.Hasql.Compat
-  ( WithConnect
-  , hasqlConnect
+  ( HasqlConnect
+  , acquireConnect
   , hasqlSettings
-  , mapConnect
+  , toHasqlConnect
   , withDedicatedListenConn
   , withHasqlListenConn
   )
@@ -153,26 +154,28 @@ createHasqlEnv
   :: forall registry m
    . (MonadIO m)
   => Proxy registry
-  -> WithConnect (SchemaName -> m (HasqlEnv registry))
-createHasqlEnv _proxy =
-  mapConnect
-    (\connect schemaName -> createEnvWithConfig hasqlDriver connect Hasql.release schemaName PC.defaultPoolConfig)
-    acquireOrThrow
+  -> HasqlConnect
+  -> SchemaName
+  -> m (HasqlEnv registry)
+createHasqlEnv proxy connect schemaName = createHasqlEnvWithConfig proxy connect schemaName PC.defaultPoolConfig
 
 -- | Create a 'HasqlEnv' with custom pool settings.
 createHasqlEnvWithConfig
   :: forall registry m
    . (MonadIO m)
   => Proxy registry
-  -> WithConnect (SchemaName -> PoolConfig -> m (HasqlEnv registry))
-createHasqlEnvWithConfig _proxy = mapConnect (\connect -> createEnvWithConfig hasqlDriver connect Hasql.release) acquireOrThrow
+  -> HasqlConnect
+  -> SchemaName
+  -> PoolConfig
+  -> m (HasqlEnv registry)
+createHasqlEnvWithConfig _proxy connect = createEnvWithConfig hasqlDriver (acquireOrThrow connect) Hasql.release
 
 -- | Give the env a dedicated LISTEN connection that takes no pool slot.
-useDedicatedListener :: (MonadIO m) => WithConnect (HasqlEnv registry -> m (HasqlEnv registry))
-useDedicatedListener = mapConnect Backend.useDedicatedListener withDedicatedListenConn
+useDedicatedListener :: (MonadIO m) => HasqlConnect -> HasqlEnv registry -> m (HasqlEnv registry)
+useDedicatedListener = Backend.useDedicatedListener . withDedicatedListenConn
 
-acquireOrThrow :: WithConnect (IO Hasql.Connection)
-acquireOrThrow = mapConnect (>>= either (throwIO . HasqlConnectionError) pure) hasqlConnect
+acquireOrThrow :: HasqlConnect -> IO Hasql.Connection
+acquireOrThrow connect = acquireConnect connect >>= either (throwIO . HasqlConnectionError) pure
 
 -- | Create a 'HasqlEnv' over a caller's own connection pool. The listener holds one pool slot.
 createHasqlEnvWithPool

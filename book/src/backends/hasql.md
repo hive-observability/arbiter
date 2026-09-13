@@ -6,12 +6,13 @@ worker transaction.
 ```haskell
 import Pqi.Ffi qualified as Ffi
 
-env <- ArbH.createHasqlEnv (Proxy @AppRegistry) Ffi.adapter connStr "arbiter"
+env <- ArbH.createHasqlEnv (Proxy @AppRegistry) (ArbH.toHasqlConnect Ffi.adapter connStr) "arbiter"
 ArbH.runHasqlDb env $ Arb.insertJob (Arb.defaultJob $ SendWelcome "alice@example.com" "Alice")
 ```
 
-The adapter is the transport: `pqi-ffi` wraps libpq, `pqi-native` is pure
-Haskell. hasql 1.x constructors take no adapter.
+`toHasqlConnect` takes the transport adapter and the connection string.
+`pqi-ffi` wraps libpq. `pqi-native` is pure Haskell. On hasql 1.x,
+`toHasqlConnect` takes only the connection string.
 
 Share a transaction with external hasql work:
 
@@ -23,7 +24,8 @@ ArbH.inTransaction @AppRegistry conn "arbiter" $
 _ <- Hasql.use conn (Session.script "COMMIT")
 ```
 
-Bring your own pool. The env borrows one pool connection for `LISTEN/NOTIFY`:
+Use your own pool. The env holds one pool connection for `LISTEN/NOTIFY`. Any
+adapter can open the pool:
 
 ```haskell
 import Data.Pool (defaultPoolConfig, newPool)

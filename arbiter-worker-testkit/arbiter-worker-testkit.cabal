@@ -49,6 +49,7 @@ library
     Arbiter.Worker.TestKit.Deadline
     Arbiter.Worker.TestKit.Lifecycle
     Arbiter.Worker.TestKit.Reclaim
+    Arbiter.Worker.TestKit.Rows
   build-depends:
     , aeson                >=2.0  && <2.3
     , arbiter-core         >=0.1  && <0.2

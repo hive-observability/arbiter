@@ -2054,24 +2054,9 @@ listenerSpec
      , RegistryTables (RegistryOf m)
      , ResultOf m payload ~ ()
      )
-  => Text
-  -- ^ Schema\/table name, also the LISTEN channel prefix
-  -> ByteString
-  -- ^ Connection string, for terminating the listener backend
-  -> (Text -> payload)
-  -- ^ Construct a task payload
-  -> IO env
-  -- ^ Create an env whose listener is enabled
-  -> IO env
-  -- ^ Create an env with the listener disabled (poll-only)
-  -> (env -> IO ())
-  -- ^ Release an env built by the actions above
-  -> ((JobRead payload -> m ()) -> JobHandler m payload ())
-  -- ^ Adapt a job action into the backend's handler shape
-  -> (forall a. env -> m a -> IO a)
-  -- ^ Runner function
+  => TestBackend payload m env
   -> Spec
-listenerSpec schema connStr mkPayload mkEnv mkEnvPollOnly destroyEnv mkHandler runM =
+listenerSpec TestBackend {schema, connStr, mkSimple, mkEnv, mkEnvPollOnly, destroyEnv, mkHandler, runM} =
   describe "listener" $ do
     around (bracket mkEnv destroyEnv) $ do
       it "wakes the dispatcher on NOTIFY under a high poll interval" $ \env -> do
@@ -2080,7 +2065,7 @@ listenerSpec schema connStr mkPayload mkEnv mkEnvPollOnly destroyEnv mkHandler r
         let workerConfig = config {workerCount = 1, pollInterval = 300, jitter = NoJitter}
         withAsync (runM env $ runWorkerPool workerConfig) $ \_ -> do
           threadDelay 1_000_000
-          runM env $ void $ HL.insertJob $ setGroupKey (Just "g1") $ defaultJob (mkPayload "notify")
+          runM env $ void $ HL.insertJob $ setGroupKey (Just "g1") $ defaultJob (mkSimple "notify")
           waitUntil 5_000 $ (== 1) <$> readIORef ref
           readIORef ref >>= (`shouldBe` 1)
 
@@ -2092,7 +2077,7 @@ listenerSpec schema connStr mkPayload mkEnv mkEnvPollOnly destroyEnv mkHandler r
           threadDelay 1_000_000
           terminateBackendsMatching connStr ("LISTEN%" <> schema <> "%")
           threadDelay 3_000_000
-          runM env $ void $ HL.insertJob $ setGroupKey (Just "g1") $ defaultJob (mkPayload "after-reconnect")
+          runM env $ void $ HL.insertJob $ setGroupKey (Just "g1") $ defaultJob (mkSimple "after-reconnect")
           waitUntil 8_000 $ (== 1) <$> readIORef ref
           readIORef ref >>= (`shouldBe` 1)
 
@@ -2148,7 +2133,7 @@ listenerSpec schema connStr mkPayload mkEnv mkEnvPollOnly destroyEnv mkHandler r
         config :: WorkerConfig m payload <- runM env $ transactionalWorkerConfig 1 (mkHandler (bumping ref))
         let workerConfig = config {workerCount = 1, pollInterval = 0.2, jitter = NoJitter}
         withAsync (runM env $ runWorkerPool workerConfig) $ \_ -> do
-          runM env $ void $ HL.insertJob $ setGroupKey (Just "g1") $ defaultJob (mkPayload "poll")
+          runM env $ void $ HL.insertJob $ setGroupKey (Just "g1") $ defaultJob (mkSimple "poll")
           waitUntil 10_000 $ (== 1) <$> readIORef ref
           readIORef ref >>= (`shouldBe` 1)
 

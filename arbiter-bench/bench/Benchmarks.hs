@@ -21,7 +21,7 @@ import Arbiter.Core.MonadArbiter (HasRegistry, MonadArbiter (..), ResultOf)
 import Arbiter.Core.PoolConfig (PoolConfig (..))
 import Arbiter.Core.QueueRegistry (Queue, RegistryTables)
 import Arbiter.Core.RateLimit.Spec (HasRateLimit (..), limitBy, tokenBucket)
-import Arbiter.Hasql (HasqlDb, runHasqlDb)
+import Arbiter.Hasql (HasqlDb, createHasqlEnvWithConfig, runHasqlDb)
 import Arbiter.Migrations (MigrationResult (..), defaultMigrationConfig, runMigrationsForRegistry)
 import Arbiter.Orville
   ( createOrvilleConnectionOptions
@@ -1047,7 +1047,8 @@ main = do
 
   hasqlEnvs <-
     traverse
-      (\(label, mkEnv) -> (label,) <$> mkEnv (Proxy @BenchRegistry) benchConnStr benchSchema benchPoolConfig)
+      ( \(label, connect) -> (label,) <$> createHasqlEnvWithConfig (Proxy @BenchRegistry) (connect benchConnStr) benchSchema benchPoolConfig
+      )
       hasqlTransports
 
   let orvilleOptions = createOrvilleConnectionOptions benchConnStr benchPoolConfig

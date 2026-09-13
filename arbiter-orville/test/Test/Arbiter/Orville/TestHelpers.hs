@@ -1,8 +1,7 @@
 {-# LANGUAGE TypeFamilies #-}
 
 module Test.Arbiter.Orville.TestHelpers
-  ( executeSql
-  , setupOrvilleTest
+  ( setupOrvilleTest
   , createOrvilleTestEnv
   , destroyOrvilleTestEnv
   , disableOrvilleListener
@@ -17,7 +16,6 @@ import Arbiter.Core.MonadArbiter (MonadArbiter (..))
 import Arbiter.Core.QueueRegistry (JobPayloadRegistry)
 import Arbiter.LibPQ (newLibPQListener)
 import Arbiter.Test.Setup qualified as TestSetup
-import Control.Monad (void)
 import Control.Monad.Catch (MonadCatch, MonadMask, MonadThrow)
 import Control.Monad.Trans.Reader (ReaderT (..), asks, runReaderT)
 import Data.ByteString (ByteString)
@@ -26,7 +24,6 @@ import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import Orville.PostgreSQL qualified as O
 import Orville.PostgreSQL.Raw.Connection (destroyIdleConnections)
-import Orville.PostgreSQL.Raw.RawSql qualified as RawSql
 import Orville.PostgreSQL.UnliftIO qualified as O
 import UnliftIO (MonadIO (..), MonadUnliftIO (..))
 
@@ -71,12 +68,6 @@ instance MonadArbiter (TestOrville registry) where
   withDbTransaction = orvilleWithDbTransaction
   runHandlerWithConnection = orvilleRunHandlerWithConnection
   getListener = TestOrville $ asks testListen
-
--- Helper to execute raw SQL
-executeSql :: (O.MonadOrville m) => Text -> m ()
-executeSql sql = O.withConnection $ \conn -> do
-  let rawSql = RawSql.fromText sql
-  void $ liftIO $ RawSql.execute conn rawSql
 
 setupOrvilleTest :: ByteString -> Text -> Text -> Int -> IO (OrvilleTestEnv registry)
 setupOrvilleTest connStr schemaName tableName maxConns = do

@@ -6,37 +6,47 @@ module Arbiter.LibPQ
   ) where
 
 import Arbiter.Core.Listen (ListenConn, Listener, Notification (..), newListener)
-import Arbiter.Core.Listen.Driver (ConnectDriver (..), ListenDriver (..), driverListenConn, withDriverListenConn)
+import Arbiter.Core.Listen.Driver
+  ( ConnStatus (..)
+  , ConnectDriver (..)
+  , ListenDriver (..)
+  , Polling (..)
+  , driverListenConn
+  , execOutcome
+  , withDriverListenConn
+  )
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Data.ByteString (ByteString)
 import Database.PostgreSQL.LibPQ qualified as PQ
 
-listenDriver :: ListenDriver PQ.Connection PQ.Notify PQ.Result PQ.ExecStatus
+listenDriver :: ListenDriver PQ.Connection
 listenDriver =
   ListenDriver
-    { notifies = PQ.notifies
+    { notifies = fmap (fmap notification) . PQ.notifies
     , socket = PQ.socket
     , consumeInput = PQ.consumeInput
-    , exec = PQ.exec
-    , resultStatus = PQ.resultStatus
+    , exec = \conn sql -> PQ.exec conn sql >>= execOutcome PQ.CommandOk PQ.resultStatus
     , escapeIdentifier = PQ.escapeIdentifier
-    , commandOk = PQ.CommandOk
-    , notification = \notify -> Notification (PQ.notifyRelname notify) (PQ.notifyExtra notify)
     }
+  where
+    notification notify = Notification (PQ.notifyRelname notify) (PQ.notifyExtra notify)
 
-connectDriver :: ConnectDriver PQ.Connection PQ.ConnStatus PQ.PollingStatus
+connectDriver :: ConnectDriver PQ.Connection
 connectDriver =
   ConnectDriver
     { connectStart = PQ.connectStart
-    , connectPoll = PQ.connectPoll
-    , status = PQ.status
+    , connectPoll = fmap polling . PQ.connectPoll
+    , status = fmap connStatus . PQ.status
     , finish = PQ.finish
     , errorMessage = PQ.errorMessage
-    , connectionOk = PQ.ConnectionOk
-    , connectionBad = PQ.ConnectionBad
-    , pollingReading = PQ.PollingReading
-    , pollingWriting = PQ.PollingWriting
     }
+  where
+    polling PQ.PollingReading = PollReading
+    polling PQ.PollingWriting = PollWriting
+    polling _ = PollDone
+    connStatus PQ.ConnectionOk = ConnOk
+    connStatus PQ.ConnectionBad = ConnBad
+    connStatus _ = ConnPending
 
 -- | A 'ListenConn' over a libpq connection.
 libpqListenConn :: PQ.Connection -> ListenConn

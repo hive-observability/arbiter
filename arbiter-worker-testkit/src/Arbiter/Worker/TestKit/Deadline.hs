@@ -25,7 +25,6 @@ import Arbiter.Core.MonadArbiter (JobHandler, RegistryOf, ResultOf)
 import Arbiter.Core.QueueRegistry (RegistryTables)
 import Arbiter.Core.Trace (capturingContextIO)
 import Arbiter.Test.Poll (waitUntil)
-import Arbiter.Test.Setup (withConn)
 import Arbiter.Worker (runWorkerPool)
 import Arbiter.Worker.BackoffStrategy (Jitter (NoJitter))
 import Arbiter.Worker.Config
@@ -42,7 +41,6 @@ import Control.Concurrent (threadDelay)
 import Control.Exception (SomeException, fromException, uninterruptibleMask_)
 import Control.Monad (void, when)
 import Control.Monad.IO.Class (MonadIO, liftIO)
-import Data.ByteString (ByteString)
 import Data.Either (isRight)
 import Data.Foldable (toList)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
@@ -50,17 +48,16 @@ import Data.Int (Int64)
 import Data.List (partition)
 import Data.List.NonEmpty (NonEmpty ((:|)))
 import Data.Maybe (fromMaybe, isJust)
-import Data.String (fromString)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Time (UTCTime, getCurrentTime)
-import Database.PostgreSQL.Simple qualified as PG
 import GHC.Clock (getMonotonicTime)
 import Test.Hspec (Spec, around, describe, it, shouldBe, shouldSatisfy)
 import UnliftIO (MonadUnliftIO, bracket, finally, mask_, tryAny, withRunInIO)
 import UnliftIO.Async (async, poll, waitCatch, withAsync)
 
 import Arbiter.Worker.TestKit.Backend (TestBackend (..))
+import Arbiter.Worker.TestKit.Rows (flagCancelled, holdRowLock, reclaimJob, releaseRow, rowCount, takeClaimHolder)
 
 -- | Longer than any deadline under test.
 handlerSleepMicros :: Int
@@ -203,7 +200,7 @@ deadlineSpec TestBackend {schema, table, connStr, mkSimple, mkEnv, destroyEnv, m
 
         withAsync (runM env $ runWorkerPool workerConfig) $ \_ -> do
           waitUntil waitMillis $ (== 2) . length <$> readIORef startedRef
-          reclaimJob connStr qualifiedTable stolenId
+          reclaimJob connStr schema table stolenId
           waitUntil waitMillis $ not . null <$> readIORef reasonsRef
           reclaimedAt <- getMonotonicTime
           waitUntil slowWaitMillis $ not . null <$> readIORef finishedRef
@@ -224,7 +221,7 @@ deadlineSpec TestBackend {schema, table, connStr, mkSimple, mkEnv, destroyEnv, m
         (handed, kept) <- case partition ((== handedId) . primaryKey) batch of
           ([job], [sibling]) -> pure (job, sibling)
           _ -> fail "expected two claimed jobs"
-        releaseRow connStr qualifiedTable handedId
+        releaseRow connStr schema table handedId
         reclaimed <- runM env (HL.claimNextVisibleJobsAs @payload 1 20 (workerId config)) >>= single
         guard <- runM env (newHeartbeatGuard guardConfig)
         startTime <- getCurrentTime
@@ -236,7 +233,7 @@ deadlineSpec TestBackend {schema, table, connStr, mkSimple, mkEnv, destroyEnv, m
             async . runM env $
               withJobsHeartbeat guard startTime (reclaimed :| []) (pure [reclaimed]) (liftIO (threadDelay siblingRunMicros))
           threadDelay beforeCancelMicros
-          flagCancelled connStr qualifiedTable handedId
+          flagCancelled connStr schema table handedId
           holderOutcome <- waitCatch holder
           keeperOutcome <- waitCatch keeper
           either isForceCancelled (const False) holderOutcome `shouldBe` True
@@ -266,7 +263,7 @@ deadlineSpec TestBackend {schema, table, connStr, mkSimple, mkEnv, destroyEnv, m
         withAsync (runM env $ runWorkerPool workerConfig) $ \_ -> do
           waitUntil waitMillis $ (== 2) . length <$> readIORef startedRef
           lockedFrom <- getMonotonicTime
-          holdRowLock connStr qualifiedTable lockedId rowLockMicros
+          holdRowLock connStr schema table lockedId rowLockMicros
           beats <- readIORef beatsRef
           [() | (jobId, at) <- beats, jobId == freeId, at > lockedFrom + lockedBeatFrom, at < lockedFrom + lockedBeatTo]
             `shouldSatisfy` (not . null)
@@ -293,7 +290,7 @@ deadlineSpec TestBackend {schema, table, connStr, mkSimple, mkEnv, destroyEnv, m
                 }
         withAsync (runM env $ runWorkerPool workerConfig) $ \_ -> do
           waitUntil waitMillis $ (== 1) <$> readIORef finishedRef
-          waitUntil waitMillis $ (== 0) <$> rowCount connStr qualifiedTable (primaryKey parent)
+          waitUntil waitMillis $ (== 0) <$> rowCount connStr schema table (primaryKey parent)
           logged <- readIORef loggedRef
           filter (T.isInfixOf "deadlock" . T.toLower) logged `shouldBe` []
           dlq <- listDLQ env
@@ -543,15 +540,13 @@ deadlineSpec TestBackend {schema, table, connStr, mkSimple, mkEnv, destroyEnv, m
 
         withAsync (runM env $ runWorkerPool workerConfig) $ \_ -> do
           waitUntil waitMillis $ (== 1) <$> readIORef startedRef
-          takeClaimHolder connStr qualifiedTable
+          takeClaimHolder connStr schema table
           waitUntil slowWaitMillis $ not . null <$> readIORef reasonsRef
           finished <- readIORef finishedRef
           finished `shouldBe` 0
           reasons <- readIORef reasonsRef
           reasons `shouldBe` [leaseExpiredReason]
   where
-    qualifiedTable :: Text
-    qualifiedTable = schema <> "." <> table
     inserted :: env -> JobWrite payload -> IO (JobRead payload)
     inserted env job = runM env (HL.insertJob job) >>= maybe (fail "insert returned no job") pure
     insertedPlainId :: env -> IO Int64
@@ -569,34 +564,6 @@ maskedSeconds = fromIntegral maskedMicros / 1_000_000
 recordBeat :: (MonadIO m) => IORef [Double] -> m ()
 recordBeat beatsRef = liftIO $ getMonotonicTime >>= \now -> atomicModifyIORef' beatsRef (\beats -> (now : beats, ()))
 
--- | Take the claim without bumping its token. The extend then reports 'VisibilityUnchanged'.
-takeClaimHolder :: ByteString -> Text -> IO ()
-takeClaimHolder connStr qualifiedTable = withConn connStr $ \conn ->
-  void $
-    PG.execute_
-      conn
-      ( fromString
-          ( T.unpack
-              ( "UPDATE "
-                  <> qualifiedTable
-                  <> " SET claimed_by = '00000000-0000-0000-0000-000000000009'::uuid WHERE claimed_by IS NOT NULL"
-              )
-          )
-      )
-
--- | Run one UPDATE on a job row over a fresh connection.
-updateJob :: ByteString -> Text -> Text -> Int64 -> IO ()
-updateJob connStr qualifiedTable setClause jobId = withConn connStr $ \conn ->
-  void $
-    PG.execute
-      conn
-      (fromString (T.unpack ("UPDATE " <> qualifiedTable <> " SET " <> setClause <> " WHERE id = ?")))
-      (PG.Only jobId)
-
--- | Take the claim under a new token, as another worker's claim does.
-reclaimJob :: ByteString -> Text -> Int64 -> IO ()
-reclaimJob connStr qualifiedTable = updateJob connStr qualifiedTable "attempts = attempts + 1, claim_seq = claim_seq + 1"
-
 single :: [a] -> IO a
 single [x] = pure x
 single _ = fail "expected exactly one job"
@@ -606,34 +573,3 @@ isForceCancelled exc = isJust (fromException exc :: Maybe JobForceCancelled)
 
 stamp :: IORef [(Int64, Double)] -> JobRead payload -> IO ()
 stamp ref job = getMonotonicTime >>= \now -> atomicModifyIORef' ref (\seen -> ((primaryKey job, now) : seen, ()))
-
--- | Hold a row lock on one job for @micros@, as a transaction touching it would.
-holdRowLock :: ByteString -> Text -> Int64 -> Int -> IO ()
-holdRowLock connStr qualifiedTable jobId micros = withConn connStr $ \conn -> do
-  PG.begin conn
-  _ <-
-    PG.query
-      conn
-      (fromString (T.unpack ("SELECT id FROM " <> qualifiedTable <> " WHERE id = ? FOR UPDATE")))
-      (PG.Only jobId)
-      :: IO [PG.Only Int64]
-  threadDelay micros
-  PG.commit conn
-
--- | Flag a job cancelled under its lease, as a force-cancel does, without the NOTIFY.
-flagCancelled :: ByteString -> Text -> Int64 -> IO ()
-flagCancelled connStr qualifiedTable = updateJob connStr qualifiedTable "cancel_requested_at = NOW(), claim_seq = claim_seq + 1"
-
--- | Release a claim and make the row claimable now.
-releaseRow :: ByteString -> Text -> Int64 -> IO ()
-releaseRow connStr qualifiedTable = updateJob connStr qualifiedTable "claimed_by = NULL, not_visible_until = NULL"
-
--- | How many rows carry the job id.
-rowCount :: ByteString -> Text -> Int64 -> IO Int
-rowCount connStr qualifiedTable jobId = withConn connStr $ \conn -> do
-  [PG.Only count] <-
-    PG.query
-      conn
-      (fromString (T.unpack ("SELECT count(*)::int FROM " <> qualifiedTable <> " WHERE id = ?")))
-      (PG.Only jobId)
-  pure count

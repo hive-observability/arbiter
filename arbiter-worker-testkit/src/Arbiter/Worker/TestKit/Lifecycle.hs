@@ -71,7 +71,7 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Time (diffUTCTime, getCurrentTime)
 import Data.UUID.V4 qualified as UUID
-import Database.PostgreSQL.Simple (Only (..), execute, query)
+import Database.PostgreSQL.Simple (Only (..), query)
 import Database.PostgreSQL.Simple qualified as PG
 import Database.PostgreSQL.Simple.Notification (Notification (..), getNotification)
 import System.Directory qualified as Dir
@@ -93,6 +93,7 @@ import UnliftIO.Async (withAsync)
 import UnliftIO.Async qualified as Async
 
 import Arbiter.Worker.TestKit.Backend (TestBackend (..))
+import Arbiter.Worker.TestKit.Rows (reclaimJob)
 
 -- | Worker lifecycle suite. The queue under test declares @Maybe [Text]@ as its result type.
 lifecycleSpec
@@ -330,19 +331,7 @@ lifecycleSpec TestBackend {schema, table, connStr, mkSimple, mkEnv, mkEnvPollOnl
               -- Simulate a reclaim of "ca-stolen". A claim bumps both counters. The bulk ack skips it.
               liftIO $
                 traverse_
-                  ( \job ->
-                      when (payload job == mkSimple "ca-stolen") $ do
-                        withConn connStr $ \conn ->
-                          void $
-                            execute
-                              conn
-                              ( fromString . T.unpack $
-                                  "UPDATE "
-                                    <> Schema.jobQueueTable schema table
-                                    <> " SET attempts = attempts + 1, claim_seq = claim_seq + 1 WHERE id = ?"
-                              )
-                              (Only (primaryKey job))
-                  )
+                  (\job -> when (payload job == mkSimple "ca-stolen") $ reclaimJob connStr schema table (primaryKey job))
                   batchJobs
               ackAll cbs batchJobs
         let jobs =

@@ -4,16 +4,19 @@
 module Arbiter.Core.Listen.Driver
   ( ListenDriver (..)
   , ConnectDriver (..)
+  , ConnStatus (..)
+  , Polling (..)
+  , execOutcome
   , driverListenConn
   , withDriverListenConn
   ) where
 
 import Control.Concurrent (threadWaitRead, threadWaitWrite)
 import Control.Exception (bracket, onException)
-import Control.Monad ((>=>))
 import Data.ByteString (ByteString)
 import Data.ByteString.Char8 qualified as BSC
 import Data.Foldable (traverse_)
+import Data.Text (Text)
 import Data.Text qualified as T
 import System.Posix.Types (Fd)
 
@@ -21,77 +24,80 @@ import Arbiter.Core.Exceptions (throwInternal)
 import Arbiter.Core.Listen (ListenConn (..), Notification (..))
 
 -- | The driver calls the hub loop runs on an open connection.
-data ListenDriver conn notify result status = ListenDriver
-  { notifies :: conn -> IO (Maybe notify)
+data ListenDriver conn = ListenDriver
+  { notifies :: conn -> IO (Maybe Notification)
   , socket :: conn -> IO (Maybe Fd)
   , consumeInput :: conn -> IO Bool
-  , exec :: conn -> ByteString -> IO (Maybe result)
-  , resultStatus :: result -> IO status
+  , exec :: conn -> ByteString -> IO (Either Text ())
+  -- ^ Run a command, reporting why it failed.
   , escapeIdentifier :: conn -> ByteString -> IO (Maybe ByteString)
-  , commandOk :: status
-  , notification :: notify -> Notification
   }
+
+-- | Where an asynchronous connect stands.
+data ConnStatus = ConnOk | ConnBad | ConnPending
+  deriving stock (Eq, Show)
+
+-- | What a connect poll asks the caller to wait for.
+data Polling = PollReading | PollWriting | PollDone
+  deriving stock (Eq, Show)
 
 -- | The driver calls that open a connection asynchronously.
-data ConnectDriver conn status poll = ConnectDriver
+data ConnectDriver conn = ConnectDriver
   { connectStart :: ByteString -> IO conn
-  , connectPoll :: conn -> IO poll
-  , status :: conn -> IO status
+  , connectPoll :: conn -> IO Polling
+  , status :: conn -> IO ConnStatus
   , finish :: conn -> IO ()
   , errorMessage :: conn -> IO (Maybe ByteString)
-  , connectionOk :: status
-  , connectionBad :: status
-  , pollingReading :: poll
-  , pollingWriting :: poll
   }
 
+-- | Judge a command's result by its status against the driver's success status.
+execOutcome :: (Eq status, Show status) => status -> (result -> IO status) -> Maybe result -> IO (Either Text ())
+execOutcome okStatus resultStatus = maybe (pure (Left "returned no result")) (fmap judge . resultStatus)
+  where
+    judge st
+      | st == okStatus = Right ()
+      | otherwise = Left ("failed with " <> T.pack (show st))
+
 -- | A 'ListenConn' over a driver connection.
-driverListenConn :: (Eq status, Show status) => ListenDriver conn notify result status -> conn -> ListenConn
+driverListenConn :: ListenDriver conn -> conn -> ListenConn
 driverListenConn driver conn =
   ListenConn
-    { listenNotifies = fmap (notification driver) <$> notifies driver conn
+    { listenNotifies = notifies driver conn
     , listenSocket = socket driver conn
     , listenConsumeInput = consumeInput driver conn
-    , listenExec = exec driver conn >=> maybe (pure (Left "returned no result")) ok
+    , listenExec = exec driver conn
     , listenEscapeIdentifier = escapeIdentifier driver conn
     }
-  where
-    ok res = do
-      st <- resultStatus driver res
-      pure $ if st == commandOk driver then Right () else Left ("failed with " <> T.pack (show st))
 
 -- | Run an action on a connection of its own, opened from a connection string.
 withDriverListenConn
-  :: (Eq cstatus, Eq poll, Eq status, Show status)
-  => ConnectDriver conn cstatus poll
-  -> ListenDriver conn notify result status
+  :: ConnectDriver conn
+  -> ListenDriver conn
   -> ByteString
   -> (ListenConn -> IO a)
   -> IO a
 withDriverListenConn connector driver connStr action =
   bracket (interruptibleConnect connector (socket driver) connStr) (finish connector) $ \conn -> do
     st <- status connector conn
-    if st == connectionOk connector
+    if st == ConnOk
       then action (driverListenConn driver conn)
       else do
         merr <- errorMessage connector conn
         throwInternal $ "connect failed" <> foldMap ((": " <>) . T.pack . BSC.unpack) merr
 
 -- | Open a connection asynchronously. A teardown cancel interrupts the connect.
-interruptibleConnect
-  :: (Eq cstatus, Eq poll) => ConnectDriver conn cstatus poll -> (conn -> IO (Maybe Fd)) -> ByteString -> IO conn
+interruptibleConnect :: ConnectDriver conn -> (conn -> IO (Maybe Fd)) -> ByteString -> IO conn
 interruptibleConnect connector socketOf connStr = do
   conn <- connectStart connector connStr
   st <- status connector conn
-  if st == connectionBad connector
+  if st == ConnBad
     then pure conn
     else (poll conn >> pure conn) `onException` finish connector conn
   where
     poll conn = connectPoll connector conn >>= traverse_ (\wait -> waitSocket conn wait >> poll conn) . waitFor
-    waitFor st
-      | st == pollingReading connector = Just threadWaitRead
-      | st == pollingWriting connector = Just threadWaitWrite
-      | otherwise = Nothing
+    waitFor PollReading = Just threadWaitRead
+    waitFor PollWriting = Just threadWaitWrite
+    waitFor PollDone = Nothing
     waitSocket conn wait =
       socketOf conn >>= \case
         Just socketFd -> wait socketFd

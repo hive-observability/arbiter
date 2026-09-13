@@ -18,23 +18,18 @@ import Arbiter.Core.Job.Types
 import Arbiter.Core.MonadArbiter (RegistryOf, ResultOf)
 import Arbiter.Core.QueueRegistry (RegistryTables)
 import Arbiter.Test.Poll (waitUntil, withLinkedAsync)
-import Arbiter.Test.Setup (withConn)
 import Arbiter.Worker (runWorkerPool)
 import Arbiter.Worker.Config (WorkerConfig (..), transactionalWorkerConfig)
 import Control.Concurrent (threadDelay)
 import Control.Monad (void, when)
 import Control.Monad.IO.Class (liftIO)
-import Data.ByteString (ByteString)
 import Data.Foldable (traverse_)
 import Data.IORef (atomicModifyIORef', newIORef, readIORef)
-import Data.Int (Int64)
-import Data.Text (Text)
-import Database.PostgreSQL.Simple (execute)
-import Database.PostgreSQL.Simple.Types (QualifiedIdentifier (..))
 import Test.Hspec
 import UnliftIO (bracket)
 
 import Arbiter.Worker.TestKit.Backend (TestBackend (..))
+import Arbiter.Worker.TestKit.Rows (reclaimJob)
 
 -- | A failing payload's remaining failure count, high enough to fail every attempt.
 alwaysFailing :: Int
@@ -71,7 +66,7 @@ reclaimSpec TestBackend {schema, table, connStr, mkSimple, mkFailing, mkEnv, des
         let jobId = primaryKey inserted
 
         let jobHandler _job = liftIO $ do
-              simulateAnotherWorkerClaim connStr schema table jobId
+              reclaimJob connStr schema table jobId
               atomicModifyIORef' handlerCompleted (\_ -> (True, ()))
 
         config :: WorkerConfig m payload <- transactionalWorkerConfig 10 (mkHandler jobHandler)
@@ -142,7 +137,7 @@ reclaimSpec TestBackend {schema, table, connStr, mkSimple, mkFailing, mkEnv, des
         let jobHandler _job = liftIO $ do
               atomicModifyIORef' handlerStarted (\_ -> (True, ()))
               threadDelay 200_000
-              simulateAnotherWorkerClaim connStr schema table jobId
+              reclaimJob connStr schema table jobId
               threadDelay 5_000_000
               atomicModifyIORef' handlerCompleted (\_ -> (True, ()))
 
@@ -200,13 +195,3 @@ reclaimSpec TestBackend {schema, table, connStr, mkSimple, mkFailing, mkEnv, des
 
         processed <- readIORef processedCount
         processed `shouldBe` 3
-
--- | Bump the attempts and claim counters from a side connection.
-simulateAnotherWorkerClaim :: ByteString -> Text -> Text -> Int64 -> IO ()
-simulateAnotherWorkerClaim connStr schema table jobId =
-  withConn connStr $ \conn ->
-    void $
-      execute
-        conn
-        "UPDATE ? SET attempts = attempts + 1, claim_seq = claim_seq + 1 WHERE id = ?"
-        (QualifiedIdentifier (Just schema) table, jobId)

@@ -80,7 +80,6 @@ test-suite arbiter-orville-tests
     , arbiter-libpq           >=0.1 && <0.2
     , arbiter-orville
     , arbiter-test-common     >=0.1 && <0.2
-    , arbiter-worker          >=0.1 && <0.2
     , arbiter-worker-testkit  >=0.1 && <0.2
     , base
     , bytestring

@@ -1,26 +1,21 @@
 {-# LANGUAGE CPP #-}
 
--- | The hasql envs the bench compares, one per transport.
+-- | The hasql connects the bench compares, one per transport.
 module BenchHasql (hasqlTransports) where
 
-import Arbiter.Core.Job.Schema (SchemaName)
-import Arbiter.Core.PoolConfig (PoolConfig)
-import Arbiter.Hasql (HasqlEnv, createHasqlEnvWithConfig)
+import Arbiter.Hasql (HasqlConnect, toHasqlConnect)
 import Data.ByteString (ByteString)
 import Data.List.NonEmpty (NonEmpty (..))
-import Data.Proxy (Proxy)
 
 #if MIN_VERSION_hasql(2,0,0)
 import Pqi.Ffi qualified as Ffi
 import Pqi.Native qualified as Native
 #endif
 
--- | Labelled env constructors. The first is the libpq transport.
-hasqlTransports :: NonEmpty (String, Proxy registry -> ByteString -> SchemaName -> PoolConfig -> IO (HasqlEnv registry))
+-- | Labelled connects. The first is the libpq transport.
+hasqlTransports :: NonEmpty (String, ByteString -> HasqlConnect)
 #if MIN_VERSION_hasql(2,0,0)
-hasqlTransports =
-  ("hasql", \proxy -> createHasqlEnvWithConfig proxy Ffi.adapter)
-    :| [("hasql-native", \proxy -> createHasqlEnvWithConfig proxy Native.adapter)]
+hasqlTransports = ("hasql", toHasqlConnect Ffi.adapter) :| [("hasql-native", toHasqlConnect Native.adapter)]
 #else
-hasqlTransports = ("hasql", createHasqlEnvWithConfig) :| []
+hasqlTransports = ("hasql", toHasqlConnect) :| []
 #endif

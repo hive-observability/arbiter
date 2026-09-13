@@ -20,7 +20,7 @@ import Arbiter.Core.MonadArbiter (JobHandler)
 import Arbiter.Core.QueueRegistry (Queue, QueueSpec (..))
 import Arbiter.Test.Fixtures (WorkerTestPayload (..))
 import Arbiter.Test.Poll (waitUntil, withLinkedAsync)
-import Arbiter.Test.Setup (addQueueTable, cleanupData, cleanupOnce, createPoolOf, createSharedPool, setupOnce, withConn)
+import Arbiter.Test.Setup (addQueueTable, cleanupOnce, createPoolOf, createSharedPool, setupOnce)
 import Arbiter.Worker (runWorkerPool)
 import Arbiter.Worker.BackoffStrategy (Jitter (NoJitter))
 import Arbiter.Worker.Config (WorkerConfig (..), transactionalWorkerConfig)
@@ -91,15 +91,7 @@ type ListenTestRegistry = '[Queue "arbiter_worker_listen_test" WorkerTestPayload
 listenerSpec :: ByteString -> Spec
 listenerSpec connStr =
   beforeAll (setupOnce connStr listenSchema listenSchema True) $ do
-    TestKit.listenerSpec @WorkerTestPayload
-      listenSchema
-      connStr
-      SimpleTask
-      (fresh (Proxy @ListenTestRegistry) connStr listenSchema)
-      (disableListener <$> fresh (Proxy @ListenTestRegistry) connStr listenSchema)
-      destroySimpleEnv
-      TestKit.plainHandler
-      runSimpleDb
+    TestKit.listenerSpec (simpleBackend (Proxy @ListenTestRegistry) connStr listenSchema)
     dedicatedListenerSpec connStr
 
 dedicatedListenerSpec :: ByteString -> Spec
@@ -162,7 +154,8 @@ multiQueueSpec connStr =
       runSimpleDb
   where
     mkEnv = do
-      withConn connStr $ \conn -> cleanupData mqSchema mqTableA conn *> cleanupData mqSchema mqTableB conn
+      cleanupOnce connStr mqSchema mqTableA
+      cleanupOnce connStr mqSchema mqTableB
       createSimpleEnv (Proxy @MultiQRegistry) connStr mqSchema
 
 deadlineSchema :: Text

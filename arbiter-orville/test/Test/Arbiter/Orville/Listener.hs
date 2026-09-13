@@ -19,33 +19,19 @@ import Test.Arbiter.Orville.TestHelpers
   ( TestOrville
   , createOrvilleTestEnv
   , destroyOrvilleTestEnv
-  , disableOrvilleListener
   , runOrvilleTest
   )
-
-newtype ListenPayload = ListenPayload Text
-  deriving stock (Eq, Generic, Show)
-  deriving anyclass (FromJSON, ToJSON)
+import Test.Arbiter.Orville.Worker (OrvilleWorkerTestPayload, orvilleBackend)
 
 listenSchema :: Text
 listenSchema = "arbiter_orville_listen_test"
 
-type OrvilleListenRegistry = '[Queue "arbiter_orville_listen_test" ListenPayload]
+type OrvilleListenRegistry = '[Queue "arbiter_orville_listen_test" OrvilleWorkerTestPayload]
 
 listenerSpec :: ByteString -> Spec
 listenerSpec connStr =
   beforeAll (setupOnce connStr listenSchema listenSchema True) $
-    TestKit.listenerSpec @ListenPayload @(TestOrville OrvilleListenRegistry)
-      listenSchema
-      connStr
-      ListenPayload
-      (cleanupOnce connStr listenSchema listenSchema >> createOrvilleTestEnv connStr listenSchema listenSchema 10)
-      ( cleanupOnce connStr listenSchema listenSchema
-          >> (disableOrvilleListener <$> createOrvilleTestEnv connStr listenSchema listenSchema 10)
-      )
-      destroyOrvilleTestEnv
-      id
-      runOrvilleTest
+    TestKit.listenerSpec (orvilleBackend @OrvilleListenRegistry connStr listenSchema)
 
 mqSchema :: Text
 mqSchema = "arbiter_orville_mq_test"

@@ -3,55 +3,39 @@
 
 module Test.Arbiter.Hasql.TestHelpers
   ( createHasqlPool
-  , createHasqlTestEnv
   , runHasqlCommand
-  , useDedicatedTestListener
+  , testConnect
   ) where
 
 import Arbiter.Core.Backend (withConn)
-import Arbiter.Core.Job.Schema (SchemaName)
 import Arbiter.Test.Setup (createPoolWith)
 import Control.Monad.IO.Class (liftIO)
 import Data.ByteString (ByteString)
 import Data.Pool (Pool)
-import Data.Proxy (Proxy)
 import Data.Text (Text)
 import Data.Text.Encoding qualified as TE
 import Hasql.Connection qualified as Hasql
 
-import Arbiter.Hasql.Compat (hasqlAcquire, hasqlSettings, runSQL)
-import Arbiter.Hasql.HasqlDb (HasqlDb, HasqlEnv, createHasqlEnv, useDedicatedListener)
+import Arbiter.Hasql.Compat (acquireConnect, runSQL)
+import Arbiter.Hasql.HasqlDb (HasqlConnect, HasqlDb, toHasqlConnect)
 
 #if MIN_VERSION_hasql(2,0,0)
 import Pqi.Ffi qualified as Ffi
 #endif
 
--- | 'createHasqlEnv' over the libpq adapter on hasql 2.
-createHasqlTestEnv :: Proxy registry -> ByteString -> SchemaName -> IO (HasqlEnv registry)
+-- | The test connect. On hasql 2 it uses the libpq adapter.
+testConnect :: ByteString -> HasqlConnect
 #if MIN_VERSION_hasql(2,0,0)
-createHasqlTestEnv proxy = createHasqlEnv proxy Ffi.adapter
+testConnect = toHasqlConnect Ffi.adapter
 #else
-createHasqlTestEnv = createHasqlEnv
-#endif
-
--- | 'useDedicatedListener' over the libpq adapter on hasql 2.
-useDedicatedTestListener :: ByteString -> HasqlEnv registry -> IO (HasqlEnv registry)
-#if MIN_VERSION_hasql(2,0,0)
-useDedicatedTestListener = useDedicatedListener Ffi.adapter
-#else
-useDedicatedTestListener = useDedicatedListener
+testConnect = toHasqlConnect
 #endif
 
 createHasqlPool :: Int -> ByteString -> IO (Pool Hasql.Connection)
 createHasqlPool numConnections connStr =
   createPoolWith numConnections connect Hasql.release
   where
-    connect = acquire (hasqlSettings connStr) >>= either (fail . ("hasql test: connection failed: " <>)) pure
-#if MIN_VERSION_hasql(2,0,0)
-    acquire = hasqlAcquire Ffi.adapter
-#else
-    acquire = hasqlAcquire
-#endif
+    connect = acquireConnect (testConnect connStr) >>= either (fail . ("hasql test: connection failed: " <>)) pure
 
 -- | Run a command as a bare script on the monad's current connection.
 runHasqlCommand :: Text -> HasqlDb registry IO ()

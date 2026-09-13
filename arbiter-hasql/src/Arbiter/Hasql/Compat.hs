@@ -6,12 +6,11 @@ module Arbiter.Hasql.Compat
   ( runSQL
   , connectionInTransaction
   , withHasqlListenConn
-  , hasqlAcquire
   , hasqlSettings
   , HasqlSettings
-  , WithConnect
-  , mapConnect
-  , hasqlConnect
+  , HasqlConnect
+  , toHasqlConnect
+  , acquireConnect
   , withDedicatedListenConn
   ) where
 
@@ -26,7 +25,15 @@ import Hasql.Session qualified as Session
 
 #if MIN_VERSION_hasql(2,0,0)
 import Arbiter.Core.Listen (Notification (..))
-import Arbiter.Core.Listen.Driver (ConnectDriver (..), ListenDriver (..), driverListenConn, withDriverListenConn)
+import Arbiter.Core.Listen.Driver
+  ( ConnStatus (..)
+  , ConnectDriver (..)
+  , ListenDriver (..)
+  , Polling (..)
+  , driverListenConn
+  , execOutcome
+  , withDriverListenConn
+  )
 import Hasql.Connection.Settings qualified as Settings
 import Pqi qualified as PQ
 #elif MIN_VERSION_hasql(1,10,0)
@@ -54,43 +61,34 @@ runScript :: T.Text -> Session.Session ()
 runScript = Session.sql
 #endif
 
--- | Open a connection, describing any failure. hasql 2 takes the transport adapter first.
 #if MIN_VERSION_hasql(2,0,0)
-hasqlAcquire :: PQ.Adapter -> HasqlSettings -> IO (Either String Hasql.Connection)
-hasqlAcquire adapter settings = either (Left . show) Right <$> Hasql.acquire adapter settings
-#else
-hasqlAcquire :: HasqlSettings -> IO (Either String Hasql.Connection)
-hasqlAcquire settings = either (Left . show) Right <$> Hasql.acquire settings
-#endif
+-- | How to open a connection. On hasql 2 this is a transport adapter, such as @Pqi.Ffi.adapter@, and a connection string.
+data HasqlConnect = HasqlConnect PQ.Adapter ByteString
 
-#if MIN_VERSION_hasql(2,0,0)
--- | A function of the connect arguments: a transport adapter, such as @Pqi.Ffi.adapter@, then a connection string.
-type WithConnect r = PQ.Adapter -> ByteString -> r
+toHasqlConnect :: PQ.Adapter -> ByteString -> HasqlConnect
+toHasqlConnect = HasqlConnect
 
-mapConnect :: (a -> b) -> WithConnect a -> WithConnect b
-mapConnect = fmap . fmap
-
--- | 'hasqlAcquire' from the connect arguments.
-hasqlConnect :: WithConnect (IO (Either String Hasql.Connection))
-hasqlConnect adapter connStr = hasqlAcquire adapter (hasqlSettings connStr)
+-- | Open a connection, describing any failure.
+acquireConnect :: HasqlConnect -> IO (Either String Hasql.Connection)
+acquireConnect (HasqlConnect adapter connStr) = either (Left . show) Right <$> Hasql.acquire adapter (hasqlSettings connStr)
 
 -- | Run the listener loop on a driver connection of its own.
-withDedicatedListenConn :: WithConnect ((ListenConn -> IO a) -> IO a)
-withDedicatedListenConn adapter = withDriverListenConn (pqiConnectDriver adapter) pqiListenDriver
+withDedicatedListenConn :: HasqlConnect -> (ListenConn -> IO a) -> IO a
+withDedicatedListenConn (HasqlConnect adapter connStr) = withDriverListenConn (pqiConnectDriver adapter) pqiListenDriver connStr
 #else
--- | A function of the connect arguments: a connection string.
-type WithConnect r = ByteString -> r
+-- | How to open a connection. On hasql 1.x this is a connection string.
+newtype HasqlConnect = HasqlConnect ByteString
 
-mapConnect :: (a -> b) -> WithConnect a -> WithConnect b
-mapConnect = fmap
+toHasqlConnect :: ByteString -> HasqlConnect
+toHasqlConnect = HasqlConnect
 
--- | 'hasqlAcquire' from the connect arguments.
-hasqlConnect :: WithConnect (IO (Either String Hasql.Connection))
-hasqlConnect connStr = hasqlAcquire (hasqlSettings connStr)
+-- | Open a connection, describing any failure.
+acquireConnect :: HasqlConnect -> IO (Either String Hasql.Connection)
+acquireConnect (HasqlConnect connStr) = either (Left . show) Right <$> Hasql.acquire (hasqlSettings connStr)
 
 -- | Run the listener loop on a driver connection of its own.
-withDedicatedListenConn :: WithConnect ((ListenConn -> IO a) -> IO a)
-withDedicatedListenConn = withLibPQListenConn
+withDedicatedListenConn :: HasqlConnect -> (ListenConn -> IO a) -> IO a
+withDedicatedListenConn (HasqlConnect connStr) = withLibPQListenConn connStr
 #endif
 
 -- | Whether the connection is in a transaction block, valid or aborted.
@@ -126,32 +124,34 @@ withHasqlListenConn conn action = Hasql.withLibPQConnection conn (action . toLis
 toListenConn :: PQ.Connection -> ListenConn
 toListenConn = driverListenConn pqiListenDriver
 
-pqiListenDriver :: ListenDriver PQ.Connection PQ.Notify PQ.Result PQ.ExecStatus
+pqiListenDriver :: ListenDriver PQ.Connection
 pqiListenDriver =
   ListenDriver
-    { notifies = PQ.notifies
+    { notifies = fmap (fmap notification) . PQ.notifies
     , socket = PQ.socket
     , consumeInput = PQ.consumeInput
-    , exec = PQ.exec
-    , resultStatus = PQ.resultStatus
+    , exec = \conn sql -> PQ.exec conn sql >>= execOutcome PQ.CommandOk PQ.resultStatus
     , escapeIdentifier = PQ.escapeIdentifier
-    , commandOk = PQ.CommandOk
-    , notification = \notify -> Notification (PQ.notifyRelname notify) (PQ.notifyExtra notify)
     }
+  where
+    notification notify = Notification (PQ.notifyRelname notify) (PQ.notifyExtra notify)
 
-pqiConnectDriver :: PQ.Adapter -> ConnectDriver PQ.Connection PQ.ConnStatus PQ.PollingStatus
+pqiConnectDriver :: PQ.Adapter -> ConnectDriver PQ.Connection
 pqiConnectDriver adapter =
   ConnectDriver
     { connectStart = PQ.connectStart adapter
-    , connectPoll = PQ.connectPoll
-    , status = PQ.status
+    , connectPoll = fmap polling . PQ.connectPoll
+    , status = fmap connStatus . PQ.status
     , finish = PQ.finish
     , errorMessage = PQ.errorMessage
-    , connectionOk = PQ.ConnectionOk
-    , connectionBad = PQ.ConnectionBad
-    , pollingReading = PQ.PollingReading
-    , pollingWriting = PQ.PollingWriting
     }
+  where
+    polling PQ.PollingReading = PollReading
+    polling PQ.PollingWriting = PollWriting
+    polling _ = PollDone
+    connStatus PQ.ConnectionOk = ConnOk
+    connStatus PQ.ConnectionBad = ConnBad
+    connStatus _ = ConnPending
 #else
 toListenConn :: PQ.Connection -> ListenConn
 toListenConn = libpqListenConn

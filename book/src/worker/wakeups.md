@@ -16,12 +16,13 @@ to:
 The listener opens with the first worker pool and holds one pool connection.
 A producer-only process opens none.
 
-`useDedicatedListener` opens a separate listener connection. On hasql 2 the
-transport adapter comes first:
+`useDedicatedListener` opens a separate listener connection:
 
 ```haskell
 env <- ArbS.useDedicatedListener connStr =<< ArbS.createSimpleEnv (Proxy @AppRegistry) connStr "arbiter"
-env <- ArbH.useDedicatedListener Ffi.adapter connStr =<< ArbH.createHasqlEnv (Proxy @AppRegistry) Ffi.adapter connStr "arbiter"
+
+let connect = ArbH.toHasqlConnect Ffi.adapter connStr
+env <- ArbH.useDedicatedListener connect =<< ArbH.createHasqlEnv (Proxy @AppRegistry) connect "arbiter"
 ```
 
 `disableListener` switches to polling:

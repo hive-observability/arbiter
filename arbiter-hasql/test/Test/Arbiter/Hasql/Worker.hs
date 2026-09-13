@@ -35,12 +35,14 @@ import UnliftIO.Async (async, cancel)
 import Arbiter.Hasql.HasqlDb
   ( HasqlDb
   , HasqlEnv
+  , createHasqlEnv
   , createHasqlEnvWithPool
   , destroyHasqlEnv
   , disableListener
   , runHasqlDb
+  , useDedicatedListener
   )
-import Test.Arbiter.Hasql.TestHelpers (createHasqlPool, createHasqlTestEnv, runHasqlCommand, useDedicatedTestListener)
+import Test.Arbiter.Hasql.TestHelpers (createHasqlPool, runHasqlCommand, testConnect)
 
 workerTestSchemaName :: Text
 workerTestSchemaName = "arbiter_hasql_worker_test"
@@ -76,17 +78,7 @@ type HasqlListenRegistry = '[Queue "arbiter_hasql_listen_test" HasqlWorkerTestPa
 listenerSpec :: ByteString -> Spec
 listenerSpec connStr =
   beforeAll (setupOnce connStr listenSchema listenSchema True) $ do
-    TestKit.listenerSpec @HasqlWorkerTestPayload
-      listenSchema
-      connStr
-      SimpleTask
-      (cleanupOnce connStr listenSchema listenSchema >> createHasqlTestEnv (Proxy @HasqlListenRegistry) connStr listenSchema)
-      ( cleanupOnce connStr listenSchema listenSchema
-          >> (disableListener <$> createHasqlTestEnv (Proxy @HasqlListenRegistry) connStr listenSchema)
-      )
-      destroyHasqlEnv
-      TestKit.plainHandler
-      runHasqlDb
+    TestKit.listenerSpec (hasqlBackend (Proxy @HasqlListenRegistry) connStr listenSchema)
     dedicatedListenerSpec connStr
 
 -- | An address that never completes the TCP handshake.
@@ -100,7 +92,8 @@ dedicatedListenerSpec connStr =
       cleanupOnce connStr listenSchema listenSchema
       pool <- createHasqlPool 1 connStr
       env <-
-        useDedicatedTestListener blackHoleConnStr =<< createHasqlEnvWithPool (Proxy @HasqlListenRegistry) pool listenSchema
+        useDedicatedListener (testConnect blackHoleConnStr)
+          =<< createHasqlEnvWithPool (Proxy @HasqlListenRegistry) pool listenSchema
       let handler :: JobHandler (HasqlDb HasqlListenRegistry IO) HasqlWorkerTestPayload ()
           handler _conn _job = pure ()
       config <- transactionalWorkerConfig 1 handler
@@ -149,10 +142,10 @@ multiQueueSpec connStr =
     mkEnv = do
       cleanupOnce connStr mqSchema mqTableA
       cleanupOnce connStr mqSchema mqTableB
-      createHasqlTestEnv (Proxy @HasqlMultiQRegistry) connStr mqSchema
+      createHasqlEnv (Proxy @HasqlMultiQRegistry) (testConnect connStr) mqSchema
 
 fresh :: Proxy registry -> ByteString -> Text -> IO (HasqlEnv registry)
-fresh proxy connStr schema = cleanupOnce connStr schema schema >> createHasqlTestEnv proxy connStr schema
+fresh proxy connStr schema = cleanupOnce connStr schema schema >> createHasqlEnv proxy (testConnect connStr) schema
 
 hasqlBackend
   :: Proxy registry
