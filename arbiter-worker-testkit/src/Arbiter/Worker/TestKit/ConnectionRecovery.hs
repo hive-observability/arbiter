@@ -44,8 +44,8 @@ connectionRecoverySpec
      )
   => TestBackend payload m env
   -> Spec
-connectionRecoverySpec TestBackend {schema, connStr, mkSimple, mkEnv, destroyEnv, mkHandler, runM} =
-  around (bracket ((,) <$> mkEnv <*> mkEnv) (\(env, spare) -> destroyEnv env >> destroyEnv spare)) $
+connectionRecoverySpec TestBackend {schema, connStr, mkSimple, mkFreshEnv, destroyEnv, mkHandler, runM} =
+  around (bracket ((,) <$> mkFreshEnv <*> mkFreshEnv) (\(env, spare) -> destroyEnv env >> destroyEnv spare)) $
     describe "Connection Recovery" $ do
       it "processes jobs inserted before and after a connection kill" $ \(env, spare) -> do
         completedRef <- newIORef (0 :: Int)

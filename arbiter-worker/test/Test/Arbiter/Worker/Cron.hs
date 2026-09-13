@@ -5,12 +5,12 @@ module Test.Arbiter.Worker.Cron (spec) where
 
 import Arbiter.Core.Job.Types (defaultJob)
 import Arbiter.Test.Fixtures (WorkerTestPayload (..))
+import Arbiter.Test.Setup (mkTime)
 import Data.List (find)
 import Data.Time
   ( UTCTime (..)
   , addUTCTime
   , fromGregorian
-  , secondsToDiffTime
   )
 import System.Cron (parseCronSchedule)
 import Test.Hspec
@@ -40,13 +40,6 @@ import Arbiter.Worker.Cron
   , resolveTZ
   , truncateToMinute
   )
-
--- | Helper to build a UTCTime from components.
-mkTime :: Integer -> Int -> Int -> Int -> Int -> Int -> UTCTime
-mkTime year month day hour minute second =
-  let calendarDay = fromGregorian year month day
-      secs = secondsToDiffTime (fromIntegral $ hour * 3600 + minute * 60 + second)
-   in UTCTime calendarDay secs
 
 spec :: Spec
 spec = do

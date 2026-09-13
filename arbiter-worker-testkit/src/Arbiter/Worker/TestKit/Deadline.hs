@@ -52,8 +52,8 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Time (UTCTime, getCurrentTime)
 import GHC.Clock (getMonotonicTime)
-import Test.Hspec (Spec, around, describe, it, shouldBe, shouldSatisfy)
-import UnliftIO (MonadUnliftIO, bracket, finally, mask_, tryAny, withRunInIO)
+import Test.Hspec (Spec, before, describe, it, shouldBe, shouldSatisfy)
+import UnliftIO (MonadUnliftIO, finally, mask_, tryAny, withRunInIO)
 import UnliftIO.Async (async, poll, waitCatch, withAsync)
 
 import Arbiter.Worker.TestKit.Backend (TestBackend (..))
@@ -148,8 +148,8 @@ deadlineSpec
      )
   => TestBackend payload m env
   -> Spec
-deadlineSpec TestBackend {schema, table, connStr, mkSimple, mkEnv, destroyEnv, mkHandler, runM} =
-  around (bracket mkEnv destroyEnv) $ do
+deadlineSpec TestBackend {schema, table, connStr, mkSimple, mkEnv, mkHandler, runM} =
+  before mkEnv $ do
     describe "Guard registration" $ do
       it "returns once a signal in flight meets the unregister" $ \env -> do
         job <- inserted env (defaultJob (mkSimple "slow"))

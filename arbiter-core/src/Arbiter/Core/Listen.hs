@@ -98,7 +98,7 @@ data ListenConn = ListenConn
   , listenSocket :: IO (Maybe Fd)
   , listenConsumeInput :: IO Bool
   , listenExec :: ByteString -> IO (Either Text ())
-  -- ^ Run a command, reporting why it failed.
+  -- ^ Run a command. A failure comes back as its reason.
   , listenEscapeIdentifier :: ByteString -> IO (Maybe ByteString)
   }
 

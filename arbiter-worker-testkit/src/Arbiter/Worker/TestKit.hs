@@ -2056,9 +2056,9 @@ listenerSpec
      )
   => TestBackend payload m env
   -> Spec
-listenerSpec TestBackend {schema, connStr, mkSimple, mkEnv, mkEnvPollOnly, destroyEnv, mkHandler, runM} =
+listenerSpec TestBackend {schema, connStr, mkSimple, mkEnv, pollOnly, mkHandler, runM} =
   describe "listener" $ do
-    around (bracket mkEnv destroyEnv) $ do
+    before mkEnv $ do
       it "wakes the dispatcher on NOTIFY under a high poll interval" $ \env -> do
         ref <- newIORef (0 :: Int)
         config :: WorkerConfig m payload <- runM env $ transactionalWorkerConfig 1 (mkHandler (bumping ref))
@@ -2127,7 +2127,7 @@ listenerSpec TestBackend {schema, connStr, mkSimple, mkEnv, mkEnvPollOnly, destr
             waitUntil 5_000 $ (== 1) <$> readIORef good
             readIORef good >>= (`shouldBe` 1)
 
-    around (bracket mkEnvPollOnly destroyEnv) $
+    before (pollOnly <$> mkEnv) $
       it "processes jobs poll-only when the listener is disabled" $ \env -> do
         ref <- newIORef (0 :: Int)
         config :: WorkerConfig m payload <- runM env $ transactionalWorkerConfig 1 (mkHandler (bumping ref))

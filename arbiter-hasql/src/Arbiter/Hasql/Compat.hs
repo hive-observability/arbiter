@@ -127,14 +127,12 @@ toListenConn = driverListenConn pqiListenDriver
 pqiListenDriver :: ListenDriver PQ.Connection
 pqiListenDriver =
   ListenDriver
-    { notifies = fmap (fmap notification) . PQ.notifies
+    { notifies = fmap (fmap (Notification <$> PQ.notifyRelname <*> PQ.notifyExtra)) . PQ.notifies
     , socket = PQ.socket
     , consumeInput = PQ.consumeInput
     , exec = \conn sql -> PQ.exec conn sql >>= execOutcome PQ.CommandOk PQ.resultStatus
     , escapeIdentifier = PQ.escapeIdentifier
     }
-  where
-    notification notify = Notification (PQ.notifyRelname notify) (PQ.notifyExtra notify)
 
 pqiConnectDriver :: PQ.Adapter -> ConnectDriver PQ.Connection
 pqiConnectDriver adapter =

@@ -38,8 +38,9 @@ let reportConfig = config { Worker.maxJobDuration = Just 300 }
 `jobHeartbeatInterval` must be less than `visibilityTimeout`. The pool refuses
 to start otherwise.
 
-After the database goes away, a handler keeps running for at most one
-`visibilityTimeout` after its last renewal, and at least the difference between
-the two settings. Failed extensions retry until the lease expires.
+After the database goes away, a handler continues for at most one
+`visibilityTimeout` after its last renewal. It continues for at least the
+difference between the two settings. Failed extensions retry until the lease
+expires.
 
 See the [`WorkerConfig` haddocks](https://arbiterq.dev/arbiter-worker/Arbiter-Worker-Config.html) for every timing field.

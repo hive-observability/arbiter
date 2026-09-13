@@ -12,7 +12,7 @@ import Arbiter.Core.HighLevel qualified as HL
 import Arbiter.Core.Job.Types (DedupKey (IgnoreDuplicate), JobRead, dedupKey, defaultJob, payload)
 import Arbiter.Core.MonadArbiter (withDbTransaction)
 import Arbiter.Core.Operations qualified as Ops
-import Arbiter.Test.Setup (withConn)
+import Arbiter.Test.Setup (mkTime, withConn)
 import Arbiter.Worker.Cron
   ( BackfillPolicy (..)
   , CronJob (..)
@@ -27,17 +27,16 @@ import Arbiter.Worker.Cron
 import Arbiter.Worker.Logger (silentLogConfig)
 import Control.Monad (void)
 import Control.Monad.IO.Class (liftIO)
-import Data.ByteString (ByteString)
 import Data.Foldable (traverse_)
 import Data.Maybe (isJust)
+import Data.String (fromString)
 import Data.Text (Text)
 import Data.Text qualified as T
-import Data.Time (UTCTime (..), fromGregorian, getCurrentTime, secondsToDiffTime)
+import Data.Time (UTCTime, getCurrentTime)
 import Database.PostgreSQL.Simple (Only (..))
 import Database.PostgreSQL.Simple qualified as PG
-import Database.PostgreSQL.Simple.Types (Identifier (..))
-import Test.Hspec (Spec, around, describe, expectationFailure, it, shouldBe, shouldNotBe, shouldSatisfy)
-import UnliftIO (bracket, catch, newEmptyMVar, putMVar, takeMVar)
+import Test.Hspec (Spec, before, describe, expectationFailure, it, shouldBe, shouldNotBe, shouldSatisfy)
+import UnliftIO (newEmptyMVar, putMVar, takeMVar)
 import UnliftIO.Async (wait, withAsync)
 
 import Arbiter.Worker.TestKit.Backend (TestBackend (..))
@@ -65,18 +64,9 @@ runRequestsAt schema jobs now = do
   cronLog <- newCronLog silentLogConfig
   processRunRequests cronLog schema jobs now
 
--- | Helper to build a UTCTime from components.
-mkTime :: Integer -> Int -> Int -> Int -> Int -> Int -> UTCTime
-mkTime year month day hour minute second =
-  let calendarDay = fromGregorian year month day
-      secs = secondsToDiffTime (fromIntegral $ hour * 3600 + minute * 60 + second)
-   in UTCTime calendarDay secs
-
-clearCronSchedules :: ByteString -> Text -> IO ()
-clearCronSchedules connStr schema =
-  withConn connStr $ \conn ->
-    void (PG.execute conn "DELETE FROM ?.cron_schedules" (Only (Identifier schema)))
-      `catch` (\(_ :: PG.SqlError) -> pure ())
+-- | An UPDATE on the schema's cron table by schedule name, with @?@ holes for the SET values.
+cronUpdate :: Text -> Text -> PG.Query
+cronUpdate schema setClause = fromString . T.unpack $ "UPDATE " <> CS.cronSchedulesTable schema <> " SET " <> setClause <> " WHERE name = ?"
 
 -- | Cron scheduler suite.
 cronSpec
@@ -87,8 +77,8 @@ cronSpec
      )
   => TestBackend payload m env
   -> Spec
-cronSpec TestBackend {schema, table, connStr, mkSimple, mkEnv, destroyEnv, runM} =
-  around (bracket (mkEnv <* clearCronSchedules connStr schema) destroyEnv) $ do
+cronSpec TestBackend {schema, table, connStr, mkSimple, mkEnv, runM} =
+  before mkEnv $ do
     describe "processCronTick" $ do
       it "inserts a job when the schedule matches the tick time" $ \env -> do
         let Right cron =
@@ -308,8 +298,8 @@ cronSpec TestBackend {schema, table, connStr, mkSimple, mkEnv, destroyEnv, runM}
           void $
             PG.execute
               conn
-              "UPDATE ?.cron_schedules SET run_requested_at = NOW() - interval '10 minutes' WHERE name = ?"
-              (Identifier schema, "run-expire" :: Text)
+              (cronUpdate schema "run_requested_at = NOW() - interval '10 minutes'")
+              (Only ("run-expire" :: Text))
 
         now <- getCurrentTime
         runM env $ runRequestsAt schema [cron] now
@@ -535,8 +525,8 @@ cronSpec TestBackend {schema, table, connStr, mkSimple, mkEnv, destroyEnv, runM}
           void $
             PG.execute
               conn
-              "UPDATE ?.cron_schedules SET last_checked_at = NOW() - interval '5 minutes' WHERE name = ?"
-              (Identifier schema, "catchup-backfill" :: Text)
+              (cronUpdate schema "last_checked_at = NOW() - interval '5 minutes'")
+              (Only ("catchup-backfill" :: Text))
 
         now <- getCurrentTime
         runM env $ catchUpAt schema table [cron] now
@@ -560,8 +550,8 @@ cronSpec TestBackend {schema, table, connStr, mkSimple, mkEnv, destroyEnv, runM}
           void $
             PG.execute
               conn
-              "UPDATE ?.cron_schedules SET last_checked_at = NOW() - interval '5 minutes' WHERE name = ?"
-              (Identifier schema, "catchup-nobackfill" :: Text)
+              (cronUpdate schema "last_checked_at = NOW() - interval '5 minutes'")
+              (Only ("catchup-nobackfill" :: Text))
 
         now <- getCurrentTime
         runM env $ catchUpAt schema table [cron] now
@@ -650,8 +640,8 @@ cronSpec TestBackend {schema, table, connStr, mkSimple, mkEnv, destroyEnv, runM}
           void $
             PG.execute
               conn
-              "UPDATE ?.cron_schedules SET last_fired_at = ? WHERE name = ?"
-              (Identifier schema, tick, "skew-race" :: Text)
+              (cronUpdate schema "last_fired_at = ?")
+              (tick, "skew-race" :: Text)
         runM env $ catchUpAt schema table [cron] tick
         jobs <- runM env $ HL.listJobs 100 0 :: IO [JobRead payload]
         length jobs `shouldBe` 0
@@ -665,8 +655,8 @@ cronSpec TestBackend {schema, table, connStr, mkSimple, mkEnv, destroyEnv, runM}
           void $
             PG.execute
               conn
-              "UPDATE ?.cron_schedules SET last_fired_at = ? WHERE name = ?"
-              (Identifier schema, tickPrev, "skew-advance" :: Text)
+              (cronUpdate schema "last_fired_at = ?")
+              (tickPrev, "skew-advance" :: Text)
         runM env $ catchUpAt schema table [cron] tickNext
         jobs <- runM env $ HL.listJobs 100 0 :: IO [JobRead payload]
         length jobs `shouldBe` 1

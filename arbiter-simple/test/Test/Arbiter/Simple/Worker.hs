@@ -47,23 +47,35 @@ import Arbiter.Simple
   , useDedicatedListener
   )
 
-fresh :: Proxy registry -> ByteString -> Text -> IO (SimpleEnv registry)
-fresh proxy connStr schema = cleanupOnce connStr schema schema >> createSimpleEnv proxy connStr schema
+-- | Build the schema and one env over a shared pool, then run a suite over the backend.
+withSimpleBackend
+  :: Proxy registry
+  -> ByteString
+  -> Text
+  -> (TestKit.TestBackend WorkerTestPayload (SimpleDb registry IO) (SimpleEnv registry) -> Spec)
+  -> Spec
+withSimpleBackend proxy connStr schema suite =
+  beforeAll (setupOnce connStr schema schema True) $ do
+    pool <- runIO (createSharedPool connStr)
+    env <- runIO (createSimpleEnvWithPool proxy pool schema)
+    afterAll_ (destroySimpleEnv env) $ suite (simpleBackend proxy connStr schema env)
 
 simpleBackend
   :: Proxy registry
   -> ByteString
   -> Text
+  -> SimpleEnv registry
   -> TestKit.TestBackend WorkerTestPayload (SimpleDb registry IO) (SimpleEnv registry)
-simpleBackend proxy connStr schema =
+simpleBackend proxy connStr schema env =
   TestKit.TestBackend
     { schema
     , table = schema
     , connStr
     , mkSimple = SimpleTask
     , mkFailing = FailingTask
-    , mkEnv = fresh proxy connStr schema
-    , mkEnvPollOnly = disableListener <$> fresh proxy connStr schema
+    , mkEnv = cleanupOnce connStr schema schema >> pure env
+    , pollOnly = disableListener
+    , mkFreshEnv = cleanupOnce connStr schema schema >> createSimpleEnv proxy connStr schema
     , destroyEnv = destroySimpleEnv
     , mkHandler = TestKit.plainHandler
     , runCommand = TestKit.statementCommand
@@ -90,8 +102,8 @@ type ListenTestRegistry = '[Queue "arbiter_worker_listen_test" WorkerTestPayload
 
 listenerSpec :: ByteString -> Spec
 listenerSpec connStr =
-  beforeAll (setupOnce connStr listenSchema listenSchema True) $ do
-    TestKit.listenerSpec (simpleBackend (Proxy @ListenTestRegistry) connStr listenSchema)
+  withSimpleBackend (Proxy @ListenTestRegistry) connStr listenSchema $ \backend -> do
+    TestKit.listenerSpec backend
     dedicatedListenerSpec connStr
 
 dedicatedListenerSpec :: ByteString -> Spec
@@ -164,9 +176,7 @@ deadlineSchema = "arbiter_worker_deadline_test"
 type DeadlineRegistry = '[Queue "arbiter_worker_deadline_test" WorkerTestPayload]
 
 deadlineSpec :: ByteString -> Spec
-deadlineSpec connStr =
-  beforeAll (setupOnce connStr deadlineSchema deadlineSchema True) $
-    TestKit.deadlineSpec (simpleBackend (Proxy @DeadlineRegistry) connStr deadlineSchema)
+deadlineSpec connStr = withSimpleBackend (Proxy @DeadlineRegistry) connStr deadlineSchema TestKit.deadlineSpec
 
 cronSchema :: Text
 cronSchema = "arbiter_cron_test"
@@ -174,9 +184,7 @@ cronSchema = "arbiter_cron_test"
 type CronRegistry = '[Queue "arbiter_cron_test" WorkerTestPayload]
 
 cronSpec :: ByteString -> Spec
-cronSpec connStr =
-  beforeAll (setupOnce connStr cronSchema cronSchema True) $
-    TestKit.cronSpec (simpleBackend (Proxy @CronRegistry) connStr cronSchema)
+cronSpec connStr = withSimpleBackend (Proxy @CronRegistry) connStr cronSchema TestKit.cronSpec
 
 reclaimSchema :: Text
 reclaimSchema = "arbiter_worker_concurrency_test"
@@ -184,9 +192,7 @@ reclaimSchema = "arbiter_worker_concurrency_test"
 type ReclaimRegistry = '[Queue "arbiter_worker_concurrency_test" WorkerTestPayload]
 
 reclaimSpec :: ByteString -> Spec
-reclaimSpec connStr =
-  beforeAll (setupOnce connStr reclaimSchema reclaimSchema True) $
-    TestKit.reclaimSpec (simpleBackend (Proxy @ReclaimRegistry) connStr reclaimSchema)
+reclaimSpec connStr = withSimpleBackend (Proxy @ReclaimRegistry) connStr reclaimSchema TestKit.reclaimSpec
 
 recoverySchema :: Text
 recoverySchema = "arbiter_worker_recovery_test"
@@ -195,8 +201,7 @@ type RecoveryRegistry = '[Queue "arbiter_worker_recovery_test" WorkerTestPayload
 
 connectionRecoverySpec :: ByteString -> Spec
 connectionRecoverySpec connStr =
-  beforeAll (setupOnce connStr recoverySchema recoverySchema True) $
-    TestKit.connectionRecoverySpec (simpleBackend (Proxy @RecoveryRegistry) connStr recoverySchema)
+  withSimpleBackend (Proxy @RecoveryRegistry) connStr recoverySchema TestKit.connectionRecoverySpec
 
 lifecycleSchema :: Text
 lifecycleSchema = "arbiter_worker_lifecycle_test"
@@ -204,6 +209,4 @@ lifecycleSchema = "arbiter_worker_lifecycle_test"
 type LifecycleRegistry = '[QueueWithResult "arbiter_worker_lifecycle_test" WorkerTestPayload (Maybe [Text])]
 
 lifecycleSpec :: ByteString -> Spec
-lifecycleSpec connStr =
-  beforeAll (setupOnce connStr lifecycleSchema lifecycleSchema True) $
-    TestKit.lifecycleSpec (simpleBackend (Proxy @LifecycleRegistry) connStr lifecycleSchema)
+lifecycleSpec connStr = withSimpleBackend (Proxy @LifecycleRegistry) connStr lifecycleSchema TestKit.lifecycleSpec

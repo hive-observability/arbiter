@@ -18,6 +18,7 @@ module Arbiter.Test.Setup
   , createPoolOf
   , createPoolWith
   , truncateToMicros
+  , mkTime
   , seedConcurrencyPoolSQL
   , drainWith
   ) where
@@ -49,7 +50,7 @@ import Data.Pool (Pool, defaultPoolConfig, newPool, setNumStripes)
 import Data.String (fromString)
 import Data.Text (Text)
 import Data.Text qualified as T
-import Data.Time (UTCTime (..), picosecondsToDiffTime)
+import Data.Time (UTCTime (..), fromGregorian, picosecondsToDiffTime, secondsToDiffTime)
 import Database.PostgreSQL.LibPQ qualified as LibPQ
 import Database.PostgreSQL.Simple (Connection, Only (..), SqlError (..), close, connectPostgreSQL, execute, query)
 import Database.PostgreSQL.Simple.Internal qualified as PGS
@@ -209,6 +210,11 @@ drainWith fetch = go []
     go batches = do
       batch <- fetch
       if null batch then pure (concat (reverse batches)) else go (batch : batches)
+
+-- | A UTCTime from calendar and clock components.
+mkTime :: Integer -> Int -> Int -> Int -> Int -> Int -> UTCTime
+mkTime year month day hour minute second =
+  UTCTime (fromGregorian year month day) (secondsToDiffTime (fromIntegral (hour * 3600 + minute * 60 + second)))
 
 -- | Truncate to microsecond precision to match PostgreSQL @timestamptz@.
 truncateToMicros :: UTCTime -> UTCTime

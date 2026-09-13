@@ -20,11 +20,10 @@ module Arbiter.Core.Sql.Cron
 import Control.Monad (join)
 import Data.Maybe (isJust)
 import Data.Text (Text)
-import Data.Text qualified as T
 import Data.Time (UTCTime)
 import NeatInterpolation (text)
 
-import Arbiter.Core.Codec (codecColumns, cronScheduleRowCodec)
+import Arbiter.Core.Codec (codecColumns, cronScheduleRowCodec, joinColumns)
 import Arbiter.Core.CronSchedule (CronScheduleRow, CronScheduleUpdate (..), cronSchedulesTable)
 import Arbiter.Core.Job.Schema (cronRunNotifyChannel)
 import Arbiter.Core.Sql.QQ (sql)
@@ -33,7 +32,7 @@ import Arbiter.Core.SqlLiterals (textLiteral)
 
 -- | The @cron_schedules@ read columns, in codec order.
 allCronColumns :: Text
-allCronColumns = T.intercalate ", " (codecColumns cronScheduleRowCodec)
+allCronColumns = joinColumns (codecColumns cronScheduleRowCodec)
 
 -- | 'allCronColumns' with an expired @run_requested_at@ read back as NULL.
 cronReadColumns :: Text

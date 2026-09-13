@@ -21,7 +21,7 @@ import Data.Text qualified as T
 import Data.Time (UTCTime)
 import NeatInterpolation (text)
 
-import Arbiter.Core.Codec (archiveRowCodec, codecColumns, jobRowCodec)
+import Arbiter.Core.Codec (archiveRowCodec, codecColumns, jobRowCodec, joinColumns)
 import Arbiter.Core.Job.Schema (jobQueueArchiveTable, jobQueueTable)
 import Arbiter.Core.Job.Types (JobRead)
 import Arbiter.Core.Sql.Jobs (enqueuedAgainCols, jobColsExceptId, jobColumns)
@@ -31,7 +31,7 @@ import Arbiter.Core.Sql.Query (Query, rows)
 -- | The archive read columns, in codec order. The archive uses @job_id@ for the
 -- main-table @id@.
 allArchiveColumns :: Text
-allArchiveColumns = T.intercalate ", " (codecColumns (archiveRowCodec ""))
+allArchiveColumns = joinColumns (codecColumns (archiveRowCodec ""))
 
 -- | The @archived@ CTE teeing rows from the named @ack@ CTE into the archive, per-row
 -- on @archive_for@. @archive_expires_at@ is precomputed. Shared by single and batch ack.

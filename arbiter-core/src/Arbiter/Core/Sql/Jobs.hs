@@ -50,7 +50,7 @@ import Data.UUID.Types (UUID)
 import NeatInterpolation (text)
 
 import Arbiter.Core.Admission (excludedAssignment)
-import Arbiter.Core.Codec (codecColumns, dlqRowCodec, jobRowCodec, writeColumnNames)
+import Arbiter.Core.Codec (codecColumns, dlqRowCodec, jobRowCodec, joinColumns, writeColumnNames)
 import Arbiter.Core.Job.Schema
   ( SchemaName
   , TableName
@@ -326,16 +326,16 @@ countDLQFilteredSQL schema tableName whereFrag =
 
 -- | The job read columns, in codec order, for SELECT and RETURNING.
 jobColumns :: Text
-jobColumns = T.intercalate ", " (codecColumns (jobRowCodec ""))
+jobColumns = joinColumns (codecColumns (jobRowCodec ""))
 
 -- | The DLQ read columns, in codec order. The DLQ uses @job_id@ for the main-table @id@.
 allDLQColumns :: Text
-allDLQColumns = T.intercalate ", " (codecColumns (dlqRowCodec ""))
+allDLQColumns = joinColumns (codecColumns (dlqRowCodec ""))
 
 -- | The job read columns except @id@. The archive INSERT copies them with the main
 -- table's @id@ as @job_id@.
 jobColsExceptId :: Text
-jobColsExceptId = T.intercalate ", " (drop 1 (codecColumns (jobRowCodec "")))
+jobColsExceptId = joinColumns (drop 1 (codecColumns (jobRowCodec "")))
 
 -- | Job columns carried through a DLQ round-trip. The read columns except @id@ and
 -- @last_error@, plus write-only @rate_limit_cost@.

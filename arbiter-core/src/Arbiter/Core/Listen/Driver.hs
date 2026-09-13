@@ -29,7 +29,7 @@ data ListenDriver conn = ListenDriver
   , socket :: conn -> IO (Maybe Fd)
   , consumeInput :: conn -> IO Bool
   , exec :: conn -> ByteString -> IO (Either Text ())
-  -- ^ Run a command, reporting why it failed.
+  -- ^ Run a command. A failure comes back as its reason.
   , escapeIdentifier :: conn -> ByteString -> IO (Maybe ByteString)
   }
 

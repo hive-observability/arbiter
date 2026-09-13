@@ -21,7 +21,7 @@ import Test.Arbiter.Orville.TestHelpers
   , destroyOrvilleTestEnv
   , runOrvilleTest
   )
-import Test.Arbiter.Orville.Worker (OrvilleWorkerTestPayload, orvilleBackend)
+import Test.Arbiter.Orville.Worker (OrvilleWorkerTestPayload, withOrvilleBackend)
 
 listenSchema :: Text
 listenSchema = "arbiter_orville_listen_test"
@@ -29,9 +29,7 @@ listenSchema = "arbiter_orville_listen_test"
 type OrvilleListenRegistry = '[Queue "arbiter_orville_listen_test" OrvilleWorkerTestPayload]
 
 listenerSpec :: ByteString -> Spec
-listenerSpec connStr =
-  beforeAll (setupOnce connStr listenSchema listenSchema True) $
-    TestKit.listenerSpec (orvilleBackend @OrvilleListenRegistry connStr listenSchema)
+listenerSpec connStr = withOrvilleBackend @OrvilleListenRegistry connStr listenSchema TestKit.listenerSpec
 
 mqSchema :: Text
 mqSchema = "arbiter_orville_mq_test"

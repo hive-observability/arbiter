@@ -19,6 +19,7 @@ module Arbiter.Core.Codec
   , ncol
   , runCodec
   , codecColumns
+  , joinColumns
 
     -- * Parameter encoding
   , ParamType (..)
@@ -62,6 +63,7 @@ import Data.Aeson (Value)
 import Data.Int (Int32, Int64)
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
+import Data.Text qualified as T
 import Data.Time (UTCTime)
 import Data.UUID.Types (UUID)
 
@@ -128,6 +130,10 @@ codecColumns = runAp_ colName
     colName :: NullCol a -> [Text]
     colName (NotNull name _) = [name]
     colName (Nullable name _) = [name]
+
+-- | Column names as a comma-separated SQL list.
+joinColumns :: [Text] -> Text
+joinColumns = T.intercalate ", "
 
 -- | How a parameter is shaped: scalar, nullable, or array.
 data ParamType a where

@@ -12,7 +12,7 @@ module Arbiter.Worker.TestKit.Rows
   ) where
 
 import Arbiter.Core.Job.Schema (jobQueueTable)
-import Arbiter.Test.Setup (withConn)
+import Arbiter.Test.Setup (execute_, withConn)
 import Control.Concurrent (threadDelay)
 import Control.Monad (void)
 import Data.ByteString (ByteString)
@@ -46,17 +46,12 @@ releaseRow connStr schema table = updateJob connStr schema table "claimed_by = N
 -- | Take every open claim without bumping its token. The extend then reports 'VisibilityUnchanged'.
 takeClaimHolder :: ByteString -> Text -> Text -> IO ()
 takeClaimHolder connStr schema table = withConn connStr $ \conn ->
-  void $
-    PG.execute_
-      conn
-      ( fromString
-          ( T.unpack
-              ( "UPDATE "
-                  <> jobQueueTable schema table
-                  <> " SET claimed_by = '00000000-0000-0000-0000-000000000009'::uuid WHERE claimed_by IS NOT NULL"
-              )
-          )
-      )
+  execute_
+    conn
+    ( "UPDATE "
+        <> jobQueueTable schema table
+        <> " SET claimed_by = '00000000-0000-0000-0000-000000000009'::uuid WHERE claimed_by IS NOT NULL"
+    )
 
 -- | Hold a row lock on one job for @micros@, as a transaction touching it would.
 holdRowLock :: ByteString -> Text -> Text -> Int64 -> Int -> IO ()

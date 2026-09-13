@@ -53,7 +53,7 @@ import Arbiter.Worker.Config
 import Arbiter.Worker.Logger (silentLogConfig)
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
-import Control.Exception (SomeException, bracket, finally, throwIO, try)
+import Control.Exception (SomeException, finally, throwIO, try)
 import Control.Monad (void, when)
 import Control.Monad.IO.Class (liftIO)
 import Data.ByteString (ByteString)
@@ -78,7 +78,7 @@ import System.Directory qualified as Dir
 import System.Timeout (timeout)
 import Test.Hspec
   ( Spec
-  , around
+  , before
   , describe
   , expectationFailure
   , it
@@ -107,8 +107,8 @@ lifecycleSpec
      )
   => TestBackend payload m env
   -> Spec
-lifecycleSpec TestBackend {schema, table, connStr, mkSimple, mkEnv, mkEnvPollOnly, destroyEnv, mkHandler, runCommand, runM} =
-  around (bracket mkEnv destroyEnv) $ do
+lifecycleSpec TestBackend {schema, table, connStr, mkSimple, mkEnv, pollOnly, mkHandler, runCommand, runM} =
+  before mkEnv $ do
     describe "Reaper op bounding" $ do
       it "completes an op longer than the timeout when each statement is within it" $ \env -> do
         let sleep = runCommand "DO $$ BEGIN PERFORM pg_sleep(0.4); END $$"
@@ -1089,11 +1089,11 @@ lifecycleSpec TestBackend {schema, table, connStr, mkSimple, mkEnv, mkEnvPollOnl
           cancelled `shouldBe` 1
           -- Let cancellation propagate.
           threadDelay 500_000
-          before <- readIORef counterRef
+          countBefore <- readIORef counterRef
           threadDelay 500_000
-          after <- readIORef counterRef
+          countAfter <- readIORef counterRef
           -- The counter freezes. A live handler bumps it millions of times in 500ms.
-          after `shouldBe` before
+          countAfter `shouldBe` countBefore
 
       it "cancelling one job of a batch interrupts the whole batch handler" $ \env -> do
         -- A batch runs in a single handler thread. All its job ids point at the
@@ -1135,45 +1135,45 @@ lifecycleSpec TestBackend {schema, table, connStr, mkSimple, mkEnv, mkEnvPollOnl
           dlqJobs <- runM env $ HL.listDLQJobs 10 0 :: IO [DLQ.DLQJob payload]
           dlqJobs `shouldBe` []
 
-      it "interrupts a running handler in poll-only mode via the flag" $ \env ->
-        bracket mkEnvPollOnly destroyEnv $ \pollEnv -> do
-          -- With no listener, the heartbeat polls cancel_requested_at and throws
-          -- into the handler.
-          startedRef <- newIORef False
-          completedRef <- newIORef False
-          let handler :: JobRead payload -> m ()
-              handler _job = do
-                liftIO $ writeIORef startedRef True
-                liftIO $ threadDelay 30_000_000
-                liftIO $ writeIORef completedRef True
+      it "interrupts a running handler in poll-only mode via the flag" $ \env -> do
+        let pollEnv = pollOnly env
+        -- With no listener, the heartbeat polls cancel_requested_at and throws
+        -- into the handler.
+        startedRef <- newIORef False
+        completedRef <- newIORef False
+        let handler :: JobRead payload -> m ()
+            handler _job = do
+              liftIO $ writeIORef startedRef True
+              liftIO $ threadDelay 30_000_000
+              liftIO $ writeIORef completedRef True
 
-          baseConfig :: WorkerConfig m payload <- transactionalWorkerConfig 1 (mkHandler (noResult handler))
-          let config =
-                baseConfig
-                  { workerCount = 1
-                  , pollInterval = 0.2
-                  , jobHeartbeatInterval = 0.3
-                  , visibilityTimeout = 3
-                  }
+        baseConfig :: WorkerConfig m payload <- transactionalWorkerConfig 1 (mkHandler (noResult handler))
+        let config =
+              baseConfig
+                { workerCount = 1
+                , pollInterval = 0.2
+                , jobHeartbeatInterval = 0.3
+                , visibilityTimeout = 3
+                }
 
-          Just job <- runM env $ HL.insertJob (defaultJob (mkSimple "poll-cancel"))
+        Just job <- runM env $ HL.insertJob (defaultJob (mkSimple "poll-cancel"))
 
-          withLinkedAsync (runM pollEnv $ runWorkerPool config) $ \_ -> do
-            waitUntil 5_000 $ readIORef startedRef
+        withLinkedAsync (runM pollEnv $ runWorkerPool config) $ \_ -> do
+          waitUntil 5_000 $ readIORef startedRef
 
-            start <- getCurrentTime
-            cancelled <- runM env $ Ops.forceCancelJob schema table (primaryKey job)
-            cancelled `shouldBe` 1
+          start <- getCurrentTime
+          cancelled <- runM env $ Ops.forceCancelJob schema table (primaryKey job)
+          cancelled `shouldBe` 1
 
-            waitUntil 5_000 $ do
-              mJob <- runM env $ HL.getJobById @payload (primaryKey job)
-              pure (isNothing mJob)
-            elapsed <- (`diffUTCTime` start) <$> getCurrentTime
-            elapsed `shouldSatisfy` (< 3.0)
+          waitUntil 5_000 $ do
+            mJob <- runM env $ HL.getJobById @payload (primaryKey job)
+            pure (isNothing mJob)
+          elapsed <- (`diffUTCTime` start) <$> getCurrentTime
+          elapsed `shouldSatisfy` (< 3.0)
 
-            readIORef completedRef `shouldReturn` False
-            dlqJobs <- runM env $ HL.listDLQJobs 10 0 :: IO [DLQ.DLQJob payload]
-            dlqJobs `shouldBe` []
+          readIORef completedRef `shouldReturn` False
+          dlqJobs <- runM env $ HL.listDLQJobs 10 0 :: IO [DLQ.DLQJob payload]
+          dlqJobs `shouldBe` []
 
       it "flags a job that is claimed concurrently with the force-cancel" $ \env -> do
         Just job <- runM env $ HL.insertJob (defaultJob (mkSimple "concurrent-claim"))
@@ -1204,7 +1204,7 @@ lifecycleSpec TestBackend {schema, table, connStr, mkSimple, mkEnv, mkEnvPollOnl
             PG.query
               conn
               ( fromString . T.unpack $
-                  "SELECT cancel_requested_at IS NOT NULL FROM " <> schema <> "." <> table <> " WHERE id = ?"
+                  "SELECT cancel_requested_at IS NOT NULL FROM " <> Schema.jobQueueTable schema table <> " WHERE id = ?"
               )
               (Only jid)
               :: IO [Only Bool]
@@ -1222,7 +1222,7 @@ lifecycleSpec TestBackend {schema, table, connStr, mkSimple, mkEnv, mkEnvPollOnl
             PG.execute
               conn
               ( fromString . T.unpack $
-                  "UPDATE " <> schema <> "." <> table <> " SET not_visible_until = NOW() - interval '1 second' WHERE id = ?"
+                  "UPDATE " <> Schema.jobQueueTable schema table <> " SET not_visible_until = NOW() - interval '1 second' WHERE id = ?"
               )
               (Only jid)
 
@@ -1341,7 +1341,7 @@ lifecycleSpec TestBackend {schema, table, connStr, mkSimple, mkEnv, mkEnvPollOnl
         let jid = primaryKey job
             expire =
               fromString . T.unpack $
-                "UPDATE " <> schema <> "." <> table <> " SET not_visible_until = NOW() - interval '1 second' WHERE id = ?"
+                "UPDATE " <> Schema.jobQueueTable schema table <> " SET not_visible_until = NOW() - interval '1 second' WHERE id = ?"
 
         [stale] <- runM env (HL.claimNextVisibleJobsAs 1 60 staleWorker) :: IO [JobRead payload]
         primaryKey stale `shouldBe` jid
@@ -1552,7 +1552,7 @@ recordOp schema jobId =
 lockJobRow :: Text -> Text -> PG.Connection -> Int64 -> IO (Either SomeException [Only Int64])
 lockJobRow schema table conn jobId = try (PG.query conn lockSql (Only jobId))
   where
-    lockSql = fromString . T.unpack $ "SELECT id FROM " <> schema <> "." <> table <> " WHERE id = ? FOR UPDATE"
+    lockSql = fromString . T.unpack $ "SELECT id FROM " <> Schema.jobQueueTable schema table <> " WHERE id = ? FOR UPDATE"
 
 withTestOpsTable :: ByteString -> Text -> IO a -> IO a
 withTestOpsTable connStr schema action = do

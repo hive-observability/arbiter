@@ -26,7 +26,6 @@ import Control.Monad.IO.Class (liftIO)
 import Data.Foldable (traverse_)
 import Data.IORef (atomicModifyIORef', newIORef, readIORef)
 import Test.Hspec
-import UnliftIO (bracket)
 
 import Arbiter.Worker.TestKit.Backend (TestBackend (..))
 import Arbiter.Worker.TestKit.Rows (reclaimJob)
@@ -46,8 +45,8 @@ reclaimSpec
      )
   => TestBackend payload m env
   -> Spec
-reclaimSpec TestBackend {schema, table, connStr, mkSimple, mkFailing, mkEnv, destroyEnv, mkHandler, runM} =
-  around (bracket mkEnv destroyEnv) $ do
+reclaimSpec TestBackend {schema, table, connStr, mkSimple, mkFailing, mkEnv, mkHandler, runM} =
+  before mkEnv $ do
     describe "Job Reclaim During Processing" $ do
       it "gracefully skips retry when job is reclaimed by another worker" $ \env -> do
         failureCalls <- newIORef (0 :: Int)
