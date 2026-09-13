@@ -13,9 +13,8 @@ module Arbiter.Simple.SimpleDb
   ( -- * Database Monad
     SimpleDb (..)
   , SimpleEnv
-  , Db (..)
+  , Db
   , Env (..)
-  , Driver (..)
   , PoolState (..)
   , HasPoolState (..)
   , runSimpleDb
@@ -31,7 +30,7 @@ module Arbiter.Simple.SimpleDb
   ) where
 
 import Arbiter.Core.Backend
-  ( Db (..)
+  ( Db
   , Driver (..)
   , Env (..)
   , HasPoolState (..)

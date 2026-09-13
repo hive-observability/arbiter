@@ -6,8 +6,9 @@
 module Test.Arbiter.Simple.RateLimit (spec) where
 
 import Arbiter.Test.RateLimit (RLReg, rateLimitSpec, rateLimitTable, setupRateLimitPolicy)
-import Arbiter.Test.Setup (cleanupOnce, createSharedPool, setupOnce)
+import Arbiter.Test.Setup (cleanupData, createSharedPool, setupOnce)
 import Data.ByteString (ByteString)
+import Data.Pool (withResource)
 import Data.Proxy (Proxy (..))
 import Data.Text (Text)
 import Test.Hspec
@@ -22,5 +23,5 @@ spec connStr =
   beforeAll (setupOnce connStr testSchema rateLimitTable False >> setupRateLimitPolicy connStr testSchema) $ do
     sharedPool <- runIO (createSharedPool connStr)
     mkEnv <- runIO (createSimpleEnvWithPool (Proxy @RLReg) sharedPool testSchema)
-    around (\action -> cleanupOnce connStr testSchema rateLimitTable >> action mkEnv) $
+    around (\action -> withResource sharedPool (cleanupData testSchema rateLimitTable) >> action mkEnv) $
       rateLimitSpec runSimpleDb

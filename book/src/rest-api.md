@@ -133,7 +133,7 @@ claim the job.
 
 > [!IMPORTANT]
 > These routes have no authentication. Add WAI middleware, a Servant
-> authentication combinator, or an authenticating proxy before exposing them.
+> authentication combinator, or an authenticating proxy before you expose them.
 
 ## Maintenance
 

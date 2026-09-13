@@ -2,12 +2,10 @@
 
 -- | A 'ListenConn' and an interruptible connect over any libpq-shaped driver.
 module Arbiter.Core.Listen.Driver
-  ( ListenDriver (..)
-  , ConnectDriver (..)
+  ( ConnectDriver (..)
   , ConnStatus (..)
   , Polling (..)
   , execOutcome
-  , driverListenConn
   , withDriverListenConn
   ) where
 
@@ -21,17 +19,7 @@ import Data.Text qualified as T
 import System.Posix.Types (Fd)
 
 import Arbiter.Core.Exceptions (throwInternal)
-import Arbiter.Core.Listen (ListenConn (..), Notification (..))
-
--- | The driver calls the hub loop runs on an open connection.
-data ListenDriver conn = ListenDriver
-  { notifies :: conn -> IO (Maybe Notification)
-  , socket :: conn -> IO (Maybe Fd)
-  , consumeInput :: conn -> IO Bool
-  , exec :: conn -> ByteString -> IO (Either Text ())
-  -- ^ Run a command. A failure comes back as its reason.
-  , escapeIdentifier :: conn -> ByteString -> IO (Maybe ByteString)
-  }
+import Arbiter.Core.Listen (ListenConn (..))
 
 -- | Where an asynchronous connect stands.
 data ConnStatus = ConnOk | ConnBad | ConnPending
@@ -58,29 +46,18 @@ execOutcome okStatus resultStatus = maybe (pure (Left "returned no result")) (fm
       | st == okStatus = Right ()
       | otherwise = Left ("failed with " <> T.pack (show st))
 
--- | A 'ListenConn' over a driver connection.
-driverListenConn :: ListenDriver conn -> conn -> ListenConn
-driverListenConn driver conn =
-  ListenConn
-    { listenNotifies = notifies driver conn
-    , listenSocket = socket driver conn
-    , listenConsumeInput = consumeInput driver conn
-    , listenExec = exec driver conn
-    , listenEscapeIdentifier = escapeIdentifier driver conn
-    }
-
 -- | Run an action on a connection of its own, opened from a connection string.
 withDriverListenConn
   :: ConnectDriver conn
-  -> ListenDriver conn
+  -> (conn -> ListenConn)
   -> ByteString
   -> (ListenConn -> IO a)
   -> IO a
-withDriverListenConn connector driver connStr action =
-  bracket (interruptibleConnect connector (socket driver) connStr) (finish connector) $ \conn -> do
+withDriverListenConn connector toConn connStr action =
+  bracket (interruptibleConnect connector (listenSocket . toConn) connStr) (finish connector) $ \conn -> do
     st <- status connector conn
     if st == ConnOk
-      then action (driverListenConn driver conn)
+      then action (toConn conn)
       else do
         merr <- errorMessage connector conn
         throwInternal $ "connect failed" <> foldMap ((": " <>) . T.pack . BSC.unpack) merr

@@ -7,7 +7,7 @@ module Test.Arbiter.Simple.ConcurrencyLimit (spec) where
 
 import Arbiter.Test.ConcurrencyLimit (CLReg, concurrencyLimitSpec, concurrencyTable)
 import Arbiter.Test.ConcurrencyModel (concurrencyModelSpec)
-import Arbiter.Test.Setup (cleanupOnce, createSharedPool, setupOnce)
+import Arbiter.Test.Setup (cleanupData, createSharedPool, setupOnce)
 import Data.ByteString (ByteString)
 import Data.Pool (withResource)
 import Data.Proxy (Proxy (..))
@@ -29,6 +29,6 @@ spec connStr =
         run = runSimpleDb mkEnv
         withConn :: forall a. (PG.Connection -> IO a) -> IO a
         withConn = withResource sharedPool
-    around (\action -> cleanupOnce connStr testSchema concurrencyTable >> action mkEnv) $
+    around (\action -> withConn (cleanupData testSchema concurrencyTable) >> action mkEnv) $
       concurrencyLimitSpec runSimpleDb
     concurrencyModelSpec run withConn testSchema

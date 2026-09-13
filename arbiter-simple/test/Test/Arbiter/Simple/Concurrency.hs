@@ -15,7 +15,7 @@ import Arbiter.Test.Concurrency
   , removeHolDetector
   )
 import Arbiter.Test.Fixtures (TestPayload (..))
-import Arbiter.Test.Setup (cleanupOnce, createPoolOf, setupOnce)
+import Arbiter.Test.Setup (cleanupData, createPoolOf, setupOnce)
 import Control.Concurrent (threadDelay)
 import Control.Monad (forM_, replicateM_, void, when)
 import Data.ByteString (ByteString)
@@ -41,7 +41,7 @@ spec :: ByteString -> Spec
 spec connStr = beforeAll (setupOnce connStr testSchema testTable False) $ do
   sharedPool <- runIO (createPoolOf 10 connStr)
   sharedEnv <- runIO (createSimpleEnvWithPool (Proxy @SimpleConcurrencyTestRegistry) sharedPool testSchema)
-  around (\action -> cleanupOnce connStr testSchema testTable >> action sharedEnv) $ do
+  around (\action -> withResource sharedPool (cleanupData testSchema testTable) >> action sharedEnv) $ do
     concurrencySpec @TestPayload TestMessage runSimpleDb
     raceConditionSpec @TestPayload TestMessage runSimpleDb
 

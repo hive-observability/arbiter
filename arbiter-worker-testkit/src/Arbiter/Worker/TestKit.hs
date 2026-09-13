@@ -148,16 +148,9 @@ workerSpec
      , ResultOf m payload ~ Maybe [Text]
      , Show payload
      )
-  => (Text -> payload)
-  -- ^ Construct a simple task payload
-  -> (Int -> payload)
-  -- ^ Construct a failing task payload
-  -> ((JobRead payload -> m (ResultOf m payload)) -> JobHandler m payload (ResultOf m payload))
-  -- ^ Adapt a job action into the backend's handler shape
-  -> (forall a. env -> m a -> IO a)
-  -- ^ Runner function (e.g. runSimpleDb env or runOrvilleTest env)
-  -> SpecWith env
-workerSpec mkSimple mkFailing mkHandler runM = do
+  => TestBackend payload m env
+  -> Spec
+workerSpec TestBackend {mkSimple, mkFailing, mkEnv, mkHandler, runM} = before mkEnv $ do
   describe "Worker Pool" $ do
     it "processes jobs successfully" $ \env -> do
       completedRef <- newIORef []

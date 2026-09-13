@@ -1,8 +1,8 @@
 # Concurrency Limiting
 
-A pool limits jobs in flight per key across every queue in the registry. A
-pool is a prefix and a default limit. `HasConcurrency` selects a pool and key
-for each job.
+A pool is a prefix and a default limit. It caps jobs in flight per key across
+every queue in the registry. `HasConcurrency` selects a pool and key for each
+job.
 
 ```haskell
 import Arbiter.Concurrency (ConcurrencyPolicy, HasConcurrency (..), concurrencyBy, concurrencyPool)
@@ -20,8 +20,8 @@ instance HasConcurrency SyncPayload where
 
 Selectors: `noConcurrency`, `concurrencyBy`, `globalConcurrency`,
 `concurrencyByCase`. An operator can override the limit from the API or admin
-UI. Clearing the override restores the declared
-default. Limit 0 admits nothing.
+UI. If you clear the override, the declared default applies. Limit 0 admits
+nothing.
 
 ## Concurrency Limit 1 and Group Keys
 
@@ -37,7 +37,7 @@ Both admit one in-flight job per key.
 A job can use both.
 
 > [!IMPORTANT]
-> A slot is held from claim until ack, retry, nack, or reclaim. A handler
+> A job holds a slot from claim until ack, retry, nack, or reclaim. A handler
 > timeout does not release it.
 >
 > The reaper prunes idle keys and rebuilds in-flight counts after a restart or

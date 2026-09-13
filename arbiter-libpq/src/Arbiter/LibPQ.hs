@@ -5,29 +5,17 @@ module Arbiter.LibPQ
   , newLibPQListener
   ) where
 
-import Arbiter.Core.Listen (ListenConn, Listener, Notification (..), newListener)
+import Arbiter.Core.Listen (ListenConn (..), Listener, Notification (..), newListener)
 import Arbiter.Core.Listen.Driver
   ( ConnStatus (..)
   , ConnectDriver (..)
-  , ListenDriver (..)
   , Polling (..)
-  , driverListenConn
   , execOutcome
   , withDriverListenConn
   )
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Data.ByteString (ByteString)
 import Database.PostgreSQL.LibPQ qualified as PQ
-
-listenDriver :: ListenDriver PQ.Connection
-listenDriver =
-  ListenDriver
-    { notifies = fmap (fmap (Notification <$> PQ.notifyRelname <*> PQ.notifyExtra)) . PQ.notifies
-    , socket = PQ.socket
-    , consumeInput = PQ.consumeInput
-    , exec = \conn sql -> PQ.exec conn sql >>= execOutcome PQ.CommandOk PQ.resultStatus
-    , escapeIdentifier = PQ.escapeIdentifier
-    }
 
 connectDriver :: ConnectDriver PQ.Connection
 connectDriver =
@@ -48,11 +36,18 @@ connectDriver =
 
 -- | A 'ListenConn' over a libpq connection.
 libpqListenConn :: PQ.Connection -> ListenConn
-libpqListenConn = driverListenConn listenDriver
+libpqListenConn conn =
+  ListenConn
+    { listenNotifies = fmap (fmap (Notification <$> PQ.notifyRelname <*> PQ.notifyExtra)) (PQ.notifies conn)
+    , listenSocket = PQ.socket conn
+    , listenConsumeInput = PQ.consumeInput conn
+    , listenExec = \sql -> PQ.exec conn sql >>= execOutcome PQ.CommandOk PQ.resultStatus
+    , listenEscapeIdentifier = PQ.escapeIdentifier conn
+    }
 
 -- | Run an action on a libpq connection of its own, opened from a connection string.
 withLibPQListenConn :: ByteString -> (ListenConn -> IO a) -> IO a
-withLibPQListenConn = withDriverListenConn connectDriver listenDriver
+withLibPQListenConn = withDriverListenConn connectDriver libpqListenConn
 
 -- | A 'Listener' over its own libpq connection, opened from a connection string.
 newLibPQListener :: (MonadIO m) => ByteString -> m Listener

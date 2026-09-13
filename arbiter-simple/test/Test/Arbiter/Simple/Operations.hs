@@ -7,15 +7,13 @@ module Test.Arbiter.Simple.Operations (spec) where
 
 import Arbiter.Core.HighLevel qualified as HL
 import Arbiter.Core.Job.Types
-import Arbiter.Core.MonadArbiter (withDbTransaction)
 import Arbiter.Core.QueueRegistry (QueueSpec (..))
 import Arbiter.Test.Fixtures (TestPayload (..))
 import Arbiter.Test.Operations (operationsSpec)
-import Arbiter.Test.Setup (cleanupOnce, createSharedPool, execute_, setupOnce)
+import Arbiter.Test.Setup (cleanupData, createSharedPool, execute_, setupOnce)
 import Control.Concurrent (threadDelay)
 import Control.Exception (SomeException, catch, throwIO)
 import Data.ByteString (ByteString)
-import Data.Maybe (isJust)
 import Data.Pool (withResource)
 import Data.Proxy (Proxy (..))
 import Data.Text (Text)
@@ -23,7 +21,7 @@ import Database.PostgreSQL.Simple qualified as PG
 import Test.Hspec
 import UnliftIO.Async (async, wait)
 
-import Arbiter.Simple.SimpleDb (PoolState (..), createSimpleEnvWithPool, inTransaction, localPoolState, runSimpleDb)
+import Arbiter.Simple.SimpleDb (createSimpleEnvWithPool, inTransaction, runSimpleDb)
 
 testSchema :: Text
 testSchema = "arbiter_simple_test"
@@ -37,20 +35,10 @@ spec :: ByteString -> Spec
 spec connStr = beforeAll (setupOnce connStr testSchema testTable False) $ do
   sharedPool <- runIO (createSharedPool connStr)
   sharedEnv <- runIO (createSimpleEnvWithPool (Proxy @SimpleOpsTestRegistry) sharedPool testSchema)
-  around (\action -> cleanupOnce connStr testSchema testTable >> action sharedEnv) $ do
+  around (\action -> withResource sharedPool (cleanupData testSchema testTable) >> action sharedEnv) $ do
     operationsSpec @TestPayload TestMessage pure runSimpleDb
 
     describe "Transaction Participation (localConnection)" $ do
-      it "opens a transaction on a pool connection when only the depth is set" $ \env -> do
-        let job = setGroupKey (Just "g1") $ defaultJob (TestMessage "DepthOnly")
-        inserted <-
-          runSimpleDb env
-            $ localPoolState (\st -> st {transactionDepth = 1})
-            $ withDbTransaction (HL.insertJob job)
-        inserted `shouldSatisfy` isJust
-        claimed <- runSimpleDb env (HL.claimNextVisibleJobs 1 60) :: IO [JobRead TestPayload]
-        length claimed `shouldBe` 1
-
       it "commits job insertion within user transaction" $ \env -> do
         let job = setGroupKey (Just "g1") $ defaultJob (TestMessage "InTx")
 

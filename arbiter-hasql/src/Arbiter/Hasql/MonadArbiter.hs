@@ -29,7 +29,6 @@ module Arbiter.Hasql.MonadArbiter
   , hasqlExecuteStatement
   , hasqlWithDbTransaction
   , hasqlRunHandlerWithConnection
-  , localHasqlConnection
   ) where
 
 import Arbiter.Core.Backend (HasPoolState (..), PoolState (..), withConn, withSavepointTransaction)
@@ -48,11 +47,6 @@ import UnliftIO.Exception (SomeException, try)
 import Arbiter.Hasql.Compat (connectionInTransaction, runSQL)
 import Arbiter.Hasql.Decode qualified as Decode
 import Arbiter.Hasql.Encode qualified as Encode
-
--- | Pin a hasql connection for the callback. Every arbiter operation inside it runs on
--- that connection. The caller has already issued its @BEGIN@.
-localHasqlConnection :: (HasPoolState Hasql.Connection m) => Hasql.Connection -> m a -> m a
-localHasqlConnection conn = localPoolState (\pool -> pool {activeConn = Just conn, transactionDepth = 1})
 
 -- | Run a query unprepared, decoding rows.
 hasqlExecuteQuery
@@ -117,6 +111,6 @@ hasqlRunHandlerWithConnection
   -> m result
 hasqlRunHandlerWithConnection handler job = do
   pool <- getPoolState
-  case activeConn pool of
+  case fst <$> pinned pool of
     Just conn -> handler conn job
     Nothing -> throwInternal "hasqlRunHandlerWithConnection: no active connection"

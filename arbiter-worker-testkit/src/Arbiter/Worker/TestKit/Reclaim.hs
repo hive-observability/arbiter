@@ -127,15 +127,18 @@ reclaimSpec TestBackend {schema, table, connStr, mkSimple, mkFailing, mkEnv, mkH
 
     describe "Heartbeat Stolen Job Detection" $ do
       it "heartbeat cancels handler via race when job is stolen mid-processing" $ \env -> do
-        handlerStarted <- newIORef False
         handlerCompleted <- newIORef False
+        unavailableCalls <- newIORef (0 :: Int)
+
+        let hooks =
+              defaultObservabilityHooks
+                { onJobUnavailable = \_ _ -> liftIO $ atomicModifyIORef' unavailableCalls (\count -> (count + 1, ()))
+                }
 
         Just inserted <- runM env $ HL.insertJob (defaultJob (mkSimple "slow"))
         let jobId = primaryKey inserted
 
         let jobHandler _job = liftIO $ do
-              atomicModifyIORef' handlerStarted (\_ -> (True, ()))
-              threadDelay 200_000
               reclaimJob connStr schema table jobId
               threadDelay 5_000_000
               atomicModifyIORef' handlerCompleted (\_ -> (True, ()))
@@ -143,7 +146,8 @@ reclaimSpec TestBackend {schema, table, connStr, mkSimple, mkFailing, mkEnv, mkH
         config :: WorkerConfig m payload <- transactionalWorkerConfig 10 (mkHandler jobHandler)
         let configWithHooks =
               config
-                { pollInterval = 0.1
+                { observabilityHooks = hooks
+                , pollInterval = 0.1
                 , visibilityTimeout = 2
                 , jobHeartbeatInterval = 1
                 }
@@ -151,10 +155,7 @@ reclaimSpec TestBackend {schema, table, connStr, mkSimple, mkFailing, mkEnv, mkH
         withLinkedAsync
           (runM env $ runWorkerPool configWithHooks)
           $ \_ ->
-            waitUntil 10_000 $ readIORef handlerStarted
-
-        started <- readIORef handlerStarted
-        started `shouldBe` True
+            waitUntil 10_000 $ (== 1) <$> readIORef unavailableCalls
 
         completed <- readIORef handlerCompleted
         completed `shouldBe` False

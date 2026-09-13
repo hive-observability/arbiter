@@ -46,8 +46,8 @@ let instrumented = Worker.withHooks (myHooks <>) config
 
 ## Hook Restrictions
 
-Return values are discarded. An exception is logged at `Warning` and the
-worker continues.
+A hook's return value is ignored. If a hook throws, the worker logs the
+exception at `Warning` and carries on.
 
 `onJobSuccess` can fire for a job that is later redelivered. See
 [Batched Handlers](batched-handlers.md).

@@ -42,11 +42,10 @@ import Arbiter.Core.Listen (ListenConn, Listener, newListener)
 import Arbiter.Core.PoolConfig (PoolConfig (..))
 import Arbiter.Core.QueueRegistry (JobPayloadRegistry)
 
--- | Pool, pinned connection, and savepoint depth.
+-- | Pool and the pinned connection with its transaction depth.
 data PoolState conn = PoolState
   { connectionPool :: Maybe (Pool conn)
-  , activeConn :: Maybe conn
-  , transactionDepth :: Int
+  , pinned :: Maybe (conn, Int)
   }
 
 -- | Ambient access to the pool state.
@@ -99,7 +98,7 @@ inTransaction drv conn schemaName =
   runDb
     Env
       { schema = schemaName
-      , poolState = PoolState {connectionPool = Nothing, activeConn = Just conn, transactionDepth = 1}
+      , poolState = PoolState {connectionPool = Nothing, pinned = Just (conn, 1)}
       , listener = Nothing
       , driverConfig = initialConfig drv
       }
@@ -146,7 +145,7 @@ createEnvWithPool drv connPool schemaName = liftIO $ do
   pure
     Env
       { schema = schemaName
-      , poolState = PoolState {connectionPool = Just connPool, activeConn = Nothing, transactionDepth = 0}
+      , poolState = PoolState {connectionPool = Just connPool, pinned = Nothing}
       , listener = Just lstn
       , driverConfig = initialConfig drv
       }
@@ -155,14 +154,14 @@ createEnvWithPool drv connPool schemaName = liftIO $ do
 withConn :: (HasPoolState conn m, MonadUnliftIO m) => (conn -> m a) -> m a
 withConn action = do
   pool <- getPoolState
-  case (activeConn pool, connectionPool pool) of
+  case (fst <$> pinned pool, connectionPool pool) of
     (Just conn, _) -> action conn
     (Nothing, Just connPool) -> withRunInIO $ \run -> withResource connPool (run . action)
     (Nothing, Nothing) -> throwInternal noConnection
 
 -- | Pin one pooled connection for the action.
 pinConnection :: (HasPoolState conn m, MonadUnliftIO m) => m a -> m a
-pinConnection action = withConn $ \conn -> localPoolState (\st -> st {activeConn = Just conn}) action
+pinConnection action = withConn $ \conn -> localPoolState (\st -> st {pinned = Just (conn, maybe 0 snd (pinned st))}) action
 
 -- | Transaction bracket over the backend's own bracket and statement runner. Nests via savepoints.
 withSavepointTransaction
@@ -173,19 +172,19 @@ withSavepointTransaction
   -> m a
 withSavepointTransaction runSql transaction action = do
   st <- getPoolState
-  case (activeConn st, transactionDepth st) of
-    (Just conn, depth) | depth > 0 -> mask $ \restore -> do
+  case pinned st of
+    Just (conn, depth) | depth > 0 -> mask $ \restore -> do
       let spName = "arbiter_sp_" <> BSC.pack (show depth)
       liftIO $ runSql conn ("SAVEPOINT " <> spName)
       result <-
-        restore (localPoolState (\s -> s {transactionDepth = depth + 1}) action)
+        restore (localPoolState (\s -> s {pinned = Just (conn, depth + 1)}) action)
           `onException` liftIO (runSql conn ("ROLLBACK TO SAVEPOINT " <> spName))
       liftIO $ runSql conn ("RELEASE SAVEPOINT " <> spName)
       pure result
     _ -> withConn $ \conn -> withRunInIO $ \run ->
       transaction conn
         $ run
-        $ localPoolState (\s -> s {activeConn = Just conn, transactionDepth = 1}) action
+        $ localPoolState (\s -> s {pinned = Just (conn, 1)}) action
 
 noConnection :: Text
 noConnection = "No active connection and no connection pool available"

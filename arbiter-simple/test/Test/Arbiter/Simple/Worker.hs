@@ -20,7 +20,7 @@ import Arbiter.Core.MonadArbiter (JobHandler)
 import Arbiter.Core.QueueRegistry (Queue, QueueSpec (..))
 import Arbiter.Test.Fixtures (WorkerTestPayload (..))
 import Arbiter.Test.Poll (waitUntil, withLinkedAsync)
-import Arbiter.Test.Setup (addQueueTable, cleanupOnce, createPoolOf, createSharedPool, setupOnce)
+import Arbiter.Test.Setup (addQueueTable, cleanupData, cleanupOnce, createPoolOf, createSharedPool, setupOnce)
 import Arbiter.Worker (runWorkerPool)
 import Arbiter.Worker.BackoffStrategy (Jitter (NoJitter))
 import Arbiter.Worker.Config (WorkerConfig (..), transactionalWorkerConfig)
@@ -31,10 +31,12 @@ import Control.Monad.IO.Class (liftIO)
 import Data.Aeson (FromJSON, ToJSON)
 import Data.ByteString (ByteString)
 import Data.IORef (atomicModifyIORef', newIORef, readIORef)
+import Data.Pool (Pool, withResource)
 import Data.Proxy (Proxy (..))
 import Data.Text (Text)
+import Database.PostgreSQL.Simple (Connection)
 import GHC.Generics (Generic)
-import Test.Hspec (Spec, afterAll_, around, beforeAll, describe, it, runIO, shouldBe)
+import Test.Hspec (Spec, afterAll_, beforeAll, describe, it, runIO, shouldBe)
 
 import Arbiter.Simple
   ( SimpleDb
@@ -58,29 +60,32 @@ withSimpleBackend proxy connStr schema suite =
   beforeAll (setupOnce connStr schema schema True) $ do
     pool <- runIO (createSharedPool connStr)
     env <- runIO (createSimpleEnvWithPool proxy pool schema)
-    afterAll_ (destroySimpleEnv env) $ suite (simpleBackend proxy connStr schema env)
+    afterAll_ (destroySimpleEnv env) $ suite (simpleBackend proxy connStr schema pool env)
 
 simpleBackend
   :: Proxy registry
   -> ByteString
   -> Text
+  -> Pool Connection
   -> SimpleEnv registry
   -> TestKit.TestBackend WorkerTestPayload (SimpleDb registry IO) (SimpleEnv registry)
-simpleBackend proxy connStr schema env =
+simpleBackend proxy connStr schema pool env =
   TestKit.TestBackend
     { schema
     , table = schema
     , connStr
     , mkSimple = SimpleTask
     , mkFailing = FailingTask
-    , mkEnv = cleanupOnce connStr schema schema >> pure env
+    , mkEnv = emptied >> pure env
     , pollOnly = disableListener
-    , mkFreshEnv = cleanupOnce connStr schema schema >> createSimpleEnv proxy connStr schema
+    , mkFreshEnv = emptied >> createSimpleEnv proxy connStr schema
     , destroyEnv = destroySimpleEnv
     , mkHandler = TestKit.plainHandler
     , runCommand = TestKit.statementCommand
     , runM = runSimpleDb
     }
+  where
+    emptied = withResource pool (cleanupData schema schema)
 
 testSchema :: Text
 testSchema = "arbiter_worker_test"
@@ -88,12 +93,7 @@ testSchema = "arbiter_worker_test"
 type WorkerTestRegistry = '[QueueWithResult "arbiter_worker_test" WorkerTestPayload (Maybe [Text])]
 
 spec :: ByteString -> Spec
-spec connStr = beforeAll (setupOnce connStr testSchema testSchema True) $ do
-  sharedPool <- runIO (createSharedPool connStr)
-  sharedEnv <- runIO (createSimpleEnvWithPool (Proxy @WorkerTestRegistry) sharedPool testSchema)
-  afterAll_ (destroySimpleEnv sharedEnv)
-    $ around (\action -> cleanupOnce connStr testSchema testSchema >> action sharedEnv)
-    $ TestKit.workerSpec @WorkerTestPayload SimpleTask FailingTask TestKit.plainHandler runSimpleDb
+spec connStr = withSimpleBackend (Proxy @WorkerTestRegistry) connStr testSchema TestKit.workerSpec
 
 listenSchema :: Text
 listenSchema = "arbiter_worker_listen_test"

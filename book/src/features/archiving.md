@@ -8,9 +8,9 @@ job1 = Arb.defaultJob payload & Arb.setArchiveFor (Just Arb.dayRetention)       
 job2 = Arb.defaultJob payload & Arb.setArchiveFor (Just $ Arb.dayRetention * 7) -- 1 week
 ```
 
-The archive entry holds the handler's [result](results.md). Expired entries
-are deleted by the reaper. The REST API and admin UI list, re-enqueue, and
-delete archived jobs.
+The archive entry holds the handler's [result](results.md). The reaper deletes
+expired entries. The REST API and admin UI list, re-enqueue, and delete
+archived jobs.
 
 A re-enqueued job keeps its payload and settings and has no parent. Retry a
 failed [tree](job-trees.md) from the [dead-letter queue](dead-letter-queue.md).

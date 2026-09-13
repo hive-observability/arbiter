@@ -102,8 +102,12 @@ test-suite arbiter-hasql-tests
     , hspec                   >=2.0 && <2.12
     , postgresql-simple
     , resource-pool
+    , stm
     , text
     , unliftio
 
   if flag(hasql2)
-    build-depends: pqi-ffi >=1.0 && <1.1
+    build-depends:
+      , pqi         >=1.0 && <1.2
+      , pqi-ffi     >=1.0 && <1.1
+      , pqi-native  >=1.0 && <1.1

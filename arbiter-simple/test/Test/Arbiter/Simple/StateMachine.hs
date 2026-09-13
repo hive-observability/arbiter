@@ -9,7 +9,7 @@
 module Test.Arbiter.Simple.StateMachine (spec) where
 
 import Arbiter.Core.QueueRegistry (Queue)
-import Arbiter.Test.Setup (cleanupOnce, createPoolOf, setupOnce)
+import Arbiter.Test.Setup (cleanupData, createPoolOf, setupOnce)
 import Arbiter.Test.StateMachine (SMPayload, stateMachineSpec)
 import Data.ByteString (ByteString)
 import Data.Pool (withResource)
@@ -36,7 +36,7 @@ spec connStr = beforeAll (setupOnce connStr testSchema testTable False) $ do
       run = runSimpleDb env
       withConn :: forall a. (PG.Connection -> IO a) -> IO a
       withConn = withResource pool
-      reset = cleanupOnce connStr testSchema testTable
+      reset = withConn (cleanupData testSchema testTable)
   stateMachineSpec @(SimpleDb SMRegistry IO)
     run
     testSchema

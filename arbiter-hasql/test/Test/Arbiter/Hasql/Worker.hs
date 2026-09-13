@@ -14,16 +14,20 @@ module Test.Arbiter.Hasql.Worker
   , lifecycleSpec
   ) where
 
-import Arbiter.Core.MonadArbiter (JobHandler)
+import Arbiter.Core.Listen (HubLog (..), withChannels)
+import Arbiter.Core.MonadArbiter (JobHandler, getListener)
 import Arbiter.Core.QueueRegistry (Queue, QueueSpec (..))
-import Arbiter.Test.Setup (addQueueTable, cleanupOnce, setupOnce)
+import Arbiter.Test.Poll (waitUntil)
+import Arbiter.Test.Setup (addQueueTable, cleanupOnce, execute_, setupOnce, withConn)
 import Arbiter.Worker (runWorkerPool)
 import Arbiter.Worker.Config (transactionalWorkerConfig)
-import Arbiter.Worker.TestKit (workerSpec)
 import Arbiter.Worker.TestKit qualified as TestKit
 import Control.Concurrent (threadDelay)
+import Control.Concurrent.STM (atomically)
 import Data.Aeson (FromJSON, ToJSON)
 import Data.ByteString (ByteString)
+import Data.Foldable (for_)
+import Data.IORef (atomicModifyIORef', newIORef, readIORef)
 import Data.Maybe (isJust)
 import Data.Proxy (Proxy (..))
 import Data.Text (Text)
@@ -42,7 +46,14 @@ import Arbiter.Hasql.HasqlDb
   , runHasqlDb
   , useDedicatedListener
   )
-import Test.Arbiter.Hasql.TestHelpers (createHasqlPool, runHasqlCommand, testConnect)
+import Test.Arbiter.Hasql.TestHelpers
+  ( createHasqlPool
+  , createHasqlPoolWith
+  , nativeConnect
+  , refusingCancelConnect
+  , runHasqlCommand
+  , testConnect
+  )
 
 workerTestSchemaName :: Text
 workerTestSchemaName = "arbiter_hasql_worker_test"
@@ -55,20 +66,8 @@ data HasqlWorkerTestPayload
 
 type HasqlWorkerTestRegistry = '[QueueWithResult "arbiter_hasql_worker_test" HasqlWorkerTestPayload (Maybe [Text])]
 
-testTable :: Text
-testTable = "arbiter_hasql_worker_test"
-
 spec :: ByteString -> Spec
-spec connStr =
-  beforeAll (setupOnce connStr workerTestSchemaName testTable False) $ do
-    sharedPool <- runIO (createHasqlPool workerPoolSize connStr)
-    sharedEnv <- runIO (createHasqlEnvWithPool (Proxy @HasqlWorkerTestRegistry) sharedPool workerTestSchemaName)
-    around (\action -> cleanupOnce connStr workerTestSchemaName testTable >> action sharedEnv) $
-      workerSpec @HasqlWorkerTestPayload
-        SimpleTask
-        FailingTask
-        TestKit.plainHandler
-        runHasqlDb
+spec connStr = withHasqlBackend (Proxy @HasqlWorkerTestRegistry) connStr workerTestSchemaName TestKit.workerSpec
 
 listenSchema :: Text
 listenSchema = "arbiter_hasql_listen_test"
@@ -80,6 +79,7 @@ listenerSpec connStr =
   withHasqlBackend (Proxy @HasqlListenRegistry) connStr listenSchema $ \backend -> do
     TestKit.listenerSpec backend
     dedicatedListenerSpec connStr
+    transportListenerSpec connStr
 
 -- | An address that never completes the TCP handshake.
 blackHoleConnStr :: ByteString
@@ -102,6 +102,36 @@ dedicatedListenerSpec connStr =
       stopped <- timeout 5_000_000 (cancel worker)
       stopped `shouldSatisfy` isJust
       destroyHasqlEnv env
+
+-- | A hub log that reports nothing.
+quietHubLog :: HubLog
+quietHubLog = HubLog {hubRecovered = \_ -> pure (), hubWarn = \_ -> pure (), hubError = \_ -> pure (), hubRepeatInterval = 1}
+
+transportListenerSpec :: ByteString -> Spec
+transportListenerSpec connStr =
+  describe "pool listener" $ do
+    for_ nativeConnect $ \connect ->
+      it "delivers a NOTIFY over the native transport" $ do
+        env <- createHasqlEnv (Proxy @HasqlListenRegistry) (connect connStr) listenSchema
+        Just listener <- runHasqlDb env getListener
+        received <- newIORef (0 :: Int)
+        let chan = "arbiter_hasql_native_listen"
+        withChannels listener quietHubLog [(chan, \_ -> atomicModifyIORef' received (\n -> (n + 1, ())))] $ \ready -> do
+          waitUntil 5_000 (atomically ready)
+          withConn connStr $ \conn -> execute_ conn "NOTIFY arbiter_hasql_native_listen"
+          waitUntil 5_000 $ (== 1) <$> readIORef received
+        destroyHasqlEnv env
+    for_ refusingCancelConnect $ \connect ->
+      it "stops on deregistration when the session cleanup fails" $ do
+        pool <- createHasqlPoolWith connect 2 connStr
+        env <- createHasqlEnvWithPool (Proxy @HasqlListenRegistry) pool listenSchema
+        Just listener <- runHasqlDb env getListener
+        stopped <-
+          timeout 5_000_000 $
+            withChannels listener quietHubLog [("arbiter_hasql_refused_cancel", \_ -> pure ())] $ \ready ->
+              waitUntil 5_000 (atomically ready)
+        stopped `shouldSatisfy` isJust
+        destroyHasqlEnv env
 
 mqSchema :: Text
 mqSchema = "arbiter_hasql_mq_test"

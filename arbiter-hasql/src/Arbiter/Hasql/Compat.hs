@@ -24,13 +24,11 @@ import Hasql.Connection qualified as Hasql
 import Hasql.Session qualified as Session
 
 #if MIN_VERSION_hasql(2,0,0)
-import Arbiter.Core.Listen (Notification (..))
+import Arbiter.Core.Listen (ListenConn (..), Notification (..))
 import Arbiter.Core.Listen.Driver
   ( ConnStatus (..)
   , ConnectDriver (..)
-  , ListenDriver (..)
   , Polling (..)
-  , driverListenConn
   , execOutcome
   , withDriverListenConn
   )
@@ -74,7 +72,7 @@ acquireConnect (HasqlConnect adapter connStr) = either (Left . show) Right <$> H
 
 -- | Run the listener loop on a driver connection of its own.
 withDedicatedListenConn :: HasqlConnect -> (ListenConn -> IO a) -> IO a
-withDedicatedListenConn (HasqlConnect adapter connStr) = withDriverListenConn (pqiConnectDriver adapter) pqiListenDriver connStr
+withDedicatedListenConn (HasqlConnect adapter connStr) = withDriverListenConn (pqiConnectDriver adapter) toListenConn connStr
 #else
 -- | How to open a connection. On hasql 1.x this is a connection string.
 newtype HasqlConnect = HasqlConnect ByteString
@@ -108,30 +106,28 @@ connectionInTransaction conn =
     pure (txStatusNeedsRollback status)
 #endif
 
--- | Run the listener loop on the connection's driver handle.
+-- | Run the listener loop on the connection's driver handle. The loop runs outside the
+-- session, so a cancel reaches it directly.
 withHasqlListenConn :: Hasql.Connection -> (ListenConn -> IO a) -> IO a
 #if MIN_VERSION_hasql(1,10,0)
 withHasqlListenConn conn action = do
-  result <- Hasql.use conn $ Session.onLibpqConnection $ \libpq -> do
-    actionResult <- action (toListenConn libpq)
-    pure (Right actionResult, libpq)
-  either (const (throwInternal "connection lost")) pure result
+  result <- Hasql.use conn $ Session.onLibpqConnection $ \libpq -> pure (Right libpq, libpq)
+  either (const (throwInternal "connection lost")) (action . toListenConn) result
 #else
 withHasqlListenConn conn action = Hasql.withLibPQConnection conn (action . toListenConn)
 #endif
 
 #if MIN_VERSION_hasql(2,0,0)
+-- | A 'ListenConn' over a pqi connection. The native transport reads the socket only
+-- inside a query, so an empty query drains it.
 toListenConn :: PQ.Connection -> ListenConn
-toListenConn = driverListenConn pqiListenDriver
-
-pqiListenDriver :: ListenDriver PQ.Connection
-pqiListenDriver =
-  ListenDriver
-    { notifies = fmap (fmap (Notification <$> PQ.notifyRelname <*> PQ.notifyExtra)) . PQ.notifies
-    , socket = PQ.socket
-    , consumeInput = PQ.consumeInput
-    , exec = \conn sql -> PQ.exec conn sql >>= execOutcome PQ.CommandOk PQ.resultStatus
-    , escapeIdentifier = PQ.escapeIdentifier
+toListenConn conn =
+  ListenConn
+    { listenNotifies = fmap (Notification <$> PQ.notifyRelname <*> PQ.notifyExtra) <$> PQ.notifies conn
+    , listenSocket = PQ.socket conn
+    , listenConsumeInput = PQ.exec conn "" >>= fmap (either (const False) (const True)) . execOutcome PQ.EmptyQuery PQ.resultStatus
+    , listenExec = \sql -> PQ.exec conn sql >>= execOutcome PQ.CommandOk PQ.resultStatus
+    , listenEscapeIdentifier = PQ.escapeIdentifier conn
     }
 
 pqiConnectDriver :: PQ.Adapter -> ConnectDriver PQ.Connection

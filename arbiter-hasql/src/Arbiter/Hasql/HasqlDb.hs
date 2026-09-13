@@ -14,9 +14,8 @@ module Arbiter.Hasql.HasqlDb
   ( -- * Database Monad
     HasqlDb (..)
   , HasqlEnv
-  , Db (..)
+  , Db
   , Env (..)
-  , Driver (..)
   , HasqlConfig (..)
   , PoolState (..)
   , HasPoolState (..)
@@ -42,7 +41,7 @@ module Arbiter.Hasql.HasqlDb
   ) where
 
 import Arbiter.Core.Backend
-  ( Db (..)
+  ( Db
   , Driver (..)
   , Env (..)
   , HasPoolState (..)

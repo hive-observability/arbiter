@@ -15,13 +15,12 @@ module Test.Arbiter.Orville.Worker
 
 import Arbiter.Core.QueueRegistry (Queue, QueueSpec (..))
 import Arbiter.Test.Setup qualified as TestSetup
-import Arbiter.Worker.TestKit (workerSpec)
 import Arbiter.Worker.TestKit qualified as TestKit
 import Data.Aeson (FromJSON, ToJSON)
 import Data.ByteString (ByteString)
 import Data.Text (Text)
 import GHC.Generics (Generic)
-import Test.Hspec (Spec, afterAll_, beforeAll, beforeWith, runIO)
+import Test.Hspec (Spec, afterAll_, beforeAll, runIO)
 
 import Test.Arbiter.Orville.TestHelpers
   ( OrvilleTestEnv
@@ -31,7 +30,6 @@ import Test.Arbiter.Orville.TestHelpers
   , destroyOrvilleTestEnv
   , disableOrvilleListener
   , runOrvilleTest
-  , setupOrvilleTest
   )
 
 workerTestSchemaName :: Text
@@ -46,12 +44,8 @@ data OrvilleWorkerTestPayload
 type OrvilleWorkerTestRegistry =
   '[QueueWithResult "arbiter_orville_worker_test" OrvilleWorkerTestPayload (Maybe [Text])]
 
-testTable :: Text
-testTable = "arbiter_orville_worker_test"
-
 spec :: ByteString -> Spec
-spec connStr = beforeAll (setupOrvilleTest connStr workerTestSchemaName testTable 10) $ beforeWith (\env -> cleanupOrvilleTest env >> pure env) $ do
-  workerSpec @OrvilleWorkerTestPayload @(TestOrville OrvilleWorkerTestRegistry) SimpleTask FailingTask id runOrvilleTest
+spec connStr = withOrvilleBackend @OrvilleWorkerTestRegistry connStr workerTestSchemaName TestKit.workerSpec
 
 -- | Build the schema and one env over a shared pool, then run a suite over the backend.
 withOrvilleBackend
