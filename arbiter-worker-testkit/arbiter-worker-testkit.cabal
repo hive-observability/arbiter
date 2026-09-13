@@ -43,6 +43,7 @@ library
   hs-source-dirs:  src
   exposed-modules:
     Arbiter.Worker.TestKit
+    Arbiter.Worker.TestKit.Backend
     Arbiter.Worker.TestKit.ConnectionRecovery
     Arbiter.Worker.TestKit.Cron
     Arbiter.Worker.TestKit.Deadline

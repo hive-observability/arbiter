@@ -5,6 +5,9 @@ module Arbiter.Test.Setup
   ( cleanupData
   , cleanupOnce
   , withConn
+  , terminateBackendsMatching
+  , terminatePid
+  , listenerConnectionCount
   , execute_
   , execStatement
   , execQuery
@@ -13,6 +16,7 @@ module Arbiter.Test.Setup
   , disableNoticeReporting
   , createSharedPool
   , createPoolOf
+  , createPoolWith
   , truncateToMicros
   , seedConcurrencyPoolSQL
   , drainWith
@@ -40,13 +44,14 @@ import Data.ByteString (ByteString)
 import Data.Foldable (traverse_)
 import Data.Int (Int32, Int64)
 import Data.List (intersperse)
+import Data.Maybe (listToMaybe)
 import Data.Pool (Pool, defaultPoolConfig, newPool, setNumStripes)
 import Data.String (fromString)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Time (UTCTime (..), picosecondsToDiffTime)
 import Database.PostgreSQL.LibPQ qualified as LibPQ
-import Database.PostgreSQL.Simple (Connection, SqlError (..), close, connectPostgreSQL, execute)
+import Database.PostgreSQL.Simple (Connection, Only (..), SqlError (..), close, connectPostgreSQL, execute, query)
 import Database.PostgreSQL.Simple.Internal qualified as PGS
 import Database.PostgreSQL.Simple.Migration (MigrationCommand (..))
 import Database.PostgreSQL.Simple.Types (Query (..))
@@ -99,6 +104,32 @@ cleanupOnce connStr schemaName tableName = withConn connStr (cleanupData schemaN
 withConn :: ByteString -> (Connection -> IO a) -> IO a
 withConn connStr = bracket (connectPostgreSQL connStr) close
 
+-- | Terminate every other backend on this database whose current query matches the LIKE pattern.
+terminateBackendsMatching :: ByteString -> Text -> IO ()
+terminateBackendsMatching connStr pattern =
+  withConn connStr $ \conn ->
+    void $
+      query @_ @(Only Bool)
+        conn
+        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE pid <> pg_backend_pid() AND datname = current_database() AND query LIKE ?"
+        (Only pattern)
+
+-- | Terminate one backend by pid.
+terminatePid :: ByteString -> Int32 -> IO ()
+terminatePid connStr pid =
+  withConn connStr $ \conn -> void $ query @_ @(Only Bool) conn "SELECT pg_terminate_backend(?)" (Only pid)
+
+-- | Count distinct backends holding a LISTEN on any of this schema's channels.
+listenerConnectionCount :: ByteString -> Text -> IO Int
+listenerConnectionCount connStr schema =
+  withConn connStr $ \conn -> do
+    rows <-
+      query @_ @(Only Int)
+        conn
+        "SELECT count(DISTINCT pid)::int FROM pg_stat_activity WHERE datname = current_database() AND query LIKE 'LISTEN%' AND query LIKE ?"
+        (Only ("%" <> schema <> "%" :: Text))
+    pure (maybe 0 fromOnly (listToMaybe rows))
+
 -- | Run a statement with no parameters (test setup only).
 execute_ :: Connection -> Text -> IO ()
 execute_ conn sql = void $ execute conn (fromString (T.unpack sql) :: Query) ()
@@ -148,8 +179,12 @@ createSharedPool = createPoolOf sharedPoolSize
 
 -- | A single-stripe pool of the given size for tests.
 createPoolOf :: Int -> ByteString -> IO (Pool Connection)
-createPoolOf size connStr =
-  newPool $ setNumStripes (Just 1) $ defaultPoolConfig (connectPostgreSQL connStr) close sharedPoolIdleSeconds size
+createPoolOf size connStr = createPoolWith size (connectPostgreSQL connStr) close
+
+-- | A single-stripe pool of the given size over any connect and release actions.
+createPoolWith :: Int -> IO conn -> (conn -> IO ()) -> IO (Pool conn)
+createPoolWith size connect release =
+  newPool $ setNumStripes (Just 1) $ defaultPoolConfig connect release sharedPoolIdleSeconds size
 
 sharedPoolSize :: Int
 sharedPoolSize = 5

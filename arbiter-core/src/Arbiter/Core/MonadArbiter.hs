@@ -11,6 +11,8 @@ module Arbiter.Core.MonadArbiter
   , ParamType (..)
   , Query (..)
   , mkQuery
+  , countOr0
+  , countOr0Prepared
   ) where
 
 import Data.Int (Int64)
@@ -87,3 +89,14 @@ type HasRegistry m (registry :: JobPayloadRegistry) =
 -- | The result type declared by @payload@'s registry entry. It is not injective.
 -- A signature naming it needs another argument to determine @payload@.
 type ResultOf m (payload :: Type) = ResultFor payload (RegistryOf m)
+
+-- | Run a single-row count 'Query', returning 0 on an empty or unexpected result.
+countOr0 :: (MonadArbiter m) => Query Int64 -> m Int64
+countOr0 = fmap singleCount . executeQuery
+
+countOr0Prepared :: (MonadArbiter m) => Query Int64 -> m Int64
+countOr0Prepared = fmap singleCount . executeQueryPrepared
+
+singleCount :: [Int64] -> Int64
+singleCount [count] = count
+singleCount _ = 0

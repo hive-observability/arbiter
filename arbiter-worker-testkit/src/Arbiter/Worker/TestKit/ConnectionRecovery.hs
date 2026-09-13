@@ -9,36 +9,31 @@ import Arbiter.Core.Codec (Col (CInt4), col)
 import Arbiter.Core.HighLevel (QueueOperation, RegistryAdmissionPolicies)
 import Arbiter.Core.HighLevel qualified as HL
 import Arbiter.Core.Job.Types
-  ( JobRead
-  , defaultJob
+  ( defaultJob
   , payload
   , setGroupKey
   , setMaxAttempts
   )
-import Arbiter.Core.MonadArbiter (JobHandler, RegistryOf, ResultOf, withDbTransaction)
+import Arbiter.Core.MonadArbiter (RegistryOf, ResultOf, withDbTransaction)
 import Arbiter.Core.QueueRegistry (RegistryTables)
 import Arbiter.Test.Poll (waitUntil)
-import Arbiter.Test.Setup (execQuery)
+import Arbiter.Test.Setup (execQuery, terminateBackendsMatching, terminatePid)
 import Arbiter.Worker (runWorkerPool)
 import Arbiter.Worker.BackoffStrategy (Jitter (NoJitter))
 import Arbiter.Worker.Config (WorkerConfig (..), transactionalWorkerConfig)
 import Control.Concurrent (threadDelay)
 import Control.Monad (void, when)
 import Control.Monad.IO.Class (liftIO)
-import Data.ByteString (ByteString)
 import Data.Foldable (traverse_)
 import Data.IORef (atomicModifyIORef', newIORef, readIORef)
-import Data.Int (Int32)
-import Data.Text (Text)
 import Data.Text qualified as T
-import Database.PostgreSQL.Simple (Only (..), close, connectPostgreSQL)
-import Database.PostgreSQL.Simple qualified as PG
 import Test.Hspec
 import UnliftIO (bracket)
 import UnliftIO.Async (withAsync)
 
--- | The worker pool survives connection termination and keeps processing
--- after it reconnects.
+import Arbiter.Worker.TestKit.Backend (TestBackend (..))
+
+-- | Connection recovery suite.
 connectionRecoverySpec
   :: forall payload m env
    . ( Eq payload
@@ -47,22 +42,9 @@ connectionRecoverySpec
      , RegistryTables (RegistryOf m)
      , ResultOf m payload ~ ()
      )
-  => Text
-  -- ^ Schema name, also the LISTEN channel prefix
-  -> ByteString
-  -- ^ Connection string, for raw side connections
-  -> (Text -> payload)
-  -- ^ Construct a simple task payload
-  -> IO env
-  -- ^ Create a fresh env over an emptied queue table
-  -> (env -> IO ())
-  -- ^ Release an env built by the action above
-  -> ((JobRead payload -> m (ResultOf m payload)) -> JobHandler m payload (ResultOf m payload))
-  -- ^ Adapt a job action into the backend's handler shape
-  -> (forall a. env -> m a -> IO a)
-  -- ^ Runner function
+  => TestBackend payload m env
   -> Spec
-connectionRecoverySpec schema connStr mkSimple mkEnv destroyEnv mkHandler runM =
+connectionRecoverySpec TestBackend {schema, connStr, mkSimple, mkEnv, destroyEnv, mkHandler, runM} =
   around (bracket ((,) <$> mkEnv <*> mkEnv) (\(env, spare) -> destroyEnv env >> destroyEnv spare)) $
     describe "Connection Recovery" $ do
       it "processes jobs inserted before and after a connection kill" $ \(env, spare) -> do
@@ -94,7 +76,7 @@ connectionRecoverySpec schema connStr mkSimple mkEnv destroyEnv mkHandler runM =
           preKillCompleted <- readIORef completedRef
           preKillCompleted `shouldBe` 3
 
-          killSchemaConnections connStr schema
+          terminateBackendsMatching connStr ("%" <> schema <> "%")
 
           threadDelay 7_000_000
 
@@ -155,23 +137,3 @@ connectionRecoverySpec schema connStr mkSimple mkEnv destroyEnv mkHandler runM =
       runM spare
         $ withDbTransaction
         $ traverse_ (void . HL.insertJob . setGroupKey (Just "g1") . defaultJob) payloads
-
--- | Kill active connections that reference the schema.
-killSchemaConnections :: ByteString -> Text -> IO ()
-killSchemaConnections connStr schemaName =
-  bracket (connectPostgreSQL connStr) close $ \conn ->
-    void $
-      PG.query @_ @(Only Bool)
-        conn
-        "SELECT pg_terminate_backend(pid) \
-        \FROM pg_stat_activity \
-        \WHERE pid <> pg_backend_pid() \
-        \  AND datname = current_database() \
-        \  AND query LIKE ?"
-        (Only ("%" <> schemaName <> "%" :: Text))
-
--- | Terminate one backend by pid.
-terminatePid :: ByteString -> Int32 -> IO ()
-terminatePid connStr pid =
-  bracket (connectPostgreSQL connStr) close $ \conn ->
-    void $ PG.query @_ @(Only Bool) conn "SELECT pg_terminate_backend(?)" (Only pid)

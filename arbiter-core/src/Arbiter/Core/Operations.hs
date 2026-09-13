@@ -283,7 +283,7 @@ import Arbiter.Core.Job.Types
   , primaryKey
   )
 import Arbiter.Core.Job.Types qualified as JT
-import Arbiter.Core.MonadArbiter (MonadArbiter, withDbTransaction)
+import Arbiter.Core.MonadArbiter (MonadArbiter, countOr0, countOr0Prepared, withDbTransaction)
 import Arbiter.Core.MonadArbiter qualified as MA
 import Arbiter.Core.Operations.Gates
   ( Shared (..)
@@ -297,9 +297,7 @@ import Arbiter.Core.Operations.Gates
   , setLocalStatementTimeout
   )
 import Arbiter.Core.Operations.Workers
-  ( countOr0
-  , countOr0Prepared
-  , deregisterWorker
+  ( deregisterWorker
   , heartbeatWorker
   , listWorkers
   , markWorkerShuttingDown
@@ -690,7 +688,7 @@ reconcileConcurrencyCounts :: (MonadArbiter m) => SchemaName -> [TableName] -> m
 reconcileConcurrencyCounts _ [] = pure 0
 reconcileConcurrencyCounts schemaName tableNames = withDbTransaction $ do
   held <- MA.executeQuery (Tmpl.lockConcurrencyCountsSQL schemaName)
-  fromMaybe 0 . listToMaybe <$> MA.executeQuery (Tmpl.reconcileConcurrencyCountsSQL schemaName tableNames held)
+  countOr0 (Tmpl.reconcileConcurrencyCountsSQL schemaName tableNames held)
 
 -- | Rebuild the counts when a crash truncated the UNLOGGED table. Returns the
 -- rows it recounted.

@@ -13,6 +13,9 @@ module Arbiter.Otel.Gauges.Cache
   , publishSnapshot
   , setReachable
   , retireCache
+  , SeriesKey
+  , Baseline
+  , riseSince
   ) where
 
 import Arbiter.Core.Concurrency.Stats qualified as Conc (ConcurrencyPolicyView)
@@ -21,6 +24,9 @@ import Arbiter.Core.Operations (QueueOverview)
 import Arbiter.Core.RateLimit.Stats qualified as RL (RateLimitPolicyView)
 import Control.Concurrent.STM (STM, TVar, modifyTVar', newTVarIO, writeTVar)
 import Data.Aeson (FromJSON, ToJSON)
+import Data.HashMap.Strict (HashMap)
+import Data.HashMap.Strict qualified as HM
+import Data.Text (Text)
 import GHC.Generics (Generic)
 
 -- | Values from one database scan.
@@ -86,3 +92,26 @@ setReachable cache = writeTVar (databaseReachable cache) . Just
 -- | Stop exporting the cached snapshot.
 retireCache :: GaugeCache -> STM ()
 retireCache cache = modifyTVar' (export cache) retire
+
+-- | One counter series: its instrument and attributes.
+type SeriesKey = (Text, [(Text, Text)])
+
+-- | The scan a counter series was last counted from, and the total it stood at.
+data Baseline = Baseline
+  { countedFrom :: !Double
+  , countedTotal :: !Double
+  }
+
+-- | What a total scanned at @scannedAt@ adds to its series.
+riseSince
+  :: SeriesKey
+  -> Double
+  -> Double
+  -> HashMap SeriesKey Baseline
+  -> (HashMap SeriesKey Baseline, Double)
+riseSince key scannedAt total seen = case HM.lookup key seen of
+  Just base | countedFrom base >= scannedAt -> (seen, 0)
+  Just base -> (counted, if total < countedTotal base then total else total - countedTotal base)
+  Nothing -> (counted, 0)
+  where
+    counted = HM.insert key (Baseline scannedAt total) seen

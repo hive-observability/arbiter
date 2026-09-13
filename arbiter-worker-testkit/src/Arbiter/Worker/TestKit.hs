@@ -13,6 +13,9 @@ module Arbiter.Worker.TestKit
   , reclaimSpec
   , connectionRecoverySpec
   , lifecycleSpec
+  , TestBackend (..)
+  , plainHandler
+  , statementCommand
   ) where
 
 import Arbiter.Core.Exceptions
@@ -60,9 +63,19 @@ import Arbiter.Core.Job.Types
 import Arbiter.Core.JobTree ((<~~))
 import Arbiter.Core.JobTree qualified as JT
 import Arbiter.Core.Listen qualified as Listen
-import Arbiter.Core.MonadArbiter (JobHandler, RegistryOf, ResultOf, getListener, withDbTransaction)
+import Arbiter.Core.MonadArbiter
+  ( JobHandler
+  , MonadArbiter
+  , RegistryOf
+  , ResultOf
+  , executeStatement
+  , getListener
+  , withDbTransaction
+  )
 import Arbiter.Core.QueueRegistry (RegistryTables)
+import Arbiter.Core.Sql.Query (raw)
 import Arbiter.Test.Poll (waitUntil)
+import Arbiter.Test.Setup (listenerConnectionCount, terminateBackendsMatching, withConn)
 import Arbiter.Worker (childResults, runWorkerPool)
 import Arbiter.Worker.BackoffStrategy (BackoffStrategy (Constant), Jitter (NoJitter))
 import Arbiter.Worker.Config
@@ -92,23 +105,32 @@ import Data.Int (Int32, Int64)
 import Data.List (find, partition)
 import Data.List.NonEmpty (NonEmpty (..))
 import Data.Map.Strict qualified as Map
-import Data.Maybe (fromMaybe, isJust, isNothing, listToMaybe)
+import Data.Maybe (fromMaybe, isJust, isNothing)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import Data.Time (addUTCTime, getCurrentTime)
-import Database.PostgreSQL.Simple (Only (..), close, connectPostgreSQL)
+import Database.PostgreSQL.Simple (Only (..))
 import Database.PostgreSQL.Simple qualified as PG
 import Database.PostgreSQL.Simple.Types (Identifier (..))
 import Test.Hspec
 import UnliftIO (atomically, bracket, newEmptyMVar, putMVar, takeMVar, try)
 import UnliftIO.Async (concurrently_, withAsync)
 
+import Arbiter.Worker.TestKit.Backend (TestBackend (..))
 import Arbiter.Worker.TestKit.ConnectionRecovery (connectionRecoverySpec)
 import Arbiter.Worker.TestKit.Cron (cronSpec)
 import Arbiter.Worker.TestKit.Deadline (deadlineSpec)
 import Arbiter.Worker.TestKit.Lifecycle (lifecycleSpec)
 import Arbiter.Worker.TestKit.Reclaim (reclaimSpec)
+
+-- | A backend handler that ignores the connection argument.
+plainHandler :: (job -> m r) -> conn -> job -> m r
+plainHandler handler _conn job = handler job
+
+-- | Run a command through 'executeStatement', for drivers that report 0 rows for a command without a count.
+statementCommand :: (MonadArbiter m) => Text -> m ()
+statementCommand = void . executeStatement . raw
 
 -- | Build a worker-pool test suite for the given 'Arbiter.Core.MonadArbiter.MonadArbiter' runner.
 --
@@ -2068,7 +2090,7 @@ listenerSpec schema connStr mkPayload mkEnv mkEnvPollOnly destroyEnv mkHandler r
         let workerConfig = config {workerCount = 1, pollInterval = 300, jitter = NoJitter}
         withAsync (runM env $ runWorkerPool workerConfig) $ \_ -> do
           threadDelay 1_000_000
-          killListener connStr schema
+          terminateBackendsMatching connStr ("LISTEN%" <> schema <> "%")
           threadDelay 3_000_000
           runM env $ void $ HL.insertJob $ setGroupKey (Just "g1") $ defaultJob (mkPayload "after-reconnect")
           waitUntil 8_000 $ (== 1) <$> readIORef ref
@@ -2160,35 +2182,6 @@ bumpRef ref = atomicModifyIORef' ref (\count -> (count + 1, ()))
 bumping :: (MonadIO m) => IORef Int -> JobRead p -> m ()
 bumping ref _job = liftIO (bumpRef ref)
 
--- | Count distinct backends holding a LISTEN on any of this schema's channels.
-listenerConnectionCount :: ByteString -> Text -> IO Int
-listenerConnectionCount connStr schema =
-  bracket (connectPostgreSQL connStr) close $ \conn -> do
-    rows <-
-      PG.query @_ @(Only Int)
-        conn
-        "SELECT count(DISTINCT pid)::int \
-        \FROM pg_stat_activity \
-        \WHERE datname = current_database() \
-        \  AND query LIKE 'LISTEN%' \
-        \  AND query LIKE ?"
-        (Only ("%" <> schema <> "%" :: Text))
-    pure (maybe 0 fromOnly (listToMaybe rows))
-
--- | Terminate the env's listener backend, forcing the hub to reconnect.
-killListener :: ByteString -> Text -> IO ()
-killListener connStr schema =
-  bracket (connectPostgreSQL connStr) close $ \conn ->
-    void $
-      PG.query @_ @(Only Bool)
-        conn
-        "SELECT pg_terminate_backend(pid) \
-        \FROM pg_stat_activity \
-        \WHERE pid <> pg_backend_pid() \
-        \  AND datname = current_database() \
-        \  AND query LIKE ?"
-        (Only ("LISTEN%" <> schema <> "%" :: Text))
-
 -- | Env-owned LISTEN hub test suite for two queues sharing one env, one worker
 -- pool per queue. Each queue's job-arrival channel is derived from its table
 -- name. These check that a shared hub wakes each pool for its own queue only.
@@ -2268,5 +2261,5 @@ multiQueueListenerSpec tableA tableB connStr mkPayloadA mkPayloadB mkEnv destroy
 -- | Issue a raw @NOTIFY@ on a channel over a throwaway connection.
 notifyChannel :: ByteString -> Text -> IO ()
 notifyChannel connStr chan =
-  bracket (connectPostgreSQL connStr) close $ \conn ->
+  withConn connStr $ \conn ->
     void $ PG.execute conn "NOTIFY ?" (Only (Identifier chan))

@@ -1,17 +1,16 @@
 {-# LANGUAGE FunctionalDependencies #-}
 {-# LANGUAGE OverloadedStrings #-}
 
--- | The env, monad, pool state, and savepoint ladder shared by the pooled backends,
--- parameterized over the connection type.
+-- | The env, monad, pool state, and savepoint ladder shared by the pooled backends.
 module Arbiter.Core.Backend
   ( -- * Database Monad
     Db (..)
   , Env (..)
+  , Driver (..)
   , runDb
   , inTransaction
 
     -- * Environment Creation
-  , WithListenConn
   , createEnvWithConfig
   , createEnvWithPool
   , destroyEnv
@@ -55,18 +54,24 @@ class (Monad m) => HasPoolState conn m | m -> conn where
   getPoolState :: m (PoolState conn)
   localPoolState :: (PoolState conn -> PoolState conn) -> m a -> m a
 
--- | Schema name, pool state, listener, and the prepared-statement flag.
-data Env conn (registry :: JobPayloadRegistry) = Env
+-- | What a connection type contributes to its env.
+data Driver conn cfg = Driver
+  { withListenConn :: conn -> (ListenConn -> IO ()) -> IO ()
+  -- ^ Run the listener loop on a connection's driver handle.
+  , initialConfig :: cfg
+  }
+
+-- | Schema name, pool state, listener, and the driver's own state.
+data Env conn cfg (registry :: JobPayloadRegistry) = Env
   { schema :: SchemaName
   , poolState :: PoolState conn
   , listener :: Maybe Listener
   -- ^ Resolved LISTEN source. 'Nothing' runs poll-only.
-  , preparedStatements :: Bool
-  -- ^ Whether a backend prepares its hot statements once per connection.
+  , driverConfig :: cfg
   }
 
 -- | A pooled backend's database monad.
-newtype Db conn (registry :: JobPayloadRegistry) m a = Db {unDb :: ReaderT (Env conn registry) m a}
+newtype Db conn cfg (registry :: JobPayloadRegistry) m a = Db {unDb :: ReaderT (Env conn cfg registry) m a}
   deriving newtype
     ( Applicative
     , Functor
@@ -75,83 +80,75 @@ newtype Db conn (registry :: JobPayloadRegistry) m a = Db {unDb :: ReaderT (Env 
     , MonadFail
     , MonadIO
     , MonadMask
-    , MonadReader (Env conn registry)
+    , MonadReader (Env conn cfg registry)
     , MonadThrow
     , MonadUnliftIO
     )
 
-instance (Monad m) => HasPoolState conn (Db conn registry m) where
+instance (Monad m) => HasPoolState conn (Db conn cfg registry m) where
   getPoolState = asks poolState
   localPoolState adjust = local (\env -> env {poolState = adjust (poolState env)})
 
 -- | Run a 'Db' action in its env.
-runDb :: Env conn registry -> Db conn registry m a -> m a
+runDb :: Env conn cfg registry -> Db conn cfg registry m a -> m a
 runDb env action = runReaderT (unDb action) env
 
--- | Run a 'Db' action on one connection without a pool. The connection is pinned as
--- an open transaction. 'Arbiter.Core.MonadArbiter.withDbTransaction' nests through
--- savepoints. The caller owns the transaction.
-inTransaction :: conn -> SchemaName -> Db conn registry m a -> m a
-inTransaction conn schemaName =
+-- | Run a 'Db' action on one connection pinned as the caller's open transaction.
+inTransaction :: Driver conn cfg -> conn -> SchemaName -> Db conn cfg registry m a -> m a
+inTransaction drv conn schemaName =
   runDb
     Env
       { schema = schemaName
       , poolState = PoolState {connectionPool = Nothing, activeConn = Just conn, transactionDepth = 1}
       , listener = Nothing
-      , preparedStatements = True
+      , driverConfig = initialConfig drv
       }
 
 -- | Release the env's connection pool, closing its open connections.
-destroyEnv :: (MonadIO m) => Env conn registry -> m ()
+destroyEnv :: (MonadIO m) => Env conn cfg registry -> m ()
 destroyEnv env = liftIO $ traverse_ destroyAllResources (connectionPool (poolState env))
 
 -- | Turn off the shared LISTEN listener for an env, running poll-only.
-disableListener :: Env conn registry -> Env conn registry
+disableListener :: Env conn cfg registry -> Env conn cfg registry
 disableListener env = env {listener = Nothing}
 
--- | Give the env a LISTEN connection of its own from a connection runner. The
--- listener takes no pool slot.
-useDedicatedListener :: (MonadIO m) => ((ListenConn -> IO ()) -> IO ()) -> Env conn registry -> m (Env conn registry)
+-- | Give the env a LISTEN connection of its own from a connection runner.
+useDedicatedListener
+  :: (MonadIO m) => ((ListenConn -> IO ()) -> IO ()) -> Env conn cfg registry -> m (Env conn cfg registry)
 useDedicatedListener withDedicated env = liftIO $ do
   lstn <- newListener withDedicated
   pure env {listener = Just lstn}
 
--- | Run the listener loop on a connection's driver handle.
-type WithListenConn conn = conn -> (ListenConn -> IO ()) -> IO ()
-
 -- | A listener that borrows one pool connection for the hub's lifetime.
-poolListener :: WithListenConn conn -> Pool conn -> IO Listener
-poolListener withListenConn pool = newListener (\action -> withResource pool (`withListenConn` action))
+poolListener :: Driver conn cfg -> Pool conn -> IO Listener
+poolListener drv pool = newListener (\action -> withResource pool (\conn -> withListenConn drv conn action))
 
 -- | Create an env over a new pool opened with the connect and release actions.
 createEnvWithConfig
   :: (MonadIO m)
-  => WithListenConn conn
+  => Driver conn cfg
   -> IO conn
   -> (conn -> IO ())
   -> SchemaName
   -> PoolConfig
-  -> m (Env conn registry)
-createEnvWithConfig withListenConn connect release schemaName config = liftIO $ do
+  -> m (Env conn cfg registry)
+createEnvWithConfig drv connect release schemaName config = liftIO $ do
   connPool <-
     newPool
       $ setNumStripes (poolStripes config)
       $ defaultPoolConfig connect release (fromIntegral $ poolIdleTimeout config) (poolSize config)
-  createEnvWithPool withListenConn connPool schemaName
+  createEnvWithPool drv connPool schemaName
 
--- | Create an env over a caller's own connection pool. The shared listener holds one
--- pool connection for the env's lifetime. Size the pool for the worker load plus
--- one. 'disableListener' runs poll-only and frees that slot. 'useDedicatedListener'
--- gives the listener its own connection.
-createEnvWithPool :: (MonadIO m) => WithListenConn conn -> Pool conn -> SchemaName -> m (Env conn registry)
-createEnvWithPool withListenConn connPool schemaName = liftIO $ do
-  lstn <- poolListener withListenConn connPool
+-- | Create an env over a caller's own connection pool. The listener holds one pool slot.
+createEnvWithPool :: (MonadIO m) => Driver conn cfg -> Pool conn -> SchemaName -> m (Env conn cfg registry)
+createEnvWithPool drv connPool schemaName = liftIO $ do
+  lstn <- poolListener drv connPool
   pure
     Env
       { schema = schemaName
       , poolState = PoolState {connectionPool = Just connPool, activeConn = Nothing, transactionDepth = 0}
       , listener = Just lstn
-      , preparedStatements = True
+      , driverConfig = initialConfig drv
       }
 
 -- | The pinned connection, or one checked out of the pool.
@@ -165,39 +162,23 @@ withConn action = do
 
 -- | Pin one pooled connection for the action.
 pinConnection :: (HasPoolState conn m, MonadUnliftIO m) => m a -> m a
-pinConnection action = do
-  pool <- getPoolState
-  case (activeConn pool, connectionPool pool) of
-    (Just _, _) -> action
-    (Nothing, Just connPool) -> withRunInIO $ \run ->
-      withResource connPool $ \conn ->
-        run $ localPoolState (\st -> st {activeConn = Just conn}) action
-    (Nothing, Nothing) -> throwInternal noConnection
+pinConnection action = withConn $ \conn -> localPoolState (\st -> st {activeConn = Just conn}) action
 
--- | Transaction bracket. Nests via savepoints. The outer bracket and the statement
--- runner are the backend's.
+-- | Transaction bracket over the backend's own bracket and statement runner. Nests via savepoints.
 withSavepointTransaction
   :: (HasPoolState conn m, MonadUnliftIO m)
   => (conn -> ByteString -> IO ())
   -> (conn -> IO a -> IO a)
   -> m a
   -> m a
-withSavepointTransaction runSql transaction action = do
-  pool <- getPoolState
-  let depth = transactionDepth pool
-  case (activeConn pool, depth) of
-    (Nothing, _) -> case connectionPool pool of
-      Nothing -> throwInternal noConnection
-      Just connPool -> withRunInIO $ \run ->
-        withResource connPool $ \conn ->
-          transaction conn
-            $ run
-            $ localPoolState (\st -> st {activeConn = Just conn, transactionDepth = 1}) action
-    (Just conn, 0) -> withRunInIO $ \run ->
+withSavepointTransaction runSql transaction action = withConn $ \conn -> do
+  depth <- transactionDepth <$> getPoolState
+  case depth of
+    0 -> withRunInIO $ \run ->
       transaction conn
         $ run
-        $ localPoolState (\st -> st {transactionDepth = 1}) action
-    (Just conn, _) -> mask $ \restore -> do
+        $ localPoolState (\st -> st {activeConn = Just conn, transactionDepth = 1}) action
+    _ -> mask $ \restore -> do
       let spName = "arbiter_sp_" <> BSC.pack (show depth)
       liftIO $ runSql conn ("SAVEPOINT " <> spName)
       result <-

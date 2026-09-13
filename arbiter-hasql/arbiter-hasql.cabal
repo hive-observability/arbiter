@@ -94,6 +94,7 @@ test-suite arbiter-hasql-tests
     , arbiter-core            >=0.1 && <0.2
     , arbiter-hasql
     , arbiter-test-common     >=0.1 && <0.2
+    , arbiter-worker          >=0.1 && <0.2
     , arbiter-worker-testkit  >=0.1 && <0.2
     , base
     , bytestring
@@ -102,6 +103,7 @@ test-suite arbiter-hasql-tests
     , postgresql-simple
     , resource-pool
     , text
+    , unliftio
 
   if flag(hasql2)
     build-depends: pqi-ffi >=1.0 && <1.1

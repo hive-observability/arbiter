@@ -8,17 +8,17 @@ module Arbiter.Worker.TestKit.Reclaim (reclaimSpec) where
 import Arbiter.Core.HighLevel (QueueOperation, RegistryAdmissionPolicies)
 import Arbiter.Core.HighLevel qualified as HL
 import Arbiter.Core.Job.Types
-  ( JobRead
-  , ObservabilityHooks (..)
+  ( ObservabilityHooks (..)
   , defaultJob
   , defaultObservabilityHooks
   , payload
   , primaryKey
   , setMaxAttempts
   )
-import Arbiter.Core.MonadArbiter (JobHandler, RegistryOf, ResultOf)
+import Arbiter.Core.MonadArbiter (RegistryOf, ResultOf)
 import Arbiter.Core.QueueRegistry (RegistryTables)
 import Arbiter.Test.Poll (waitUntil, withLinkedAsync)
+import Arbiter.Test.Setup (withConn)
 import Arbiter.Worker (runWorkerPool)
 import Arbiter.Worker.Config (WorkerConfig (..), transactionalWorkerConfig)
 import Control.Concurrent (threadDelay)
@@ -29,17 +29,18 @@ import Data.Foldable (traverse_)
 import Data.IORef (atomicModifyIORef', newIORef, readIORef)
 import Data.Int (Int64)
 import Data.Text (Text)
-import Database.PostgreSQL.Simple (close, connectPostgreSQL, execute)
+import Database.PostgreSQL.Simple (execute)
 import Database.PostgreSQL.Simple.Types (QualifiedIdentifier (..))
 import Test.Hspec
 import UnliftIO (bracket)
+
+import Arbiter.Worker.TestKit.Backend (TestBackend (..))
 
 -- | A failing payload's remaining failure count, high enough to fail every attempt.
 alwaysFailing :: Int
 alwaysFailing = 999
 
--- | Reclaim-during-processing, heartbeat theft detection, and worker-loop
--- exception safety, instantiated for each backend.
+-- | Reclaim, heartbeat theft, and worker-loop exception safety suite.
 reclaimSpec
   :: forall payload m env
    . ( Eq payload
@@ -48,26 +49,9 @@ reclaimSpec
      , RegistryTables (RegistryOf m)
      , ResultOf m payload ~ ()
      )
-  => Text
-  -- ^ Schema name, also the LISTEN channel prefix
-  -> Text
-  -- ^ Queue table name
-  -> ByteString
-  -- ^ Connection string, for raw side connections
-  -> (Text -> payload)
-  -- ^ Construct a simple task payload
-  -> (Int -> payload)
-  -- ^ Construct a failing task payload
-  -> IO env
-  -- ^ Create a fresh env over an emptied queue table
-  -> (env -> IO ())
-  -- ^ Release an env built by the action above
-  -> ((JobRead payload -> m (ResultOf m payload)) -> JobHandler m payload (ResultOf m payload))
-  -- ^ Adapt a job action into the backend's handler shape
-  -> (forall a. env -> m a -> IO a)
-  -- ^ Runner function
+  => TestBackend payload m env
   -> Spec
-reclaimSpec schema table connStr mkSimple mkFailing mkEnv destroyEnv mkHandler runM =
+reclaimSpec TestBackend {schema, table, connStr, mkSimple, mkFailing, mkEnv, destroyEnv, mkHandler, runM} =
   around (bracket mkEnv destroyEnv) $ do
     describe "Job Reclaim During Processing" $ do
       it "gracefully skips retry when job is reclaimed by another worker" $ \env -> do
@@ -217,10 +201,10 @@ reclaimSpec schema table connStr mkSimple mkFailing mkEnv destroyEnv mkHandler r
         processed <- readIORef processedCount
         processed `shouldBe` 3
 
--- | Bump the attempts and claim counters from a side connection, so the worker's ack fails.
+-- | Bump the attempts and claim counters from a side connection.
 simulateAnotherWorkerClaim :: ByteString -> Text -> Text -> Int64 -> IO ()
 simulateAnotherWorkerClaim connStr schema table jobId =
-  bracket (connectPostgreSQL connStr) close $ \conn ->
+  withConn connStr $ \conn ->
     void $
       execute
         conn

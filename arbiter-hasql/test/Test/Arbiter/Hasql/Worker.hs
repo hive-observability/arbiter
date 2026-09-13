@@ -1,4 +1,5 @@
 {-# LANGUAGE DeriveAnyClass #-}
+{-# LANGUAGE NumericUnderscores #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE TypeFamilies #-}
 
@@ -13,25 +14,33 @@ module Test.Arbiter.Hasql.Worker
   , lifecycleSpec
   ) where
 
+import Arbiter.Core.MonadArbiter (JobHandler)
 import Arbiter.Core.QueueRegistry (Queue, QueueSpec (..))
 import Arbiter.Test.Setup (addQueueTable, cleanupOnce, setupOnce)
+import Arbiter.Worker (runWorkerPool)
+import Arbiter.Worker.Config (transactionalWorkerConfig)
 import Arbiter.Worker.TestKit (workerSpec)
 import Arbiter.Worker.TestKit qualified as TestKit
+import Control.Concurrent (threadDelay)
 import Data.Aeson (FromJSON, ToJSON)
 import Data.ByteString (ByteString)
+import Data.Maybe (isJust)
 import Data.Proxy (Proxy (..))
 import Data.Text (Text)
 import GHC.Generics (Generic)
+import System.Timeout (timeout)
 import Test.Hspec
+import UnliftIO.Async (async, cancel)
 
 import Arbiter.Hasql.HasqlDb
-  ( HasqlEnv
+  ( HasqlDb
+  , HasqlEnv
   , createHasqlEnvWithPool
   , destroyHasqlEnv
   , disableListener
   , runHasqlDb
   )
-import Test.Arbiter.Hasql.TestHelpers (createHasqlPool, createHasqlTestEnv)
+import Test.Arbiter.Hasql.TestHelpers (createHasqlPool, createHasqlTestEnv, runHasqlCommand, useDedicatedTestListener)
 
 workerTestSchemaName :: Text
 workerTestSchemaName = "arbiter_hasql_worker_test"
@@ -56,7 +65,7 @@ spec connStr =
       workerSpec @HasqlWorkerTestPayload
         SimpleTask
         FailingTask
-        (\handler _conn job -> handler job)
+        TestKit.plainHandler
         runHasqlDb
 
 listenSchema :: Text
@@ -66,7 +75,7 @@ type HasqlListenRegistry = '[Queue "arbiter_hasql_listen_test" HasqlWorkerTestPa
 
 listenerSpec :: ByteString -> Spec
 listenerSpec connStr =
-  beforeAll (setupOnce connStr listenSchema listenSchema True) $
+  beforeAll (setupOnce connStr listenSchema listenSchema True) $ do
     TestKit.listenerSpec @HasqlWorkerTestPayload
       listenSchema
       connStr
@@ -76,8 +85,30 @@ listenerSpec connStr =
           >> (disableListener <$> createHasqlTestEnv (Proxy @HasqlListenRegistry) connStr listenSchema)
       )
       destroyHasqlEnv
-      (\handler _conn job -> handler job)
+      TestKit.plainHandler
       runHasqlDb
+    dedicatedListenerSpec connStr
+
+-- | An address that never completes the TCP handshake.
+blackHoleConnStr :: ByteString
+blackHoleConnStr = "host=10.255.255.1 port=5432 dbname=arbiter user=arbiter"
+
+dedicatedListenerSpec :: ByteString -> Spec
+dedicatedListenerSpec connStr =
+  describe "dedicated listener" $
+    it "lets pool shutdown interrupt a connect in progress" $ do
+      cleanupOnce connStr listenSchema listenSchema
+      pool <- createHasqlPool 1 connStr
+      env <-
+        useDedicatedTestListener blackHoleConnStr =<< createHasqlEnvWithPool (Proxy @HasqlListenRegistry) pool listenSchema
+      let handler :: JobHandler (HasqlDb HasqlListenRegistry IO) HasqlWorkerTestPayload ()
+          handler _conn _job = pure ()
+      config <- transactionalWorkerConfig 1 handler
+      worker <- async (runHasqlDb env (runWorkerPool config))
+      threadDelay 1_000_000
+      stopped <- timeout 5_000_000 (cancel worker)
+      stopped `shouldSatisfy` isJust
+      destroyHasqlEnv env
 
 mqSchema :: Text
 mqSchema = "arbiter_hasql_mq_test"
@@ -112,7 +143,7 @@ multiQueueSpec connStr =
       MqBPayload
       mkEnv
       destroyHasqlEnv
-      (\handler _conn job -> handler job)
+      TestKit.plainHandler
       runHasqlDb
   where
     mkEnv = do
@@ -120,11 +151,28 @@ multiQueueSpec connStr =
       cleanupOnce connStr mqSchema mqTableB
       createHasqlTestEnv (Proxy @HasqlMultiQRegistry) connStr mqSchema
 
-hasqlHandler :: (job -> m r) -> conn -> job -> m r
-hasqlHandler handler _conn job = handler job
-
 fresh :: Proxy registry -> ByteString -> Text -> IO (HasqlEnv registry)
 fresh proxy connStr schema = cleanupOnce connStr schema schema >> createHasqlTestEnv proxy connStr schema
+
+hasqlBackend
+  :: Proxy registry
+  -> ByteString
+  -> Text
+  -> TestKit.TestBackend HasqlWorkerTestPayload (HasqlDb registry IO) (HasqlEnv registry)
+hasqlBackend proxy connStr schema =
+  TestKit.TestBackend
+    { schema
+    , table = schema
+    , connStr
+    , mkSimple = SimpleTask
+    , mkFailing = FailingTask
+    , mkEnv = fresh proxy connStr schema
+    , mkEnvPollOnly = disableListener <$> fresh proxy connStr schema
+    , destroyEnv = destroyHasqlEnv
+    , mkHandler = TestKit.plainHandler
+    , runCommand = runHasqlCommand
+    , runM = runHasqlDb
+    }
 
 deadlineSchema :: Text
 deadlineSchema = "arbiter_hasql_deadline_test"
@@ -134,15 +182,7 @@ type HasqlDeadlineRegistry = '[Queue "arbiter_hasql_deadline_test" HasqlWorkerTe
 deadlineSpec :: ByteString -> Spec
 deadlineSpec connStr =
   beforeAll (setupOnce connStr deadlineSchema deadlineSchema True) $
-    TestKit.deadlineSpec @HasqlWorkerTestPayload
-      deadlineSchema
-      deadlineSchema
-      connStr
-      SimpleTask
-      (fresh (Proxy @HasqlDeadlineRegistry) connStr deadlineSchema)
-      destroyHasqlEnv
-      hasqlHandler
-      runHasqlDb
+    TestKit.deadlineSpec (hasqlBackend (Proxy @HasqlDeadlineRegistry) connStr deadlineSchema)
 
 cronSchema :: Text
 cronSchema = "arbiter_hasql_cron_test"
@@ -152,14 +192,7 @@ type HasqlCronRegistry = '[Queue "arbiter_hasql_cron_test" HasqlWorkerTestPayloa
 cronSpec :: ByteString -> Spec
 cronSpec connStr =
   beforeAll (setupOnce connStr cronSchema cronSchema True) $
-    TestKit.cronSpec @HasqlWorkerTestPayload
-      cronSchema
-      cronSchema
-      connStr
-      SimpleTask
-      (fresh (Proxy @HasqlCronRegistry) connStr cronSchema)
-      destroyHasqlEnv
-      runHasqlDb
+    TestKit.cronSpec (hasqlBackend (Proxy @HasqlCronRegistry) connStr cronSchema)
 
 reclaimSchema :: Text
 reclaimSchema = "arbiter_hasql_reclaim_test"
@@ -169,16 +202,7 @@ type HasqlReclaimRegistry = '[Queue "arbiter_hasql_reclaim_test" HasqlWorkerTest
 reclaimSpec :: ByteString -> Spec
 reclaimSpec connStr =
   beforeAll (setupOnce connStr reclaimSchema reclaimSchema True) $
-    TestKit.reclaimSpec @HasqlWorkerTestPayload
-      reclaimSchema
-      reclaimSchema
-      connStr
-      SimpleTask
-      FailingTask
-      (fresh (Proxy @HasqlReclaimRegistry) connStr reclaimSchema)
-      destroyHasqlEnv
-      hasqlHandler
-      runHasqlDb
+    TestKit.reclaimSpec (hasqlBackend (Proxy @HasqlReclaimRegistry) connStr reclaimSchema)
 
 recoverySchema :: Text
 recoverySchema = "arbiter_hasql_recovery_test"
@@ -188,14 +212,7 @@ type HasqlRecoveryRegistry = '[Queue "arbiter_hasql_recovery_test" HasqlWorkerTe
 connectionRecoverySpec :: ByteString -> Spec
 connectionRecoverySpec connStr =
   beforeAll (setupOnce connStr recoverySchema recoverySchema True) $
-    TestKit.connectionRecoverySpec @HasqlWorkerTestPayload
-      recoverySchema
-      connStr
-      SimpleTask
-      (fresh (Proxy @HasqlRecoveryRegistry) connStr recoverySchema)
-      destroyHasqlEnv
-      hasqlHandler
-      runHasqlDb
+    TestKit.connectionRecoverySpec (hasqlBackend (Proxy @HasqlRecoveryRegistry) connStr recoverySchema)
 
 lifecycleSchema :: Text
 lifecycleSchema = "arbiter_hasql_lifecycle_test"
@@ -205,13 +222,4 @@ type HasqlLifecycleRegistry = '[QueueWithResult "arbiter_hasql_lifecycle_test" H
 lifecycleSpec :: ByteString -> Spec
 lifecycleSpec connStr =
   beforeAll (setupOnce connStr lifecycleSchema lifecycleSchema True) $
-    TestKit.lifecycleSpec @HasqlWorkerTestPayload
-      lifecycleSchema
-      lifecycleSchema
-      connStr
-      SimpleTask
-      (fresh (Proxy @HasqlLifecycleRegistry) connStr lifecycleSchema)
-      (disableListener <$> fresh (Proxy @HasqlLifecycleRegistry) connStr lifecycleSchema)
-      destroyHasqlEnv
-      hasqlHandler
-      runHasqlDb
+    TestKit.lifecycleSpec (hasqlBackend (Proxy @HasqlLifecycleRegistry) connStr lifecycleSchema)

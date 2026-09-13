@@ -225,8 +225,7 @@ baseTelemetry meterProvider =
 refreshFor :: PeriodicMetricReaderOptions -> NominalDiffTime
 refreshFor opts = fromIntegral (periodicIntervalMicros opts) / 1_000_000
 
--- | 'withTelemetry' unless @OTEL_SDK_DISABLED@, the spec's own switch, is set. An inert
--- handle when it is.
+-- | 'withTelemetry', or an inert handle when @OTEL_SDK_DISABLED@ is set.
 withTelemetryFromEnv :: (Telemetry -> IO a) -> IO a
 withTelemetryFromEnv action = lookupBooleanEnv "OTEL_SDK_DISABLED" >>= \disabled -> withTelemetryIf (not disabled) action
 

@@ -25,6 +25,7 @@ import Arbiter.Core.MonadArbiter (JobHandler, RegistryOf, ResultOf)
 import Arbiter.Core.QueueRegistry (RegistryTables)
 import Arbiter.Core.Trace (capturingContextIO)
 import Arbiter.Test.Poll (waitUntil)
+import Arbiter.Test.Setup (withConn)
 import Arbiter.Worker (runWorkerPool)
 import Arbiter.Worker.BackoffStrategy (Jitter (NoJitter))
 import Arbiter.Worker.Config
@@ -53,12 +54,13 @@ import Data.String (fromString)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Time (UTCTime, getCurrentTime)
-import Database.PostgreSQL.Simple (close, connectPostgreSQL)
 import Database.PostgreSQL.Simple qualified as PG
 import GHC.Clock (getMonotonicTime)
 import Test.Hspec (Spec, around, describe, it, shouldBe, shouldSatisfy)
 import UnliftIO (MonadUnliftIO, bracket, finally, mask_, tryAny, withRunInIO)
 import UnliftIO.Async (async, poll, waitCatch, withAsync)
+
+import Arbiter.Worker.TestKit.Backend (TestBackend (..))
 
 -- | Longer than any deadline under test.
 handlerSleepMicros :: Int
@@ -138,7 +140,7 @@ withJobsHeartbeat guard startTime jobs pending action = do
   inherit <- capturingContextIO
   withRunInIO $ \run -> guardBatch guard (Batch jobs (run pending) startTime inherit) (run action)
 
--- | Deadline test suite, instantiated for each backend. The queue under test declares @()@ as its result type.
+-- | Deadline suite. The queue under test declares @()@ as its result type.
 deadlineSpec
   :: forall payload m env
    . ( Eq payload
@@ -147,24 +149,9 @@ deadlineSpec
      , RegistryTables (RegistryOf m)
      , ResultOf m payload ~ ()
      )
-  => Text
-  -- ^ Schema name
-  -> Text
-  -- ^ Queue table name
-  -> ByteString
-  -- ^ Connection string, for the side connections that poke rows
-  -> (Text -> payload)
-  -- ^ Construct a simple task payload
-  -> IO env
-  -- ^ A fresh env over an emptied queue table
-  -> (env -> IO ())
-  -- ^ Release that env
-  -> ((JobRead payload -> m (ResultOf m payload)) -> JobHandler m payload (ResultOf m payload))
-  -- ^ Adapt a job action into the backend's handler shape
-  -> (forall a. env -> m a -> IO a)
-  -- ^ Runner function
+  => TestBackend payload m env
   -> Spec
-deadlineSpec schema table connStr mkSimple mkEnv destroyEnv mkHandler runM =
+deadlineSpec TestBackend {schema, table, connStr, mkSimple, mkEnv, destroyEnv, mkHandler, runM} =
   around (bracket mkEnv destroyEnv) $ do
     describe "Guard registration" $ do
       it "returns once a signal in flight meets the unregister" $ \env -> do
@@ -584,7 +571,7 @@ recordBeat beatsRef = liftIO $ getMonotonicTime >>= \now -> atomicModifyIORef' b
 
 -- | Take the claim without bumping its token. The extend then reports 'VisibilityUnchanged'.
 takeClaimHolder :: ByteString -> Text -> IO ()
-takeClaimHolder connStr qualifiedTable = withFreshConn connStr $ \conn ->
+takeClaimHolder connStr qualifiedTable = withConn connStr $ \conn ->
   void $
     PG.execute_
       conn
@@ -599,7 +586,7 @@ takeClaimHolder connStr qualifiedTable = withFreshConn connStr $ \conn ->
 
 -- | Run one UPDATE on a job row over a fresh connection.
 updateJob :: ByteString -> Text -> Text -> Int64 -> IO ()
-updateJob connStr qualifiedTable setClause jobId = withFreshConn connStr $ \conn ->
+updateJob connStr qualifiedTable setClause jobId = withConn connStr $ \conn ->
   void $
     PG.execute
       conn
@@ -609,9 +596,6 @@ updateJob connStr qualifiedTable setClause jobId = withFreshConn connStr $ \conn
 -- | Take the claim under a new token, as another worker's claim does.
 reclaimJob :: ByteString -> Text -> Int64 -> IO ()
 reclaimJob connStr qualifiedTable = updateJob connStr qualifiedTable "attempts = attempts + 1, claim_seq = claim_seq + 1"
-
-withFreshConn :: ByteString -> (PG.Connection -> IO a) -> IO a
-withFreshConn connStr = bracket (connectPostgreSQL connStr) close
 
 single :: [a] -> IO a
 single [x] = pure x
@@ -625,7 +609,7 @@ stamp ref job = getMonotonicTime >>= \now -> atomicModifyIORef' ref (\seen -> ((
 
 -- | Hold a row lock on one job for @micros@, as a transaction touching it would.
 holdRowLock :: ByteString -> Text -> Int64 -> Int -> IO ()
-holdRowLock connStr qualifiedTable jobId micros = withFreshConn connStr $ \conn -> do
+holdRowLock connStr qualifiedTable jobId micros = withConn connStr $ \conn -> do
   PG.begin conn
   _ <-
     PG.query
@@ -646,7 +630,7 @@ releaseRow connStr qualifiedTable = updateJob connStr qualifiedTable "claimed_by
 
 -- | How many rows carry the job id.
 rowCount :: ByteString -> Text -> Int64 -> IO Int
-rowCount connStr qualifiedTable jobId = withFreshConn connStr $ \conn -> do
+rowCount connStr qualifiedTable jobId = withConn connStr $ \conn -> do
   [PG.Only count] <-
     PG.query
       conn

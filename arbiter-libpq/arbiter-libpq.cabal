@@ -40,4 +40,3 @@ library
     , base              >=4.20 && <5
     , bytestring        >=0.10 && <0.13
     , postgresql-libpq  >=0.10 && <0.12
-    , text              >=1.2  && <2.2

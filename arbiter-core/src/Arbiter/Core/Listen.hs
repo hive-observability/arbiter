@@ -92,7 +92,7 @@ data Listener = Listener
   -- ^ Run the loop with a connection, for the connection's lifetime.
   }
 
--- | The connection operations the hub loop needs, so any driver can host it.
+-- | The connection operations the hub loop needs.
 data ListenConn = ListenConn
   { listenNotifies :: IO (Maybe Notification)
   , listenSocket :: IO (Maybe Fd)

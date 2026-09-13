@@ -8,7 +8,6 @@ module Arbiter.Orville.MonadArbiter
   , orvilleRunHandlerWithConnection
   ) where
 
-import Arbiter.Orville.Array qualified as Array
 import Arbiter.Core.Codec (Col (..), NullCol (..), ParamType (..), SomeParam (..), runCodec)
 import Arbiter.Core.Exceptions (throwInternal)
 import Arbiter.Core.MonadArbiter (Query (..))
@@ -30,6 +29,8 @@ import Orville.PostgreSQL.Raw.PgTextFormatValue (PgTextFormatValue)
 import Orville.PostgreSQL.Raw.PgTextFormatValue qualified as PgText
 import Orville.PostgreSQL.Raw.SqlValue (SqlValue)
 import Orville.PostgreSQL.Raw.SqlValue qualified as SqlValue
+
+import Arbiter.Orville.Array qualified as Array
 
 -- | Run a query, decoding rows.
 orvilleExecuteQuery

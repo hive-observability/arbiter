@@ -9,43 +9,36 @@ module Arbiter.Hasql.Compat
   , hasqlAcquire
   , hasqlSettings
   , HasqlSettings
-  , noRowCount
+  , WithConnect
+  , mapConnect
+  , hasqlConnect
+  , withDedicatedListenConn
   ) where
 
 import Arbiter.Core.Exceptions (throwInternal)
-import Arbiter.Core.Listen (ListenConn (..))
+import Arbiter.Core.Listen (ListenConn)
 import Data.ByteString (ByteString)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import Data.Text.Encoding.Error qualified as TE
 import Hasql.Connection qualified as Hasql
-import Hasql.Errors qualified as Errors
 import Hasql.Session qualified as Session
 
 #if MIN_VERSION_hasql(2,0,0)
 import Arbiter.Core.Listen (Notification (..))
-import Control.Monad ((>=>))
+import Arbiter.Core.Listen.Driver (ConnectDriver (..), ListenDriver (..), driverListenConn, withDriverListenConn)
 import Hasql.Connection.Settings qualified as Settings
 import Pqi qualified as PQ
 #elif MIN_VERSION_hasql(1,10,0)
-import Arbiter.LibPQ (libpqListenConn)
+import Arbiter.LibPQ (libpqListenConn, withLibPQListenConn)
 import Database.PostgreSQL.LibPQ qualified as PQ
 import Hasql.Connection.Settings qualified as Settings
 #else
-import Arbiter.LibPQ (libpqListenConn)
+import Arbiter.LibPQ (libpqListenConn, withLibPQListenConn)
 import Database.PostgreSQL.LibPQ qualified as PQ
 import Hasql.Connection.Setting qualified as Setting
 import Hasql.Connection.Setting.Connection qualified as ConnSetting
 #endif
-
--- | Whether a statement failed only because its command tag carries no row count.
-noRowCount :: Errors.SessionError -> Bool
-#if MIN_VERSION_hasql(1,10,0)
-noRowCount (Errors.StatementSessionError _ _ _ _ _ (Errors.UnexpectedResultStatementError "Empty bytes")) = True
-#else
-noRowCount (Errors.QueryError _ _ (Errors.ResultError (Errors.UnexpectedResult "Empty bytes"))) = True
-#endif
-noRowCount _ = False
 
 -- | Run a bare SQL command, such as @BEGIN@ or @COMMIT@.
 runSQL :: Hasql.Connection -> ByteString -> IO ()
@@ -68,6 +61,36 @@ hasqlAcquire adapter settings = either (Left . show) Right <$> Hasql.acquire ada
 #else
 hasqlAcquire :: HasqlSettings -> IO (Either String Hasql.Connection)
 hasqlAcquire settings = either (Left . show) Right <$> Hasql.acquire settings
+#endif
+
+#if MIN_VERSION_hasql(2,0,0)
+-- | A function of the connect arguments: a transport adapter, such as @Pqi.Ffi.adapter@, then a connection string.
+type WithConnect r = PQ.Adapter -> ByteString -> r
+
+mapConnect :: (a -> b) -> WithConnect a -> WithConnect b
+mapConnect = fmap . fmap
+
+-- | 'hasqlAcquire' from the connect arguments.
+hasqlConnect :: WithConnect (IO (Either String Hasql.Connection))
+hasqlConnect adapter connStr = hasqlAcquire adapter (hasqlSettings connStr)
+
+-- | Run the listener loop on a driver connection of its own.
+withDedicatedListenConn :: WithConnect ((ListenConn -> IO a) -> IO a)
+withDedicatedListenConn adapter = withDriverListenConn (pqiConnectDriver adapter) pqiListenDriver
+#else
+-- | A function of the connect arguments: a connection string.
+type WithConnect r = ByteString -> r
+
+mapConnect :: (a -> b) -> WithConnect a -> WithConnect b
+mapConnect = fmap
+
+-- | 'hasqlAcquire' from the connect arguments.
+hasqlConnect :: WithConnect (IO (Either String Hasql.Connection))
+hasqlConnect connStr = hasqlAcquire (hasqlSettings connStr)
+
+-- | Run the listener loop on a driver connection of its own.
+withDedicatedListenConn :: WithConnect ((ListenConn -> IO a) -> IO a)
+withDedicatedListenConn = withLibPQListenConn
 #endif
 
 -- | Whether the connection is in a transaction block, valid or aborted.
@@ -101,23 +124,34 @@ withHasqlListenConn conn action = Hasql.withLibPQConnection conn (action . toLis
 
 #if MIN_VERSION_hasql(2,0,0)
 toListenConn :: PQ.Connection -> ListenConn
-toListenConn conn =
-  ListenConn
-    { listenNotifies = fmap toNotification <$> PQ.notifies conn
-    , listenSocket = PQ.socket conn
-    , listenConsumeInput = PQ.consumeInput conn
-    , listenExec = PQ.exec conn >=> maybe (pure (Left "returned no result")) commandOk
-    , listenEscapeIdentifier = PQ.escapeIdentifier conn
+toListenConn = driverListenConn pqiListenDriver
+
+pqiListenDriver :: ListenDriver PQ.Connection PQ.Notify PQ.Result PQ.ExecStatus
+pqiListenDriver =
+  ListenDriver
+    { notifies = PQ.notifies
+    , socket = PQ.socket
+    , consumeInput = PQ.consumeInput
+    , exec = PQ.exec
+    , resultStatus = PQ.resultStatus
+    , escapeIdentifier = PQ.escapeIdentifier
+    , commandOk = PQ.CommandOk
+    , notification = \notify -> Notification (PQ.notifyRelname notify) (PQ.notifyExtra notify)
     }
-  where
-    commandOk res = do
-      status <- PQ.resultStatus res
-      pure $ if status == PQ.CommandOk then Right () else Left ("failed with " <> T.pack (show status))
-    toNotification notify =
-      Notification
-        { notificationChannel = PQ.notifyRelname notify
-        , notificationData = PQ.notifyExtra notify
-        }
+
+pqiConnectDriver :: PQ.Adapter -> ConnectDriver PQ.Connection PQ.ConnStatus PQ.PollingStatus
+pqiConnectDriver adapter =
+  ConnectDriver
+    { connectStart = PQ.connectStart adapter
+    , connectPoll = PQ.connectPoll
+    , status = PQ.status
+    , finish = PQ.finish
+    , errorMessage = PQ.errorMessage
+    , connectionOk = PQ.ConnectionOk
+    , connectionBad = PQ.ConnectionBad
+    , pollingReading = PQ.PollingReading
+    , pollingWriting = PQ.PollingWriting
+    }
 #else
 toListenConn :: PQ.Connection -> ListenConn
 toListenConn = libpqListenConn

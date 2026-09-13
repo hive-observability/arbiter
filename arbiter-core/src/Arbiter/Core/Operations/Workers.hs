@@ -1,8 +1,6 @@
 -- | Worker-registry database operations.
 module Arbiter.Core.Operations.Workers
-  ( countOr0
-  , countOr0Prepared
-  , registerWorker
+  ( registerWorker
   , heartbeatWorker
   , setWorkerPaused
   , markWorkerShuttingDown
@@ -21,9 +19,8 @@ import Data.UUID.Types (UUID)
 
 import Arbiter.Core.Exceptions (throwParsing)
 import Arbiter.Core.Job.Schema (SchemaName)
-import Arbiter.Core.MonadArbiter (MonadArbiter)
+import Arbiter.Core.MonadArbiter (MonadArbiter, countOr0)
 import Arbiter.Core.MonadArbiter qualified as MA
-import Arbiter.Core.Sql.Query (Query)
 import Arbiter.Core.Sql.Workers qualified as Sql
 import Arbiter.Core.Worker (WorkerRow (..), workerHealthFromText)
 
@@ -86,14 +83,3 @@ listWorkers schema queue liveSecs = do
 -- | Delete workers older than their recorded stale threshold.
 sweepStaleWorkers :: (MonadArbiter m) => SchemaName -> m Int64
 sweepStaleWorkers schema = MA.executeStatement (Sql.deleteStaleWorkersSQL schema)
-
--- | Run a single-row count @Query@, returning 0 on an empty or unexpected result.
-countOr0 :: (MonadArbiter m) => Query Int64 -> m Int64
-countOr0 = fmap singleCount . MA.executeQuery
-
-countOr0Prepared :: (MonadArbiter m) => Query Int64 -> m Int64
-countOr0Prepared = fmap singleCount . MA.executeQueryPrepared
-
-singleCount :: [Int64] -> Int64
-singleCount [count] = count
-singleCount _ = 0

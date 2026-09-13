@@ -30,11 +30,10 @@ import Arbiter.Core.Job.Types
   )
 import Arbiter.Core.JobTree ((<~~))
 import Arbiter.Core.JobTree qualified as JT
-import Arbiter.Core.MonadArbiter (JobHandler, MonadArbiter, RegistryOf, ResultOf, executeStatement, withDbTransaction)
+import Arbiter.Core.MonadArbiter (MonadArbiter, RegistryOf, ResultOf, withDbTransaction)
 import Arbiter.Core.Operations qualified as Ops
 import Arbiter.Core.QueueRegistry (RegistryTables)
 import Arbiter.Core.Queues qualified as Q
-import Arbiter.Core.Sql.Query (raw)
 import Arbiter.Core.Worker qualified as WR
 import Arbiter.Test.Poll (waitUntil, withLinkedAsync)
 import Arbiter.Test.Setup (execStatement, execute_, withConn)
@@ -93,13 +92,9 @@ import Test.Hspec
 import UnliftIO.Async (withAsync)
 import UnliftIO.Async qualified as Async
 
--- | Build a worker lifecycle test suite for the given 'Arbiter.Core.MonadArbiter.MonadArbiter' runner.
---
--- @mkSimple@ constructs the backend's payload, @mkHandler@ adapts a plain job
--- action into the backend's 'JobHandler' shape, and @runM@ runs a backend
--- action in 'IO'.
---
--- The queue under test declares @Maybe [Text]@ as its result type.
+import Arbiter.Worker.TestKit.Backend (TestBackend (..))
+
+-- | Worker lifecycle suite. The queue under test declares @Maybe [Text]@ as its result type.
 lifecycleSpec
   :: forall payload m env
    . ( Eq payload
@@ -109,30 +104,13 @@ lifecycleSpec
      , ResultOf m payload ~ Maybe [Text]
      , Show payload
      )
-  => Text
-  -- ^ Schema name, also the LISTEN channel prefix
-  -> Text
-  -- ^ Queue table name
-  -> ByteString
-  -- ^ Connection string, for raw side connections
-  -> (Text -> payload)
-  -- ^ Construct a simple task payload
-  -> IO env
-  -- ^ Create a fresh env over an emptied queue table
-  -> IO env
-  -- ^ A fresh env with the listener disabled (poll-only)
-  -> (env -> IO ())
-  -- ^ Release that env
-  -> ((JobRead payload -> m (ResultOf m payload)) -> JobHandler m payload (ResultOf m payload))
-  -- ^ Adapt a job action into the backend's handler shape
-  -> (forall a. env -> m a -> IO a)
-  -- ^ Runner function
+  => TestBackend payload m env
   -> Spec
-lifecycleSpec schema table connStr mkSimple mkEnv mkEnvPollOnly destroyEnv mkHandler runM =
+lifecycleSpec TestBackend {schema, table, connStr, mkSimple, mkEnv, mkEnvPollOnly, destroyEnv, mkHandler, runCommand, runM} =
   around (bracket mkEnv destroyEnv) $ do
     describe "Reaper op bounding" $ do
       it "completes an op longer than the timeout when each statement is within it" $ \env -> do
-        let sleep = void $ executeStatement (raw "DO $$ BEGIN PERFORM pg_sleep(0.4); END $$")
+        let sleep = runCommand "DO $$ BEGIN PERFORM pg_sleep(0.4); END $$"
         result <-
           runM env $
             runReaperOp silentLogConfig schema 1 "test-reaper-slow-op" 0 $ do
@@ -145,7 +123,7 @@ lifecycleSpec schema table connStr mkSimple mkEnv mkEnvPollOnly destroyEnv mkHan
         result <-
           runM env
             $ runReaperOp silentLogConfig schema 0.5 "test-reaper-stuck-op" 0
-            $ executeStatement (raw "DO $$ BEGIN PERFORM pg_sleep(5); END $$")
+            $ runCommand "DO $$ BEGIN PERFORM pg_sleep(5); END $$"
         result `shouldBe` Nothing
 
     describe "Transactional Atomicity" $ do
@@ -198,7 +176,7 @@ lifecycleSpec schema table connStr mkSimple mkEnv mkEnvPollOnly destroyEnv mkHan
             handler job = do
               recordOp schema (primaryKey job)
               -- User manually commits the transaction (violates our transaction semantics)
-              void $ executeStatement (raw "COMMIT")
+              runCommand "COMMIT"
               throwRetryable "Simulated failure after commit"
 
         void

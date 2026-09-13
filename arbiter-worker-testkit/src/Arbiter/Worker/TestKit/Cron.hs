@@ -12,6 +12,7 @@ import Arbiter.Core.HighLevel qualified as HL
 import Arbiter.Core.Job.Types (DedupKey (IgnoreDuplicate), JobRead, dedupKey, defaultJob, payload)
 import Arbiter.Core.MonadArbiter (withDbTransaction)
 import Arbiter.Core.Operations qualified as Ops
+import Arbiter.Test.Setup (withConn)
 import Arbiter.Worker.Cron
   ( BackfillPolicy (..)
   , CronJob (..)
@@ -32,12 +33,14 @@ import Data.Maybe (isJust)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Time (UTCTime (..), fromGregorian, getCurrentTime, secondsToDiffTime)
-import Database.PostgreSQL.Simple (Only (..), close, connectPostgreSQL)
+import Database.PostgreSQL.Simple (Only (..))
 import Database.PostgreSQL.Simple qualified as PG
 import Database.PostgreSQL.Simple.Types (Identifier (..))
 import Test.Hspec (Spec, around, describe, expectationFailure, it, shouldBe, shouldNotBe, shouldSatisfy)
 import UnliftIO (bracket, catch, newEmptyMVar, putMVar, takeMVar)
 import UnliftIO.Async (wait, withAsync)
+
+import Arbiter.Worker.TestKit.Backend (TestBackend (..))
 
 -- | A silent logger for tests (filters out everything below Error).
 testLogConfig :: LogConfig
@@ -79,33 +82,20 @@ mkTime year month day hour minute second =
 
 clearCronSchedules :: ByteString -> Text -> IO ()
 clearCronSchedules connStr schema =
-  bracket (connectPostgreSQL connStr) close $ \conn ->
+  withConn connStr $ \conn ->
     void (PG.execute conn "DELETE FROM ?.cron_schedules" (Only (Identifier schema)))
       `catch` (\(_ :: PG.SqlError) -> pure ())
 
--- | Cron scheduler test suite, instantiated for each backend.
+-- | Cron scheduler suite.
 cronSpec
   :: forall payload m env
    . ( Eq payload
      , QueueOperation m payload
      , Show payload
      )
-  => Text
-  -- ^ Schema name
-  -> Text
-  -- ^ Queue table name
-  -> ByteString
-  -- ^ Connection string, for side connections
-  -> (Text -> payload)
-  -- ^ Construct a simple task payload
-  -> IO env
-  -- ^ Create a fresh env over an emptied queue table
-  -> (env -> IO ())
-  -- ^ Release that env
-  -> (forall a. env -> m a -> IO a)
-  -- ^ Runner function
+  => TestBackend payload m env
   -> Spec
-cronSpec schema table connStr mkSimple mkEnv destroyEnv runM =
+cronSpec TestBackend {schema, table, connStr, mkSimple, mkEnv, destroyEnv, runM} =
   around (bracket (mkEnv <* clearCronSchedules connStr schema) destroyEnv) $ do
     describe "processCronTick" $ do
       it "inserts a job when the schedule matches the tick time" $ \env -> do
@@ -322,7 +312,7 @@ cronSpec schema table connStr mkSimple mkEnv destroyEnv runM =
           initCronSchedules schema table [cron] testLogConfig
           void $ Ops.requestCronRun schema "run-expire"
 
-        bracket (connectPostgreSQL connStr) close $ \conn ->
+        withConn connStr $ \conn ->
           void $
             PG.execute
               conn
@@ -549,7 +539,7 @@ cronSpec schema table connStr mkSimple mkEnv destroyEnv runM =
             cron = base {backfill = Backfill 600}
         runM env $ initCronSchedules schema table [cron] testLogConfig
 
-        bracket (connectPostgreSQL connStr) close $ \conn ->
+        withConn connStr $ \conn ->
           void $
             PG.execute
               conn
@@ -574,7 +564,7 @@ cronSpec schema table connStr mkSimple mkEnv destroyEnv runM =
                 (\_ _ -> defaultJob (mkSimple "no-replay"))
         runM env $ initCronSchedules schema table [cron] testLogConfig
 
-        bracket (connectPostgreSQL connStr) close $ \conn ->
+        withConn connStr $ \conn ->
           void $
             PG.execute
               conn
@@ -664,7 +654,7 @@ cronSpec schema table connStr mkSimple mkEnv destroyEnv runM =
         let Right cron = cronJob "skew-race" "* * * * *" AllowOverlap (\_ _ -> defaultJob (mkSimple "skew"))
             tick = mkTime 2025 6 15 12 0 0
         runM env $ initCronSchedules schema table [cron] testLogConfig
-        bracket (connectPostgreSQL connStr) close $ \conn ->
+        withConn connStr $ \conn ->
           void $
             PG.execute
               conn
@@ -679,7 +669,7 @@ cronSpec schema table connStr mkSimple mkEnv destroyEnv runM =
             tickPrev = mkTime 2025 6 15 12 0 0
             tickNext = mkTime 2025 6 15 12 1 0
         runM env $ initCronSchedules schema table [cron] testLogConfig
-        bracket (connectPostgreSQL connStr) close $ \conn ->
+        withConn connStr $ \conn ->
           void $
             PG.execute
               conn
