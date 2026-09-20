@@ -13,6 +13,7 @@ import Arbiter.Core.Listen.Driver
   , execOutcome
   , withDriverListenConn
   )
+import Control.Monad ((>=>))
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Data.ByteString (ByteString)
 import Database.PostgreSQL.LibPQ qualified as PQ
@@ -41,7 +42,7 @@ libpqListenConn conn =
     { listenNotifies = fmap (fmap (Notification <$> PQ.notifyRelname <*> PQ.notifyExtra)) (PQ.notifies conn)
     , listenSocket = PQ.socket conn
     , listenConsumeInput = PQ.consumeInput conn
-    , listenExec = \sql -> PQ.exec conn sql >>= execOutcome PQ.CommandOk PQ.resultStatus
+    , listenExec = PQ.exec conn >=> execOutcome PQ.CommandOk PQ.resultStatus
     , listenEscapeIdentifier = PQ.escapeIdentifier conn
     }
 

@@ -107,12 +107,14 @@ data Setup = Setup
   -- ^ Each row's @not_visible_until@, from the start of the simulation.
   , settleLag :: DiffTime
   -- ^ How long a returned statement takes to reach the timers.
+  , logBlocks :: Bool
+  -- ^ The log sink never returns.
   }
   deriving stock (Show)
 
 -- | A setup whose rows carry no lease of their own.
 plainSetup :: DiffTime -> DiffTime -> Maybe DiffTime -> [Reply] -> Setup
-plainSetup every timeout duration answers = Setup every timeout duration answers [] 0
+plainSetup every timeout duration answers = Setup every timeout duration answers [] 0 False
 
 -- | The guard under test and the scenario's event recorder.
 data World s = World
@@ -157,7 +159,7 @@ guardConfig setup epoch recorder script inFlight =
     , configLease = \job -> (`addUTCTime` epoch) . realToFrac <$> lookup job (rowLeases setup)
     , configExtend = extend
     , configExtended = threadDelay (settleLag setup)
-    , configLog = \level jobs _ -> recorder (Logged level jobs)
+    , configLog = \level jobs _ -> recorder (Logged level jobs) >> when (logBlocks setup) (threadDelay neverReturns)
     , configHeartbeat = \job _ _ -> recorder (Heartbeat job)
     }
   where
@@ -277,6 +279,7 @@ genPlan = do
       <*> frequency [(1, pure [Answer 0 []]), (2, choose (1, 4) >>= (`vectorOf` genReply verdicts))]
       <*> pure []
       <*> pure 0
+      <*> pure False
   pure (Plan setup {rowLeases = [(planJob b, rowLeaseAt setup b) | b <- batches]} batches)
 
 -- | The row's @not_visible_until@: the claim leased it before the batch started.
@@ -459,6 +462,10 @@ spec = describe "Guard simulation" $ do
       (\w -> handler w 1 0 (threadDelay 3) >> threadDelay 5)
     $ \events -> [() | (1, Done, _) <- endings events] `is` 1
 
+  it "stops a batch whose failed extend's log never returns, at the lease" $
+    simulate (plainSetup 1 2 Nothing [Refuse 0]) {logBlocks = True} (\w -> handler w 1 0 (threadDelay 10) >> threadDelay 5) $ \events ->
+      [() | (1, Gone reason, at) <- endings events, reason == leaseExpiredReason, withinPause (Time 2) at] `is` 1
+
   it "stops a batch whose extend hangs, at the lease" $
     simulate (plainSetup 1 2 Nothing [Hang]) (\w -> handler w 1 0 (threadDelay 10) >> threadDelay 5) $ \events ->
       [() | (1, Gone reason, at) <- endings events, reason == leaseExpiredReason, withinPause (Time 2) at] `is` 1
@@ -475,15 +482,15 @@ spec = describe "Guard simulation" $ do
         ]
 
   it "takes the initial lease from the row, not from the batch start" $
-    simulate (Setup 5 20 Nothing [Refuse 0] [(1, 3)] 0) (\w -> handler w 1 0 (threadDelay 10) >> threadDelay 6) $ \events ->
+    simulate (Setup 5 20 Nothing [Refuse 0] [(1, 3)] 0 False) (\w -> handler w 1 0 (threadDelay 10) >> threadDelay 6) $ \events ->
       [() | (1, Gone reason, at) <- endings events, reason == leaseExpiredReason, withinPause (Time 3) at] `is` 1
 
   it "takes the batch start where it precedes the row's own lease" $
-    simulate (Setup 5 20 Nothing [Refuse 0] [(1, 9)] 0) (\w -> handler w 1 17 (threadDelay 10) >> threadDelay 6) $ \events ->
+    simulate (Setup 5 20 Nothing [Refuse 0] [(1, 9)] 0 False) (\w -> handler w 1 17 (threadDelay 10) >> threadDelay 6) $ \events ->
       [() | (1, Gone reason, at) <- endings events, reason == leaseExpiredReason, withinPause (Time 3) at] `is` 1
 
   it "keeps a batch whose row lease is already past at register, and says so" $
-    simulate (Setup 5 20 Nothing [Answer 0 []] [(1, -3)] 0) (\w -> handler w 1 0 (threadDelay 2) >> threadDelay 4) $ \events ->
+    simulate (Setup 5 20 Nothing [Answer 0 []] [(1, -3)] 0 False) (\w -> handler w 1 0 (threadDelay 2) >> threadDelay 4) $ \events ->
       conjoin
         [ [() | (1, Done, _) <- endings events] `is` 1
         , [() | Logged Warning [1] _ <- events] `is` 1

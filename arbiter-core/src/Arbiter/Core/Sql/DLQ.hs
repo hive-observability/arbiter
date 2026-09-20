@@ -22,7 +22,7 @@ import NeatInterpolation (text)
 
 import Arbiter.Core.Codec (jobRowCodec)
 import Arbiter.Core.Job.Schema (jobQueueDLQTable, jobQueueTable)
-import Arbiter.Core.Job.Types (JobRead, defaultMaxAttempts)
+import Arbiter.Core.Job.Types (JobRead, defaultMaxAttemptsSQL)
 import Arbiter.Core.Sql.Jobs (dlqCarriedCols, jobColumns, requeuedCols)
 import Arbiter.Core.Sql.QQ (sql)
 import Arbiter.Core.Sql.Query (Query, mwhen, rows)
@@ -35,10 +35,9 @@ data DLQMove = MoveNow | MoveIfExhausted
 -- | The sweep's predicate. Claimable, uncancelled, and out of attempt budget.
 sweepableGuard :: Text
 sweepableGuard =
-  let dma = T.pack (show defaultMaxAttempts)
-   in [text|
+  [text|
         NOT suspended AND cancel_requested_at IS NULL
-        AND attempts >= COALESCE(max_attempts, ${dma})
+        AND attempts >= COALESCE(max_attempts, ${defaultMaxAttemptsSQL})
         AND (not_visible_until IS NULL OR not_visible_until <= NOW())
       |]
 

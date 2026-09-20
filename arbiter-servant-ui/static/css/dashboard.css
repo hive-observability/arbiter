@@ -456,6 +456,7 @@ label.queue-sort-label,
 /* Stat cards link to the filtered job list. No underline: the whole card lifts
    and glows on hover, and presses in on click. */
 .stat-card {
+  position: relative;
   text-decoration: none;
   color: inherit;
   cursor: pointer;
@@ -479,6 +480,20 @@ label.queue-sort-label,
 
 .stat-card.is-danger {
   border-color: var(--arb-danger-border) !important;
+}
+
+/* A secondary count under a stat, in the same voice as the queue card's blocked figure. */
+.stat-card-sub {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0.45rem;
+  margin: 0;
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--arb-purple-on-bg);
+  font-variant-numeric: tabular-nums;
 }
 
 /* ---- Tables ---- */
@@ -888,6 +903,30 @@ label.queue-sort-label,
 
 [data-bs-theme="dark"] .queue-card-hero:hover .queue-card-ready {
   text-shadow: 0 0 18px rgba(0, 212, 255, 0.45);
+}
+
+/* The ready hero with, when there is one, the count a claim skips beside it. */
+.queue-card-headline {
+  display: flex;
+  align-items: baseline;
+  gap: 1.1rem;
+  flex-wrap: wrap;
+}
+
+.queue-card-headline > .queue-card-hero {
+  align-self: auto;
+}
+
+.queue-card-blocked {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 0.4rem;
+  color: var(--arb-purple-on-bg);
+}
+
+.queue-card-blocked .qc-val {
+  color: inherit;
+  font-weight: 600;
 }
 
 .queue-card-ready-label {

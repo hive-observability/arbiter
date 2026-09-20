@@ -5,7 +5,6 @@ module Arbiter.Otel.Gauges.Instruments (registerInstruments) where
 
 import Arbiter.Core.Concurrency.Stats qualified as Conc (ConcurrencyPolicyView (..))
 import Arbiter.Core.Health qualified as Health
-import Arbiter.Core.Job.Types (jobStatusToText)
 import Arbiter.Core.Operations
   ( QueueOverview (..)
   , QueueStats (..)
@@ -14,7 +13,6 @@ import Arbiter.Core.Operations
 import Arbiter.Core.RateLimit.Stats qualified as RL (RateLimitPolicyView (..))
 import Control.Concurrent.STM (readTVarIO)
 import Control.Monad (void)
-import Data.Bifunctor (first)
 import Data.Foldable (toList, traverse_)
 import Data.HashMap.Strict (HashMap)
 import Data.HashMap.Strict qualified as HM
@@ -82,7 +80,7 @@ registerInstruments meter cache = do
     observed $
       over queues $ \overview ->
         [ ([("queue", overviewQueue overview), ("status", status)], fromIntegral count)
-        | (status, count) <- statusCounts (overviewStats overview)
+        | (status, count) <- queueStatusCounts (overviewStats overview)
         ]
   reg Name.QueueDepthByKind "{job}" "Jobs in a queue by payload variant" $
     observed $
@@ -90,7 +88,7 @@ registerInstruments meter cache = do
         [ ([("queue", overviewQueue overview), ("kind", kind)], fromIntegral count)
         | (kind, count) <- Map.toList (kindCounts (overviewStats overview))
         ]
-  reg Name.QueueOldestReadyAge "s" "Age of the oldest claimable job (0 = none ready)" $
+  reg Name.QueueOldestReadyAge "s" "Time the oldest ready or blocked job has waited (0 = none waiting)" $
     perQueue oldestReadyAgeSeconds
   reg Name.QueueOldestInFlightAge "s" "Time the longest-running job has been leased (0 = none in flight)" $
     perQueue oldestInFlightAgeSeconds
@@ -115,8 +113,8 @@ registerInstruments meter cache = do
   reg Name.AdmissionTokens "{token}" "Rate-limit tokens left across a policy's buckets" $
     observed $
       over rateLimits $ \policy ->
-        [ ([("policy", RL.prefix policy), ("stat", stat)], fromMaybe 0 tokens)
-        | (stat, tokens) <- [("min", RL.minTokens policy), ("avg", RL.avgTokens policy)]
+        [ ([("policy", RL.prefix policy), ("stat", stat)], tokens)
+        | (stat, Just tokens) <- [("min", RL.minTokens policy), ("avg", RL.avgTokens policy)]
         ]
 
   reg Name.PgTableDeadTuples "{tuple}" "Dead tuples pending vacuum" $ perTable (fromIntegral . Health.deadTup)
@@ -169,7 +167,6 @@ registerInstruments meter cache = do
   where
     effectiveLimit policy = fromMaybe (Conc.defaultLimit policy) (Conc.overrideLimit policy)
     effectiveMaxTokens policy = fromMaybe (RL.defaultMaxTokens policy) (RL.overrideMaxTokens policy)
-    statusCounts = map (first jobStatusToText) . queueStatusCounts
     connCounts dbHealth =
       [ ("active", Health.connActive dbHealth)
       , ("idle", Health.connIdle dbHealth)

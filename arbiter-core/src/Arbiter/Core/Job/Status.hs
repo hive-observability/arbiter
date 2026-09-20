@@ -14,7 +14,7 @@ import GHC.Generics (Generic)
 
 -- | Effective job status. Arbiter derives status from the stored fields. The status SQL
 -- in "Arbiter.Core.Sql.Jobs" is its source of truth.
-data JobStatus = Ready | InFlight | Backoff | Scheduled | Suspended | Throttled | Cancelled
+data JobStatus = Ready | InFlight | Backoff | Scheduled | Suspended | Throttled | Cancelled | Exhausted
   deriving stock (Bounded, Enum, Eq, Generic, Show)
 
 -- | The wire name for a status.
@@ -26,6 +26,7 @@ jobStatusToText Scheduled = "scheduled"
 jobStatusToText Suspended = "suspended"
 jobStatusToText Throttled = "throttled"
 jobStatusToText Cancelled = "cancelled"
+jobStatusToText Exhausted = "exhausted"
 
 -- | Strict inverse of 'jobStatusToText'. Unknown values are rejected.
 jobStatusFromText :: Text -> Either Text JobStatus

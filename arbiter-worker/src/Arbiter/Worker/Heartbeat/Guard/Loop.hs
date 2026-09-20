@@ -191,7 +191,6 @@ extend
 extend guard issued bound due = do
   lives <- traverse (\entry -> (,) entry <$> pendingOf entry) due
   outcome <- timeout bound (trySync (configExtend config (concatMap snd lives)))
-  land guard
   case outcome of
     Nothing -> traverse_ (retryLater guard) due
     Just (Left exception) -> do
@@ -199,6 +198,7 @@ extend guard issued bound due = do
         configLog config Error (toList (batchJobs (guardedBatch entry))) ("Heartbeat error (retrying): " <> displayEx exception)
       traverse_ (retryLater guard) due
     Just (Right results) -> do
+      land guard
       configExtended config
       currentTime <- getCurrentTime
       let byJob = Map.fromList [(resultId result, result) | result <- results]

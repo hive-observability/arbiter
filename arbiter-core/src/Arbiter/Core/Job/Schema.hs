@@ -86,7 +86,7 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import NeatInterpolation (text)
 
-import Arbiter.Core.Job.Types (defaultMaxAttempts)
+import Arbiter.Core.Job.Types (defaultMaxAttemptsSQL)
 import Arbiter.Core.SqlLiterals (quoteIdentifier, textLiteral)
 
 -- | PostgreSQL schema name, e.g. @"arbiter"@.
@@ -208,10 +208,9 @@ jobQueueArchiveTable schemaName tableName = qualifiedTable schemaName (tableName
 setMaxAttemptsDefaultSQL :: SchemaName -> TableName -> Text
 setMaxAttemptsDefaultSQL schemaName tableName =
   let tbl = jobQueueTable schemaName tableName
-      dma = T.pack (show defaultMaxAttempts)
    in [text|
-        UPDATE ${tbl} SET max_attempts = ${dma} WHERE max_attempts IS NULL;
-        ALTER TABLE ${tbl} ALTER COLUMN max_attempts SET DEFAULT ${dma};
+        UPDATE ${tbl} SET max_attempts = ${defaultMaxAttemptsSQL} WHERE max_attempts IS NULL;
+        ALTER TABLE ${tbl} ALTER COLUMN max_attempts SET DEFAULT ${defaultMaxAttemptsSQL};
       |]
 
 -- | Qualified results table name: @jobQueueResultsTable "arbiter" "email_jobs"@ -> @"arbiter"."email_jobs_results"@

@@ -1065,9 +1065,32 @@ function eventBusTab() {
   };
 }
 
+// Visible jobs waiting for a claim. Blocked rows are the subset a claim skips for now.
+function visibleReady(stats) {
+  return (stats?.readyJobs ?? 0) + (stats?.blockedJobs ?? 0);
+}
+
 // Label for a job's rate-limit or concurrency gate key.
 function gateLabel(g, empty = EMPTY) {
   return g ? g.prefix + ':' + g.suffix : empty;
+}
+
+// Tree-view indent: one band per ancestor level, colours cycling by depth, so a
+// row's bands are its parent's bands plus one. Empty at the root.
+const TREE_BAND_PX = 12;
+const TREE_BAND_FADE_PX = 6;
+const TREE_BAND_TOKENS = ['--arb-teal-dim', '--arb-purple', '--arb-gold'];
+function treeIndentStyle(depth) {
+  if (!depth) return '';
+  const stops = [];
+  for (let level = 0; level < depth; level++) {
+    const token = TREE_BAND_TOKENS[level % TREE_BAND_TOKENS.length];
+    const from = level * TREE_BAND_PX;
+    stops.push(`color-mix(in srgb, var(${token}) 35%, transparent) ${from}px ${from + TREE_BAND_PX}px`);
+  }
+  stops.push(`transparent ${depth * TREE_BAND_PX + TREE_BAND_FADE_PX}px`);
+  const indent = depth * TREE_BAND_PX + TREE_BAND_FADE_PX;
+  return `background: linear-gradient(to right, ${stops.join(', ')}); padding-left: calc(var(--bs-table-cell-padding-x, 0.5rem) + ${indent}px)`;
 }
 
 // Badge classes for a job status, shared by the tables and the detail drawers.
@@ -1079,6 +1102,7 @@ function statusBadgeClass(status) {
     backoff: 'bg-danger-subtle text-danger-emphasis',
     scheduled: 'bg-secondary-subtle text-secondary-emphasis',
     throttled: 'bg-info-subtle text-info-emphasis',
+    exhausted: 'bg-danger-subtle text-danger-emphasis',
     ready: 'bg-success-subtle text-success-emphasis',
   }[status] || 'bg-secondary-subtle text-secondary-emphasis';
 }

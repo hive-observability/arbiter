@@ -187,6 +187,9 @@ rateLimitSpec runM = do
     length admitted `shouldBe` 3
     -- A drained key's fresh jobs are deferred at claim.
     enqueue env (replicate 3 (job "claimskip"))
+    stats <- runM env (HL.getQueueStats @RLPayload)
+    HL.readyJobs stats `shouldBe` 0
+    HL.blockedJobs stats `shouldBe` 3
     skipped <- claim env
     length skipped `shouldBe` 0
 

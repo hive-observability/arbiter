@@ -107,13 +107,13 @@ withConn connStr = bracket (connectPostgreSQL connStr) close
 
 -- | Terminate every other backend on this database whose current query matches the LIKE pattern.
 terminateBackendsMatching :: ByteString -> Text -> IO ()
-terminateBackendsMatching connStr pattern =
+terminateBackendsMatching connStr queryLike =
   withConn connStr $ \conn ->
     void $
       query @_ @(Only Bool)
         conn
         "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE pid <> pg_backend_pid() AND datname = current_database() AND query LIKE ?"
-        (Only pattern)
+        (Only queryLike)
 
 -- | Terminate one backend by pid.
 terminatePid :: ByteString -> Int32 -> IO ()

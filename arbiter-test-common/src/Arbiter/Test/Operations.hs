@@ -1989,6 +1989,52 @@ operationsSpec mkMessage mkResult runM = do
       HL.scheduledJobs stats2 `shouldBe` 0
       HL.suspendedJobs stats2 `shouldBe` 0
 
+    it "getQueueStats ages a due scheduled job from when it became visible" $ \env -> do
+      Just inserted <- runM env (HL.insertJob (defaultJob (mkMessage "DueScheduled")))
+      runM env $ do
+        schemaName <- getSchema
+        let tbl = Schema.jobQueueTable schemaName (HL.queueTable @payload @m)
+        void $
+          execStatement
+            ( "UPDATE "
+                <> tbl
+                <> " SET inserted_at = NOW() - interval '1 day', not_visible_until = NOW() - interval '1 second' WHERE id = ?"
+            )
+            [pval CInt8 (primaryKey inserted)]
+      stats <- runM env (HL.getQueueStats @payload)
+      HL.readyJobs stats `shouldBe` 1
+      HL.oldestReadyAgeSeconds stats `shouldSatisfy` maybe False (< 60)
+
+    it "getQueueStats counts a job out of attempts as exhausted, not ready" $ \env -> do
+      Just inserted <- runM env (HL.insertJob (defaultJob (mkMessage "Exhausted")))
+      runM env $ do
+        schemaName <- getSchema
+        let tbl = Schema.jobQueueTable schemaName (HL.queueTable @payload @m)
+        void $
+          execStatement
+            ("UPDATE " <> tbl <> " SET attempts = max_attempts WHERE id = ?")
+            [pval CInt8 (primaryKey inserted)]
+      claimed <- claimJobs env 10
+      length claimed `shouldBe` 0
+      stats <- runM env (HL.getQueueStats @payload)
+      HL.readyJobs stats `shouldBe` 0
+      HL.exhaustedJobs stats `shouldBe` 1
+      HL.oldestReadyAgeSeconds stats `shouldBe` Nothing
+
+    it "getQueueStats counts grouped jobs behind their head as blocked" $ \env -> do
+      forM_ [1 .. 3 :: Int] $ \index ->
+        void $ runM env (HL.insertJob (defaultGroupedJob "blocked-group" (mkMessage (T.pack ("B" <> show index)))))
+      queued <- runM env (HL.getQueueStats @payload)
+      HL.readyJobs queued `shouldBe` 1
+      HL.blockedJobs queued `shouldBe` 2
+      claimed <- claimJobs env 10
+      length claimed `shouldBe` 1
+      running <- runM env (HL.getQueueStats @payload)
+      HL.inFlightJobs running `shouldBe` 1
+      HL.readyJobs running `shouldBe` 0
+      HL.blockedJobs running `shouldBe` 2
+      HL.oldestReadyAgeSeconds running `shouldSatisfy` isJust
+
   describe "Count Operations" $ do
     it "countJobs returns total job count" $ \env -> do
       -- Insert 4 jobs

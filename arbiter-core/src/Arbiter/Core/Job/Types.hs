@@ -46,6 +46,7 @@ module Arbiter.Core.Job.Types
   , setArchiveFor
   , mapPayload
   , defaultMaxAttempts
+  , defaultMaxAttemptsSQL
   , dayRetention
   , isRollup
 
@@ -86,6 +87,7 @@ import Data.Aeson.Types (Pair)
 import Data.Int (Int32, Int64)
 import Data.Maybe (isJust)
 import Data.Text (Text)
+import Data.Text qualified as T
 import Data.Time (NominalDiffTime, UTCTime)
 import GHC.Generics (Generic)
 import UnliftIO (MonadUnliftIO, withRunInIO)
@@ -152,6 +154,10 @@ data PayloadColumns = PayloadColumns
 -- | Default attempt limit stamped onto jobs whose 'maxAttempts' is unset.
 defaultMaxAttempts :: Int32
 defaultMaxAttempts = 10
+
+-- | 'defaultMaxAttempts' as a SQL literal.
+defaultMaxAttemptsSQL :: Text
+defaultMaxAttemptsSQL = T.pack (show defaultMaxAttempts)
 
 -- | 24h in seconds, a convenience value for 'archiveFor'.
 dayRetention :: Int32

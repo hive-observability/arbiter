@@ -1967,8 +1967,12 @@ data QueueStats = QueueStats
   -- ^ Suspended jobs (e.g. rollup finalizers awaiting their children)
   , cancelledJobs :: Int64
   -- ^ Force-cancelled jobs flagged for teardown and awaiting the reaper
+  , exhaustedJobs :: Int64
+  -- ^ Visible jobs out of attempts, awaiting the reaper's DLQ sweep
+  , blockedJobs :: Int64
+  -- ^ Visible jobs a claim would skip: behind a group's head, or behind a full concurrency or rate-limit key
   , oldestReadyAgeSeconds :: Maybe Double
-  -- ^ Age in seconds of the oldest @ready@ job (Nothing when none are ready).
+  -- ^ Seconds since the oldest ready or blocked job became visible (Nothing when none wait).
   , oldestInFlightAgeSeconds :: Maybe Double
   -- ^ Seconds since the oldest in-flight job was claimed (Nothing when none are
   -- leased). Measures work still running.
@@ -1990,6 +1994,8 @@ instance ToJSON QueueStats where
       , "throttledJobs" .= throttledJobs stats
       , "suspendedJobs" .= suspendedJobs stats
       , "cancelledJobs" .= cancelledJobs stats
+      , "exhaustedJobs" .= exhaustedJobs stats
+      , "blockedJobs" .= blockedJobs stats
       , "oldestReadyAgeSeconds" .= oldestReadyAgeSeconds stats
       , "oldestInFlightAgeSeconds" .= oldestInFlightAgeSeconds stats
       , "dlqJobs" .= dlqJobs stats
@@ -2007,6 +2013,8 @@ instance FromJSON QueueStats where
       <*> obj .: "throttledJobs"
       <*> obj .: "suspendedJobs"
       <*> obj .: "cancelledJobs"
+      <*> obj .:? "exhaustedJobs" .!= 0
+      <*> obj .:? "blockedJobs" .!= 0
       <*> obj .:? "oldestReadyAgeSeconds"
       <*> obj .:? "oldestInFlightAgeSeconds"
       <*> obj .: "dlqJobs"
@@ -2014,19 +2022,26 @@ instance FromJSON QueueStats where
 
 -- | All-zero counts, the fallback for an aggregate query that returned no row.
 emptyQueueStats :: QueueStats
-emptyQueueStats = QueueStats 0 0 0 0 0 0 0 0 Nothing Nothing 0 Map.empty
+emptyQueueStats = QueueStats 0 0 0 0 0 0 0 0 0 0 Nothing Nothing 0 Map.empty
 
--- | The per-status depths a 'QueueStats' carries.
-queueStatusCounts :: QueueStats -> [(JobStatus, Int64)]
+-- | The per-status depths a 'QueueStats' carries, labelled by wire name. Blocked is
+-- a stats partition only. A row's own status reads ready.
+queueStatusCounts :: QueueStats -> [(Text, Int64)]
 queueStatusCounts stats =
-  [ (Ready, readyJobs stats)
-  , (InFlight, inFlightJobs stats)
-  , (Scheduled, scheduledJobs stats)
-  , (Backoff, backoffJobs stats)
-  , (Throttled, throttledJobs stats)
-  , (Suspended, suspendedJobs stats)
-  , (Cancelled, cancelledJobs stats)
+  [ (jobStatusToText Ready, readyJobs stats)
+  , (blockedStatusLabel, blockedJobs stats)
+  , (jobStatusToText InFlight, inFlightJobs stats)
+  , (jobStatusToText Scheduled, scheduledJobs stats)
+  , (jobStatusToText Backoff, backoffJobs stats)
+  , (jobStatusToText Throttled, throttledJobs stats)
+  , (jobStatusToText Suspended, suspendedJobs stats)
+  , (jobStatusToText Cancelled, cancelledJobs stats)
+  , (jobStatusToText Exhausted, exhaustedJobs stats)
   ]
+
+-- | The status label of the blocked partition.
+blockedStatusLabel :: Text
+blockedStatusLabel = "blocked"
 
 -- | Decodes the single aggregate row produced by 'Tmpl.getQueueStatsSQL', whose
 -- select list is built from these same columns.
@@ -2041,6 +2056,8 @@ statsRowCodec =
     <*> col "throttled_jobs" CInt8
     <*> col "suspended_jobs" CInt8
     <*> col "cancelled_jobs" CInt8
+    <*> col "exhausted_jobs" CInt8
+    <*> col "blocked_jobs" CInt8
     <*> ncol "oldest_ready_age_seconds" CFloat8
     <*> ncol "oldest_in_flight_age_seconds" CFloat8
     <*> col "dlq_jobs" CInt8

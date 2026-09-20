@@ -70,7 +70,7 @@
       "id": 2,
       "type": "timeseries",
       "title": "Oldest job age (waiting vs running)",
-      "description": "Shared reading: one replica scans and every replica exports it, so this aggregates with max, never sum. Waiting is the oldest claimable job, running is the longest-held lease. Both read 0 when the queue holds nothing in that state, so a flat zero means idle rather than instant.",
+      "description": "Shared reading: one replica scans and every replica exports it, so this aggregates with max, never sum. Waiting is the oldest job still to be claimed, blocked ones included, running is the longest-held lease. Both read 0 when the queue holds nothing in that state, so a flat zero means idle rather than instant.",
       "datasource": {
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"

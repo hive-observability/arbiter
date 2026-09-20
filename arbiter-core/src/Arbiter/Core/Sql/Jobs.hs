@@ -57,7 +57,7 @@ import Arbiter.Core.Job.Schema
   , jobQueueDLQTable
   , jobQueueTable
   )
-import Arbiter.Core.Job.Types (JobRead, JobStatus)
+import Arbiter.Core.Job.Types (JobRead, JobStatus, defaultMaxAttemptsSQL)
 import Arbiter.Core.Sql.QQ (sql)
 import Arbiter.Core.Sql.Query (Query, mwhen, rows)
 
@@ -171,6 +171,7 @@ throttledPredicateSQL =
   "throttled_until > NOW() AND not_visible_until > NOW()"
 
 -- | The derived job status. Its string values match 'Arbiter.Core.Job.Status.jobStatusToText'.
+-- An exhausted job is visible but out of attempts, awaiting the reaper's DLQ sweep.
 jobStatusCaseSQL :: Text
 jobStatusCaseSQL =
   [text|
@@ -182,6 +183,7 @@ jobStatusCaseSQL =
            AND not_visible_until IS NOT NULL AND not_visible_until > NOW() THEN 'backoff'
       WHEN attempts > 0 AND not_visible_until IS NOT NULL AND not_visible_until > NOW() THEN 'in_flight'
       WHEN not_visible_until IS NOT NULL AND not_visible_until > NOW() THEN 'scheduled'
+      WHEN attempts >= COALESCE(max_attempts, ${defaultMaxAttemptsSQL}) THEN 'exhausted'
       ELSE 'ready'
     END
   |]

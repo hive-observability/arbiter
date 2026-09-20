@@ -16,7 +16,7 @@ import NeatInterpolation (text)
 import Arbiter.Core.Admission (effectivePolicyCol)
 import Arbiter.Core.Concurrency.Schema (arbiterConcurrencyPoliciesTable, arbiterConcurrencyTable)
 import Arbiter.Core.Job.Schema (SchemaName, TableName, jobQueueGroupsTable, jobQueueTable)
-import Arbiter.Core.Job.Types (defaultMaxAttempts)
+import Arbiter.Core.Job.Types (defaultMaxAttemptsSQL)
 import Arbiter.Core.RateLimit.Schema (arbiterRateLimitPoliciesTable, arbiterRateLimitsTable, bucketSeedInsert)
 import Arbiter.Core.Sql.Jobs (jobColumns)
 import Arbiter.Core.Sql.QQ (sql)
@@ -50,8 +50,8 @@ clampedCostExpr = "LEAST(GREATEST(candidate.rate_limit_cost, 0), bucket.max_toke
 -- | The batch a gated group would take, reduced to the row the group cut ranks first,
 -- and the headroom check on that row. Retried rows rank ahead of fresh ones. Each run
 -- comes from an index.
-gatedHeadLateral :: Text -> Text -> Text -> Text -> Text
-gatedHeadLateral tbl dma batchLimit headGate =
+gatedHeadLateral :: Text -> Text -> Text -> Text
+gatedHeadLateral tbl batchLimit headGate =
   [text|
     CROSS JOIN LATERAL (
       SELECT head_batch.concurrency_key, head_batch.claimed_by
@@ -65,7 +65,7 @@ gatedHeadLateral tbl dma batchLimit headGate =
               AND NOT job.suspended
               AND job.cancel_requested_at IS NULL
               AND (job.not_visible_until IS NULL OR job.not_visible_until <= NOW())
-              AND job.attempts < COALESCE(job.max_attempts, ${dma})
+              AND job.attempts < COALESCE(job.max_attempts, ${defaultMaxAttemptsSQL})
               AND job.attempts > 0
             ORDER BY job.attempts DESC, job.priority ASC, job.id ASC
             LIMIT ${batchLimit}
@@ -78,7 +78,7 @@ gatedHeadLateral tbl dma batchLimit headGate =
               AND NOT job.suspended
               AND job.cancel_requested_at IS NULL
               AND (job.not_visible_until IS NULL OR job.not_visible_until <= NOW())
-              AND job.attempts < COALESCE(job.max_attempts, ${dma})
+              AND job.attempts < COALESCE(job.max_attempts, ${defaultMaxAttemptsSQL})
               AND job.attempts = 0
             ORDER BY job.priority ASC, job.id ASC
             LIMIT ${batchLimit}
@@ -95,8 +95,8 @@ gatedHeadLateral tbl dma batchLimit headGate =
 
 -- | Candidate stage one. Groups with ready or due work, locked and reduced
 -- to each head row. A gated group is judged on the row its next batch would take.
-groupCandidateCtes :: Text -> Text -> Text -> Text -> Text -> Text
-groupCandidateCtes groupsTbl tbl overfetch dma gateLateral =
+groupCandidateCtes :: Text -> Text -> Text -> Text -> Text
+groupCandidateCtes groupsTbl tbl overfetch gateLateral =
   [text|
     group_candidates AS (
       (
@@ -132,7 +132,7 @@ groupCandidateCtes groupsTbl tbl overfetch dma gateLateral =
           AND NOT job.suspended
           AND job.cancel_requested_at IS NULL
           AND (job.not_visible_until IS NULL OR job.not_visible_until <= NOW())
-          AND job.attempts < COALESCE(job.max_attempts, ${dma})
+          AND job.attempts < COALESCE(job.max_attempts, ${defaultMaxAttemptsSQL})
         ORDER BY job.priority ASC, job.id ASC
         LIMIT 1
       ) head
@@ -141,8 +141,8 @@ groupCandidateCtes groupsTbl tbl overfetch dma gateLateral =
   |]
 
 -- | Candidate stage two. The ungrouped ready and due pools, numbered into batches.
-ungroupedPoolCtes :: Text -> Text -> Text -> Text -> Text -> Text
-ungroupedPoolCtes tbl ungroupedLimit batchLimit dma ccGate =
+ungroupedPoolCtes :: Text -> Text -> Text -> Text -> Text
+ungroupedPoolCtes tbl ungroupedLimit batchLimit ccGate =
   [text|
     ungrouped_pool AS (
       (
@@ -152,7 +152,7 @@ ungroupedPoolCtes tbl ungroupedLimit batchLimit dma ccGate =
           AND NOT job.suspended
           AND job.cancel_requested_at IS NULL
           AND job.not_visible_until IS NULL
-          AND job.attempts < COALESCE(job.max_attempts, ${dma})
+          AND job.attempts < COALESCE(job.max_attempts, ${defaultMaxAttemptsSQL})
           ${ccGate}
         ORDER BY job.priority ASC, job.id ASC
         LIMIT ${ungroupedLimit}
@@ -165,7 +165,7 @@ ungroupedPoolCtes tbl ungroupedLimit batchLimit dma ccGate =
           AND NOT job.suspended
           AND job.cancel_requested_at IS NULL
           AND job.not_visible_until <= NOW()
-          AND job.attempts < COALESCE(job.max_attempts, ${dma})
+          AND job.attempts < COALESCE(job.max_attempts, ${defaultMaxAttemptsSQL})
           ${ccGate}
         ORDER BY job.not_visible_until ASC
         LIMIT ${ungroupedLimit}
@@ -210,8 +210,8 @@ allocatedSlotCtes batchBudget =
   |]
 
 -- | Candidate stage four. Resolves the allocated slots to rows and locks the claimable set.
-lockedCandidateCtes :: Text -> Text -> Text -> Text -> Text
-lockedCandidateCtes tbl batchLimit dma ungroupedLimit =
+lockedCandidateCtes :: Text -> Text -> Text -> Text
+lockedCandidateCtes tbl batchLimit ungroupedLimit =
   [text|
     grouped_candidates AS (
       SELECT batch.id, target_group.group_key AS expected_group
@@ -223,7 +223,7 @@ lockedCandidateCtes tbl batchLimit dma ungroupedLimit =
           AND NOT suspended
           AND cancel_requested_at IS NULL
           AND (not_visible_until IS NULL OR not_visible_until <= NOW())
-          AND attempts < COALESCE(max_attempts, ${dma})
+          AND attempts < COALESCE(max_attempts, ${defaultMaxAttemptsSQL})
         ORDER BY attempts DESC, priority ASC, id ASC
         LIMIT ${batchLimit}
       ) batch
@@ -251,7 +251,7 @@ lockedCandidateCtes tbl batchLimit dma ungroupedLimit =
         AND job.cancel_requested_at IS NULL
         AND (job.not_visible_until IS NULL OR job.not_visible_until <= NOW())
         AND job.group_key IS NOT DISTINCT FROM selected.expected_group
-        AND job.attempts < COALESCE(job.max_attempts, ${dma})
+        AND job.attempts < COALESCE(job.max_attempts, ${defaultMaxAttemptsSQL})
       ORDER BY job.priority ASC, job.id ASC
       FOR UPDATE OF job SKIP LOCKED
       LIMIT ${ungroupedLimit}
@@ -557,17 +557,16 @@ claimJobsBatchedSQL schema tableName admission batchSize maxBatches timeoutSecon
       timeout = T.pack (show (realToFrac timeoutSeconds :: Double))
       ungroupedLimit = T.pack (show (maxBatches * batchSize))
       overfetch = T.pack (show (maxBatches * 10))
-      dma = T.pack (show defaultMaxAttempts)
       hasRateLimit = admitRateLimited admission
       hasConcurrency = admitConcurrent admission
       jobHeadroom = concHeadroomPred concTbl concPolicies "job"
       headHeadroom = concHeadroomPred concTbl concPolicies "gated_head"
       ccGate = mwhen hasConcurrency [text|AND ${jobHeadroom}|]
-      gateLateral = mwhen hasConcurrency (gatedHeadLateral tbl dma batchLimit headHeadroom)
-      groupCandidates = groupCandidateCtes groupsTbl tbl overfetch dma gateLateral
-      ungroupedPool = ungroupedPoolCtes tbl ungroupedLimit batchLimit dma ccGate
+      gateLateral = mwhen hasConcurrency (gatedHeadLateral tbl batchLimit headHeadroom)
+      groupCandidates = groupCandidateCtes groupsTbl tbl overfetch gateLateral
+      ungroupedPool = ungroupedPoolCtes tbl ungroupedLimit batchLimit ccGate
       allocatedSlots = allocatedSlotCtes batchBudget
-      lockedCandidates = lockedCandidateCtes tbl batchLimit dma ungroupedLimit
+      lockedCandidates = lockedCandidateCtes tbl batchLimit ungroupedLimit
       concLocked = mwhen hasConcurrency (concLockedCte concTbl concPolicies)
       rlSeed = mwhen hasRateLimit (rlSeedCte buckets rlPolicies)
       concJoin = mwhen hasConcurrency "LEFT JOIN conc_locked pool ON pool.concurrency_key = candidate.concurrency_key"

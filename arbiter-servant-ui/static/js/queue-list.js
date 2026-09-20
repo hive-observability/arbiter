@@ -5,7 +5,8 @@
 // Sort keys shared by both views. An absent age sorts below any present one.
 const QUEUE_SORT_KEYS = {
   queue: (r) => r.queue,
-  ready: (r) => r.stats?.readyJobs ?? 0,
+  ready: (r) => visibleReady(r.stats),
+  blocked: (r) => r.stats?.blockedJobs ?? 0,
   inFlight: (r) => r.stats?.inFlightJobs ?? 0,
   scheduled: (r) => r.stats?.scheduledJobs ?? 0,
   backoff: (r) => r.stats?.backoffJobs ?? 0,
@@ -99,7 +100,8 @@ document.addEventListener('alpine:init', () => {
     get summary() {
       return this.rows.reduce((acc, r) => {
         const s = r.stats || {};
-        acc.ready += s.readyJobs || 0;
+        acc.ready += visibleReady(s);
+        acc.blocked += s.blockedJobs || 0;
         acc.inFlight += s.inFlightJobs || 0;
         acc.throttled += s.throttledJobs || 0;
         acc.dlq += s.dlqJobs || 0;
@@ -107,7 +109,7 @@ document.addEventListener('alpine:init', () => {
         acc.workersPaused += r.workersPaused || 0;
         if (r.paused) acc.queuesPaused += 1;
         return acc;
-      }, { ready: 0, inFlight: 0, throttled: 0, dlq: 0, workersLive: 0, workersPaused: 0, queuesPaused: 0 });
+      }, { ready: 0, blocked: 0, inFlight: 0, throttled: 0, dlq: 0, workersLive: 0, workersPaused: 0, queuesPaused: 0 });
     },
 
     // Text reads ascending first, counts descending first.

@@ -24,6 +24,7 @@ import Arbiter.Core.Job.Types
 import Arbiter.Core.MonadArbiter (JobHandler)
 import Arbiter.Core.Operations qualified as Ops
 import Arbiter.Core.QueueRegistry (Queue)
+import Arbiter.Core.RateLimit.Stats qualified as RL
 import Arbiter.Core.SqlLiterals (quoteIdentifier)
 import Arbiter.Core.Trace
   ( ConsumeShape (..)
@@ -113,9 +114,11 @@ import OpenTelemetry.Util (appendOnlyBoundedCollectionValues)
 import System.Directory (doesFileExist)
 import Test.Hspec
 import UnliftIO.Async (withAsync)
+import UnliftIO.STM (atomically)
 
 import Arbiter.Otel qualified as Otel
 import Arbiter.Otel.Gauges.Cache qualified as Cache
+import Arbiter.Otel.Gauges.Instruments (registerInstruments)
 
 newtype Greeting = Greeting Text
   deriving stock (Eq, Generic, Show)
@@ -310,6 +313,21 @@ spec = do
             , ("arbiter.pg.table.blocks", [("table", queue), ("source", "hit")])
             , ("arbiter.pg.table.xid_age", [("table", queue)])
             ]
+
+  describe "instrument export" $ do
+    let withInstruments use = do
+          (meterProvider, env) <- createMeterProvider (materializeResources (mkResource [])) defaultSdkMeterProviderOptions
+          cache <- Cache.newGaugeCache 0
+          meter <- getMeter meterProvider "arbiter"
+          _ <- registerInstruments meter cache
+          use cache env
+        bucketless = RL.RateLimitPolicyView "rl" 3 1 1 Nothing Nothing Nothing 0 0 Nothing Nothing
+        publish cache policies = atomically (Cache.publishSnapshot cache (Cache.Cached 1 (Cache.Snapshot [] Nothing [] [] policies)))
+
+    it "exports no token stats for a policy without buckets" $ withInstruments $ \cache env -> do
+      publish cache [bucketless]
+      points <- collected env
+      filter ((== "arbiter.admission.tokens") . fst) points `shouldBe` []
 
   -- The one series that tells a stopped refresh loop from a fresh reading.
   describe "reading staleness" $ do

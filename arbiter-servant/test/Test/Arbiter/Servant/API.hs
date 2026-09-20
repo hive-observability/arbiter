@@ -956,7 +956,7 @@ spec connStr = do
           Ops.QueueOverview
             { Ops.overviewQueue = "greetings"
             , Ops.overviewStats =
-                Ops.QueueStats 8 3 2 1 1 0 1 0 (Just 12.5) (Just 4.5) 2 $
+                Ops.QueueStats 8 3 2 1 1 0 1 0 0 0 (Just 12.5) (Just 4.5) 2 $
                   Map.fromList [("TestMessage", 5), ("TestCalculation", 3)]
             , Ops.overviewQueuePaused = True
             , Ops.overviewWorkersLive = 4
@@ -979,6 +979,8 @@ spec connStr = do
               , "throttledJobs": 0
               , "suspendedJobs": 1
               , "cancelledJobs": 0
+              , "exhaustedJobs": 0
+              , "blockedJobs": 0
               , "dlqJobs": 2
               , "oldestReadyAgeSeconds": 12.5
               , "oldestInFlightAgeSeconds": 4.5

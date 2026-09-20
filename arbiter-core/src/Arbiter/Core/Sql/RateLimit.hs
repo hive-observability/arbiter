@@ -10,6 +10,7 @@ module Arbiter.Core.Sql.RateLimit
   , wakeThrottledJobsSQL
   , wakeThrottledJobsForKeySQL
   , refilledExpr
+  , refilledBucketTokens
   , rateLimitPoliciesSQL
   , rateLimitPolicyExistsSQL
   , listRateLimitBucketsSQL

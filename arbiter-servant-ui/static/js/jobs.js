@@ -340,7 +340,7 @@ document.addEventListener('alpine:init', () => {
           const queue = Alpine.store('app').selectedQueue;
           // Inserts land as ready/scheduled (or suspended for rollup parents), but
           // never in_flight/backoff/throttled/cancelled, which require a prior claim.
-          const insertsRelevant = !['in_flight', 'backoff', 'throttled', 'cancelled'].includes(this.stateFilter);
+          const insertsRelevant = !['in_flight', 'backoff', 'throttled', 'cancelled', 'exhausted'].includes(this.stateFilter);
           const relevantTypes = insertsRelevant
             ? ['job_inserted', 'job_updated', 'job_deleted']
             : ['job_updated', 'job_deleted'];

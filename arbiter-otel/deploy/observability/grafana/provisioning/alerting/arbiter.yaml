@@ -91,7 +91,7 @@ groups:
             model:
               refId: query
               instant: true
-              expr: (max by (queue) (arbiter_queue_depth{status="ready"}) > 0) and on (queue) (sum by (queue) (arbiter_workers) == 0)
+              expr: (max by (queue) (arbiter_queue_depth{status=~"ready|blocked"}) > 0) and on (queue) (sum by (queue) (arbiter_workers) == 0)
           - refId: threshold
             datasourceUid: __expr__
             model:
@@ -271,7 +271,7 @@ groups:
           severity: warning
         annotations:
           summary: "{{ $labels.table }}: over 20% of the table is dead tuples."
-          description: Vacuum is not keeping up with the churn on this table, and the dead rows slow the claim query. A table autovacuum has never reached reports an age of -1, so age alone does not surface it.
+          description: Vacuum is not keeping up with the churn on this table, and the dead rows slow the claim query. A table autovacuum has never reached exports no age, so age alone does not surface it.
         noDataState: OK
         execErrState: Error
         data:

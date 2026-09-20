@@ -201,6 +201,10 @@ concurrencyLimitSpec runM = do
     enqueue env (replicate 5 (job "cap" "a"))
     first <- claimAs env
     length first `shouldBe` 3
+    stats <- runM env (HL.getQueueStats @CLPayload)
+    HL.inFlightJobs stats `shouldBe` 3
+    HL.readyJobs stats `shouldBe` 0
+    HL.blockedJobs stats `shouldBe` 2
     again <- claimAs env
     length again `shouldBe` 0
 
