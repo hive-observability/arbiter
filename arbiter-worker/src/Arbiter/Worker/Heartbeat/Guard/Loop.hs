@@ -1,15 +1,15 @@
 {-# LANGUAGE OverloadedStrings #-}
 
 -- | The guard loop. It sleeps until the earliest lease, deadline or beat. On
--- waking it fences the batches past a lease or deadline, then issues one
--- extend over every batch due a beat, on a thread of its own so a hung
--- statement cannot stall the fence. A register wakes the loop only when it
--- precedes the published target.
+-- waking it fences the batches past a lease or deadline. It then issues one
+-- extend over every batch due a beat. The extend runs on a thread of its own,
+-- so a hung statement cannot stall the fence. A register wakes the loop only
+-- when it precedes the published target.
 --
--- The lease fence waits for an extend that carries the batch, until that
--- extend gives up, or once it has landed, until it is over. The fence and
--- the settle each take the batch's status in one transaction, so whichever
--- commits first wins and the other sees it.
+-- The lease fence waits for an extend that carries the batch. It waits until
+-- that extend gives up. If the extend lands, it waits a settle grace past
+-- that. The fence and the settle each take the batch's status in one
+-- transaction. Whichever commits first wins and the other sees it.
 module Arbiter.Worker.Heartbeat.Guard.Loop
   ( runHeartbeatGuard
   , trySync
@@ -87,18 +87,18 @@ plan guard = do
 -- | When the guard next acts on a batch. Beats wait for the extend in flight.
 dueTimes :: Maybe InFlight -> (Guarded n job, Status n) -> [Time]
 dueTimes inFlight (entry, status) =
-  [at | not (leaseLapsed status), Just at <- [leaseFenceAt inFlight entry status]]
+  [leaseFenceAt inFlight entry status | not (leaseLapsed status)]
     <> [beatAt status | not (leaseLapsed status), isNothing inFlight]
     <> [deadline | not (deadlineSent status), Just deadline <- [guardedDeadline entry]]
 
 -- | When the lease fence fires. An extend carrying the batch holds it until the extend
--- gives up, or, once landed, until it is over.
-leaseFenceAt :: Maybe InFlight -> Guarded n job -> Status n -> Maybe Time
+-- gives up, or, once landed, a settle grace past that.
+leaseFenceAt :: Maybe InFlight -> Guarded n job -> Status n -> Time
 leaseFenceAt inFlight entry status = case inFlight of
   Just running
-    | carried running, landed running -> Nothing
-    | carried running -> Just (max lease (givesUp running))
-  _ -> Just lease
+    | carried running, landed running -> max lease (addTime settleGrace (givesUp running))
+    | carried running -> max lease (givesUp running)
+  _ -> lease
   where
     lease = leaseAt status
     carried running = Set.member (guardedToken entry) (carries running) && issuedAt running < lease
@@ -138,7 +138,7 @@ lapse :: (MonadSTM n) => HeartbeatGuard n job -> Time -> Guarded n job -> STM n 
 lapse guard woke entry = do
   inFlight <- readTVar (guardInFlight guard)
   status <- readTVar (guardedStatus entry)
-  let lapsed = not (leaseLapsed status) && maybe False (woke >=) (leaseFenceAt inFlight entry status)
+  let lapsed = not (leaseLapsed status) && woke >= leaseFenceAt inFlight entry status
   when lapsed (writeTVar (guardedStatus entry) status {leaseLapsed = True})
   pure (lapsed, not (leaseLapsed status || lapsed))
 
@@ -165,7 +165,7 @@ issue guard woke leased due = do
     writeTVar
       (guardInFlight guard)
       (Just (InFlight issued (addTime bound issued) (Set.fromList (map guardedToken due)) False))
-  void . forkIO $ extend guard issued bound due `finally` finish guard
+  void . forkIO $ (extend guard issued bound due `finally` finish guard) >>= traverse_ (report guard due)
   where
     bound =
       max
@@ -187,24 +187,31 @@ extend
   -> Time
   -> DiffTime
   -> [Guarded n job]
-  -> n ()
+  -> n (Maybe SomeException)
 extend guard issued bound due = do
   lives <- traverse (\entry -> (,) entry <$> pendingOf entry) due
   outcome <- timeout bound (trySync (configExtend config (concatMap snd lives)))
   case outcome of
-    Nothing -> traverse_ (retryLater guard) due
-    Just (Left exception) -> do
-      for_ due $ \entry ->
-        configLog config Error (toList (batchJobs (guardedBatch entry))) ("Heartbeat error (retrying): " <> displayEx exception)
-      traverse_ (retryLater guard) due
+    Nothing -> Nothing <$ traverse_ (retryLater guard) due
+    Just (Left exception) -> Just exception <$ traverse_ (retryLater guard) due
     Just (Right results) -> do
       land guard
       configExtended config
       currentTime <- getCurrentTime
       let byJob = Map.fromList [(resultId result, result) | result <- results]
-      traverse_ (settle guard issued currentTime byJob) lives
+      Nothing <$ traverse_ (settle guard issued currentTime byJob) lives
   where
     config = guardConfig guard
+
+-- | Log a refused extend.
+report :: (Applicative n) => HeartbeatGuard n job -> [Guarded n job] -> SomeException -> n ()
+report guard due exception =
+  for_ due $ \entry ->
+    configLog
+      (guardConfig guard)
+      Error
+      (toList (batchJobs (guardedBatch entry)))
+      ("Heartbeat error (retrying): " <> displayEx exception)
 
 -- | Beat again after a failed extend.
 retryLater :: (MonadMonotonicTime n, MonadSTM n) => HeartbeatGuard n job -> Guarded n job -> n ()

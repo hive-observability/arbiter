@@ -1066,9 +1066,9 @@ function eventBusTab() {
 }
 
 // Visible jobs waiting for a claim: the claimable ready rows plus the blocked ones
-// a claim skips for now. The ready job filter lists both.
+// a claim skips for now. The ready job filter lists both. Unknown without stats.
 function waitingJobs(stats) {
-  return (stats?.readyJobs ?? 0) + (stats?.blockedJobs ?? 0);
+  return stats ? (stats.readyJobs ?? 0) + (stats.blockedJobs ?? 0) : undefined;
 }
 
 // Label for a job's rate-limit or concurrency gate key.

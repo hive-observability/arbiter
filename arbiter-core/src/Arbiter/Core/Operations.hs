@@ -1970,7 +1970,7 @@ data QueueStats = QueueStats
   , exhaustedJobs :: Int64
   -- ^ Visible jobs out of attempts, awaiting the reaper's DLQ sweep
   , blockedJobs :: Int64
-  -- ^ Visible jobs a claim would skip: behind a group's head, or behind a full concurrency or rate-limit key
+  -- ^ Visible jobs a single claim would skip: behind a group's head, or behind a full concurrency or rate-limit key
   , oldestReadyAgeSeconds :: Maybe Double
   -- ^ Seconds since the oldest ready or blocked job became visible (Nothing when none wait).
   , oldestInFlightAgeSeconds :: Maybe Double

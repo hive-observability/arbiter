@@ -10,6 +10,7 @@ module Arbiter.Test.Operations
 import Arbiter.Core.Codec (Col (..), col, pval)
 import Arbiter.Core.HighLevel (SetVisibilityResult (..))
 import Arbiter.Core.HighLevel qualified as HL
+import Arbiter.Core.Job.Archive (archivePrimaryKey)
 import Arbiter.Core.Job.DLQ qualified as DLQ
 import Arbiter.Core.Job.Schema qualified as Schema
 import Arbiter.Core.Job.Types
@@ -2027,6 +2028,65 @@ operationsSpec mkMessage mkResult runM = do
       stats <- runM env (HL.getQueueStats @payload)
       HL.readyJobs stats `shouldBe` 1
       HL.exhaustedJobs stats `shouldBe` 0
+
+    it "retryFromDLQ stamps a stored zero attempt limit with one" $ \env -> do
+      Just inserted <- runM env (HL.insertJob (defaultJob (mkMessage "ZeroAttemptsDLQ")))
+      claimed <- claimJobs env 1
+      void $ runM env (HL.moveToDLQ "Failed" (head claimed))
+      runM env $ do
+        schemaName <- getSchema
+        let dlqTbl = Schema.jobQueueDLQTable schemaName (HL.queueTable @payload @m)
+        void $
+          execStatement ("UPDATE " <> dlqTbl <> " SET max_attempts = 0 WHERE job_id = ?") [pval CInt8 (primaryKey inserted)]
+      dlqJobs <- dlqAll env
+      Just retried <- runM env (HL.retryFromDLQ @payload (DLQ.dlqPrimaryKey (head dlqJobs)))
+      maxAttempts retried `shouldBe` Just minMaxAttempts
+      stats <- runM env (HL.getQueueStats @payload)
+      HL.readyJobs stats `shouldBe` 1
+      HL.exhaustedJobs stats `shouldBe` 0
+
+    it "reEnqueueFromArchive stamps a stored zero attempt limit with one" $ \env -> do
+      Just inserted <-
+        runM env (HL.insertJob (setArchiveFor (Just dayRetention) (defaultJob (mkMessage "ZeroAttemptsArchive"))))
+      claimed <- claimJobs env 1
+      void $ runM env (HL.ackJob (head claimed))
+      runM env $ do
+        schemaName <- getSchema
+        let archiveTbl = Schema.jobQueueArchiveTable schemaName (HL.queueTable @payload @m)
+        void $
+          execStatement ("UPDATE " <> archiveTbl <> " SET max_attempts = 0 WHERE job_id = ?") [pval CInt8 (primaryKey inserted)]
+      Just archived <- runM env (HL.getArchivedJobById @payload (primaryKey inserted))
+      Just again <- runM env (HL.reEnqueueFromArchive @payload (archivePrimaryKey archived))
+      maxAttempts again `shouldBe` Just minMaxAttempts
+
+    it "retryFromDLQ stamps a stored null attempt limit with the default" $ \env -> do
+      Just inserted <- runM env (HL.insertJob (defaultJob (mkMessage "NullAttemptsDLQ")))
+      claimed <- claimJobs env 1
+      void $ runM env (HL.moveToDLQ "Failed" (head claimed))
+      runM env $ do
+        schemaName <- getSchema
+        let dlqTbl = Schema.jobQueueDLQTable schemaName (HL.queueTable @payload @m)
+        void $
+          execStatement ("UPDATE " <> dlqTbl <> " SET max_attempts = NULL WHERE job_id = ?") [pval CInt8 (primaryKey inserted)]
+      dlqJobs <- dlqAll env
+      Just retried <- runM env (HL.retryFromDLQ @payload (DLQ.dlqPrimaryKey (head dlqJobs)))
+      maxAttempts retried `shouldBe` Just defaultMaxAttempts
+
+    it "reEnqueueFromArchive stamps a stored null attempt limit with the default" $ \env -> do
+      Just inserted <-
+        runM env (HL.insertJob (setArchiveFor (Just dayRetention) (defaultJob (mkMessage "NullAttemptsArchive"))))
+      claimed <- claimJobs env 1
+      void $ runM env (HL.ackJob (head claimed))
+      runM env $ do
+        schemaName <- getSchema
+        let archiveTbl = Schema.jobQueueArchiveTable schemaName (HL.queueTable @payload @m)
+        void $
+          execStatement
+            ("UPDATE " <> archiveTbl <> " SET max_attempts = NULL WHERE job_id = ?")
+            [pval CInt8 (primaryKey inserted)]
+      Just archived <- runM env (HL.getArchivedJobById @payload (primaryKey inserted))
+      Just again <- runM env (HL.reEnqueueFromArchive @payload (archivePrimaryKey archived))
+      maxAttempts again `shouldBe` Just defaultMaxAttempts
 
     it "getQueueStats counts grouped jobs behind their head as blocked" $ \env -> do
       forM_ [1 .. 3 :: Int] $ \index ->

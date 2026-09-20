@@ -418,7 +418,7 @@
             <a class="card text-center stat-card" :href="jobsUrl('ready')" @click="goToJobs($event, 'ready')">
               <div class="card-body">
                 <h3 class="card-title text-muted">Waiting</h3>
-                <p class="display-6" :class="zeroClass(waitingJobs(stats))" x-text="stats ? waitingJobs(stats) : EMPTY"></p>
+                <p class="display-6" :class="zeroClass(waitingJobs(stats))" x-text="waitingJobs(stats) ?? EMPTY"></p>
                 <p class="stat-card-sub" x-show="stats?.blockedJobs > 0" title="Visible jobs a claim skips for now: behind a group head, a full concurrency key, or an empty rate-limit bucket">
                   <span x-text="stats?.readyJobs"></span> ready &middot; <span x-text="stats?.blockedJobs"></span> blocked
                 </p>

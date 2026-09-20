@@ -21,6 +21,7 @@ module Arbiter.Worker.Heartbeat.Guard.State
   , heartbeatWait
   , toDiffTime
   , minRetryPause
+  , settleGrace
   , leaseExpiredReason
   , reclaimedReason
   ) where
@@ -45,6 +46,10 @@ import Arbiter.Worker.Logger (LogLevel (..))
 -- | Shortest gap between failed extends.
 minRetryPause :: DiffTime
 minRetryPause = 0.25
+
+-- | Settle time a landed extend gets past its give-up.
+settleGrace :: DiffTime
+settleGrace = 0.25
 
 -- | The reason a batch is stopped at its lease.
 leaseExpiredReason :: Text

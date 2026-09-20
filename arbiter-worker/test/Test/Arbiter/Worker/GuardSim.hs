@@ -466,6 +466,24 @@ spec = describe "Guard simulation" $ do
     simulate (plainSetup 1 2 Nothing [Refuse 0]) {logBlocks = True} (\w -> handler w 1 0 (threadDelay 10) >> threadDelay 5) $ \events ->
       [() | (1, Gone reason, at) <- endings events, reason == leaseExpiredReason, withinPause (Time 2) at] `is` 1
 
+  let afterBlockedLog w = do
+        handler w 1 0 (threadDelay 10)
+        threadDelay 3
+        handler w 2 0 (threadDelay 3)
+        threadDelay 5
+  it "extends a batch registered after a failed extend whose log never returns" $
+    simulate (plainSetup 1 2 Nothing [Refuse 0, Answer 0 []]) {logBlocks = True} afterBlockedLog $ \events ->
+      [() | (2, Done, _) <- endings events] `is` 1
+
+  it "stops a batch whose landed extend never settles, a settle grace past the give-up"
+    $ simulate
+      (plainSetup 1 2 Nothing [Answer 0 []]) {settleLag = neverReturns}
+      (\w -> handler w 1 0 (threadDelay 4) >> threadDelay 5)
+    $ \events ->
+      [ () | (1, Gone reason, at) <- endings events, reason == leaseExpiredReason, withinPause (addTime settleGrace (Time 2)) at
+      ]
+        `is` 1
+
   it "stops a batch whose extend hangs, at the lease" $
     simulate (plainSetup 1 2 Nothing [Hang]) (\w -> handler w 1 0 (threadDelay 10) >> threadDelay 5) $ \events ->
       [() | (1, Gone reason, at) <- endings events, reason == leaseExpiredReason, withinPause (Time 2) at] `is` 1

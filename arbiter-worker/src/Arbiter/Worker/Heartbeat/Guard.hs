@@ -17,6 +17,7 @@ module Arbiter.Worker.Heartbeat.Guard
   , trySync
   , toDiffTime
   , minRetryPause
+  , settleGrace
   , leaseExpiredReason
   , reclaimedReason
   ) where
@@ -32,5 +33,6 @@ import Arbiter.Worker.Heartbeat.Guard.State
   , minRetryPause
   , newHeartbeatGuard
   , reclaimedReason
+  , settleGrace
   , toDiffTime
   )

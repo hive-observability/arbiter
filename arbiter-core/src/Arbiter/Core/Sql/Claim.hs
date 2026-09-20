@@ -6,6 +6,7 @@ module Arbiter.Core.Sql.Claim
   ( ClaimAdmission (..)
   , claimJobsBatchedSQL
   , concHeadroomPred
+  , groupHeadBatch
   ) where
 
 import Data.Text (Text)
@@ -19,7 +20,7 @@ import Arbiter.Core.Concurrency.Schema (arbiterConcurrencyPoliciesTable, arbiter
 import Arbiter.Core.Job.Schema (SchemaName, TableName, jobQueueGroupsTable, jobQueueTable)
 import Arbiter.Core.Job.Types (defaultMaxAttemptsSQL)
 import Arbiter.Core.RateLimit.Schema (arbiterRateLimitPoliciesTable, arbiterRateLimitsTable, bucketSeedInsert)
-import Arbiter.Core.Sql.Jobs (jobColumns)
+import Arbiter.Core.Sql.Jobs (claimablePred, jobColumns)
 import Arbiter.Core.Sql.QQ (sql)
 import Arbiter.Core.Sql.Query (Query, mwhen)
 import Arbiter.Core.Sql.RateLimit (defaultThrottleWaitSeconds, refilledExpr)
@@ -48,45 +49,50 @@ grpRankExpr =
 clampedCostExpr :: Text
 clampedCostExpr = "LEAST(GREATEST(candidate.rate_limit_cost, 0), bucket.max_tokens)"
 
+-- | The batch a group's next claim takes: the two index-served head runs, merged with
+-- retried rows first. Projects @extras@, @priority@ and @id@ over alias @job@.
+groupHeadBatch :: Text -> Text -> [Text] -> Text -> Text
+groupHeadBatch tbl groupKey extras limit =
+  let runCols = T.intercalate ", " (map ("job." <>) (extras <> ["attempts", "priority", "id"]))
+      mergedCols = T.intercalate ", " (map ("merged." <>) (extras <> ["priority", "id"]))
+      claimable = claimablePred "job"
+   in [text|
+    SELECT ${mergedCols}
+    FROM (
+      (
+        SELECT ${runCols}
+        FROM ${tbl} job
+        WHERE job.group_key = ${groupKey}
+          AND ${claimable}
+          AND job.attempts > 0
+        ORDER BY job.attempts DESC, job.priority ASC, job.id ASC
+        LIMIT ${limit}
+      )
+      UNION ALL
+      (
+        SELECT ${runCols}
+        FROM ${tbl} job
+        WHERE job.group_key = ${groupKey}
+          AND ${claimable}
+          AND job.attempts = 0
+        ORDER BY job.priority ASC, job.id ASC
+        LIMIT ${limit}
+      )
+    ) merged
+    ORDER BY merged.attempts DESC, merged.priority ASC, merged.id ASC
+    LIMIT ${limit}
+  |]
+
 -- | The batch a gated group would take, reduced to the row the group cut ranks first,
--- and the headroom check on that row. Retried rows rank ahead of fresh ones. Each run
--- comes from an index.
+-- and the headroom check on that row.
 gatedHeadLateral :: Text -> Text -> Text -> Text
 gatedHeadLateral tbl batchLimit headGate =
-  [text|
+  let headBatch = groupHeadBatch tbl "eligible.group_key" ["concurrency_key", "claimed_by"] batchLimit
+   in [text|
     CROSS JOIN LATERAL (
       SELECT head_batch.concurrency_key, head_batch.claimed_by
       FROM (
-        SELECT merged.concurrency_key, merged.claimed_by, merged.priority, merged.id
-        FROM (
-          (
-            SELECT job.concurrency_key, job.claimed_by, job.attempts, job.priority, job.id
-            FROM ${tbl} job
-            WHERE job.group_key = eligible.group_key
-              AND NOT job.suspended
-              AND job.cancel_requested_at IS NULL
-              AND (job.not_visible_until IS NULL OR job.not_visible_until <= NOW())
-              AND job.attempts < COALESCE(job.max_attempts, ${defaultMaxAttemptsSQL})
-              AND job.attempts > 0
-            ORDER BY job.attempts DESC, job.priority ASC, job.id ASC
-            LIMIT ${batchLimit}
-          )
-          UNION ALL
-          (
-            SELECT job.concurrency_key, job.claimed_by, job.attempts, job.priority, job.id
-            FROM ${tbl} job
-            WHERE job.group_key = eligible.group_key
-              AND NOT job.suspended
-              AND job.cancel_requested_at IS NULL
-              AND (job.not_visible_until IS NULL OR job.not_visible_until <= NOW())
-              AND job.attempts < COALESCE(job.max_attempts, ${defaultMaxAttemptsSQL})
-              AND job.attempts = 0
-            ORDER BY job.priority ASC, job.id ASC
-            LIMIT ${batchLimit}
-          )
-        ) merged
-        ORDER BY merged.attempts DESC, merged.priority ASC, merged.id ASC
-        LIMIT ${batchLimit}
+        ${headBatch}
       ) head_batch
       ORDER BY head_batch.priority ASC, head_batch.id ASC
       LIMIT 1
@@ -98,7 +104,8 @@ gatedHeadLateral tbl batchLimit headGate =
 -- to each head row. A gated group is judged on the row its next batch would take.
 groupCandidateCtes :: Text -> Text -> Text -> Text -> Text
 groupCandidateCtes groupsTbl tbl overfetch gateLateral =
-  [text|
+  let claimable = claimablePred "job"
+   in [text|
     group_candidates AS (
       (
         SELECT group_key FROM ${groupsTbl}
@@ -130,10 +137,7 @@ groupCandidateCtes groupsTbl tbl overfetch gateLateral =
         SELECT job.priority AS min_priority, job.id AS min_id
         FROM ${tbl} job
         WHERE job.group_key = eligible.group_key
-          AND NOT job.suspended
-          AND job.cancel_requested_at IS NULL
-          AND (job.not_visible_until IS NULL OR job.not_visible_until <= NOW())
-          AND job.attempts < COALESCE(job.max_attempts, ${defaultMaxAttemptsSQL})
+          AND ${claimable}
         ORDER BY job.priority ASC, job.id ASC
         LIMIT 1
       ) head
@@ -213,19 +217,17 @@ allocatedSlotCtes batchBudget =
 -- | Candidate stage four. Resolves the allocated slots to rows and locks the claimable set.
 lockedCandidateCtes :: Text -> Text -> Text -> Text
 lockedCandidateCtes tbl batchLimit ungroupedLimit =
-  [text|
+  let claimable = claimablePred "job"
+   in [text|
     grouped_candidates AS (
       SELECT batch.id, target_group.group_key AS expected_group
       FROM final_locked_groups target_group
       CROSS JOIN LATERAL (
-        SELECT id
-        FROM ${tbl}
-        WHERE group_key = target_group.group_key
-          AND NOT suspended
-          AND cancel_requested_at IS NULL
-          AND (not_visible_until IS NULL OR not_visible_until <= NOW())
-          AND attempts < COALESCE(max_attempts, ${defaultMaxAttemptsSQL})
-        ORDER BY attempts DESC, priority ASC, id ASC
+        SELECT job.id
+        FROM ${tbl} job
+        WHERE job.group_key = target_group.group_key
+          AND ${claimable}
+        ORDER BY job.attempts DESC, job.priority ASC, job.id ASC
         LIMIT ${batchLimit}
       ) batch
     ),
@@ -248,11 +250,8 @@ lockedCandidateCtes tbl batchLimit ungroupedLimit =
         SELECT id, expected_group FROM ungrouped_candidates
       ) selected
       INNER JOIN ${tbl} job ON job.id = selected.id
-      WHERE NOT job.suspended
-        AND job.cancel_requested_at IS NULL
-        AND (job.not_visible_until IS NULL OR job.not_visible_until <= NOW())
+      WHERE ${claimable}
         AND job.group_key IS NOT DISTINCT FROM selected.expected_group
-        AND job.attempts < COALESCE(job.max_attempts, ${defaultMaxAttemptsSQL})
       ORDER BY job.priority ASC, job.id ASC
       FOR UPDATE OF job SKIP LOCKED
       LIMIT ${ungroupedLimit}

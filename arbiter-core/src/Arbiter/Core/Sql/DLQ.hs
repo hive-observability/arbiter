@@ -23,7 +23,7 @@ import NeatInterpolation (text)
 import Arbiter.Core.Codec (jobRowCodec)
 import Arbiter.Core.Job.Schema (jobQueueDLQTable, jobQueueTable)
 import Arbiter.Core.Job.Types (JobRead, defaultMaxAttemptsSQL)
-import Arbiter.Core.Sql.Jobs (dlqCarriedCols, jobColumns, requeuedCols)
+import Arbiter.Core.Sql.Jobs (dlqCarriedCols, jobColumns, requeuedCols, requeuedVals)
 import Arbiter.Core.Sql.QQ (sql)
 import Arbiter.Core.Sql.Query (Query, mwhen, rows)
 import Arbiter.Core.Sql.Tree (lockedByIdsCte)
@@ -154,7 +154,7 @@ retryFromDLQSQL schema tableName dlqId =
                      OR EXISTS (SELECT 1 FROM ${tbl} WHERE parent_id = dead.job_id)
                    ELSE FALSE
                  END,
-                 ${requeuedCols}
+                 ${requeuedVals}
           FROM deleted dead
           RETURNING *
         ),

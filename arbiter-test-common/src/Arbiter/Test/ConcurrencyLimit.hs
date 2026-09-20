@@ -208,6 +208,16 @@ concurrencyLimitSpec runM = do
     again <- claimAs env
     length again `shouldBe` 0
 
+  it "counts a visible row still stamped by its claim as ready, not blocked by its own full key" $ \env -> do
+    seed env 1
+    enqueue env (replicate 2 (job "cap" "a"))
+    first <- claimAs env
+    length first `shouldBe` 1
+    timeOut env 120
+    stats <- runM env (HL.getQueueStats @CLPayload)
+    HL.readyJobs stats `shouldBe` 1
+    HL.blockedJobs stats `shouldBe` 1
+
   it "an undeclared pool runs uncapped (fail open)" $ \env -> do
     -- Claim well above any seeded limit.
     enqueue env (replicate 20 (job "undeclared" "a"))

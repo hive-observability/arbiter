@@ -5,7 +5,7 @@
 // Sort keys shared by both views. An absent age sorts below any present one.
 const QUEUE_SORT_KEYS = {
   queue: (r) => r.queue,
-  waiting: (r) => waitingJobs(r.stats),
+  waiting: (r) => waitingJobs(r.stats) ?? 0,
   ready: (r) => r.stats?.readyJobs ?? 0,
   blocked: (r) => r.stats?.blockedJobs ?? 0,
   inFlight: (r) => r.stats?.inFlightJobs ?? 0,
@@ -101,7 +101,7 @@ document.addEventListener('alpine:init', () => {
     get summary() {
       return this.rows.reduce((acc, r) => {
         const s = r.stats || {};
-        acc.waiting += waitingJobs(s);
+        acc.waiting += waitingJobs(s) || 0;
         acc.ready += s.readyJobs || 0;
         acc.blocked += s.blockedJobs || 0;
         acc.inFlight += s.inFlightJobs || 0;

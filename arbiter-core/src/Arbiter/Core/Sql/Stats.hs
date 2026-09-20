@@ -18,11 +18,10 @@ import Arbiter.Core.Admission (effectivePolicyCol)
 import Arbiter.Core.Codec (RowCodec)
 import Arbiter.Core.Concurrency.Schema (arbiterConcurrencyPoliciesTable, arbiterConcurrencyTable)
 import Arbiter.Core.Job.Schema (SchemaName, TableName, jobQueueDLQTable, jobQueueGroupsTable, jobQueueTable)
-import Arbiter.Core.Job.Types (defaultMaxAttemptsSQL)
 import Arbiter.Core.Queues (arbiterQueuesTable)
 import Arbiter.Core.RateLimit.Schema (arbiterRateLimitPoliciesTable, arbiterRateLimitsTable)
-import Arbiter.Core.Sql.Claim (concHeadroomPred)
-import Arbiter.Core.Sql.Jobs (jobStatusCaseSQL, unionAllOverQueueTables)
+import Arbiter.Core.Sql.Claim (concHeadroomPred, groupHeadBatch)
+import Arbiter.Core.Sql.Jobs (claimablePred, jobStatusCaseSQL, unionAllOverQueueTables)
 import Arbiter.Core.Sql.QQ (sql)
 import Arbiter.Core.Sql.Query (Query, rawRows)
 import Arbiter.Core.Sql.RateLimit (refilledBucketTokens)
@@ -36,17 +35,18 @@ getQueueStatsSQL :: RowCodec a -> SchemaName -> TableName -> [Text] -> Query a
 getQueueStatsSQL codec schema tableName kinds = rawRows codec (queueStatsSelect schema tableName kinds)
 
 -- | One queue's stats row. The classified rows are aggregated once per kind and once
--- over the whole table in one pass. @total_row@ marks the whole-table row. The ready
--- rows a claim would skip are counted apart and moved into blocked.
+-- over the whole table in one pass. @total_row@ marks the whole-table row. A ready
+-- row a claim would skip counts as blocked instead.
 queueStatsSelect :: SchemaName -> TableName -> [Text] -> Text
 queueStatsSelect schema tableName kinds =
   let tbl = jobQueueTable schema tableName
       dlqTbl = jobQueueDLQTable schema tableName
       kindExpr = declaredKindSQL kinds
-      blocked = blockedJobsSQL schema tableName
+      heads = groupHeadsSQL schema tableName
+      blocked = blockedExpr schema
    in [text|
         SELECT MAX(total_jobs) FILTER (WHERE total_row = 1) AS total_jobs,
-               MAX(ready_jobs) FILTER (WHERE total_row = 1) - blocked.blocked_jobs AS ready_jobs,
+               MAX(ready_jobs) FILTER (WHERE total_row = 1) AS ready_jobs,
                MAX(in_flight_jobs) FILTER (WHERE total_row = 1) AS in_flight_jobs,
                MAX(scheduled_jobs) FILTER (WHERE total_row = 1) AS scheduled_jobs,
                MAX(backoff_jobs) FILTER (WHERE total_row = 1) AS backoff_jobs,
@@ -54,7 +54,7 @@ queueStatsSelect schema tableName kinds =
                MAX(suspended_jobs) FILTER (WHERE total_row = 1) AS suspended_jobs,
                MAX(cancelled_jobs) FILTER (WHERE total_row = 1) AS cancelled_jobs,
                MAX(exhausted_jobs) FILTER (WHERE total_row = 1) AS exhausted_jobs,
-               blocked.blocked_jobs,
+               MAX(blocked_jobs) FILTER (WHERE total_row = 1) AS blocked_jobs,
                MAX(oldest_ready_age_seconds) FILTER (WHERE total_row = 1) AS oldest_ready_age_seconds,
                MAX(oldest_in_flight_age_seconds) FILTER (WHERE total_row = 1) AS oldest_in_flight_age_seconds,
                (SELECT COUNT(*)::int8 FROM ${dlqTbl}) AS dlq_jobs,
@@ -62,7 +62,7 @@ queueStatsSelect schema tableName kinds =
         FROM (
           SELECT kind, GROUPING(kind) AS total_row,
                  COUNT(*)::int8 AS total_jobs,
-                 COUNT(*) FILTER (WHERE status = 'ready') AS ready_jobs,
+                 COUNT(*) FILTER (WHERE status = 'ready' AND NOT blocked) AS ready_jobs,
                  COUNT(*) FILTER (WHERE status = 'in_flight') AS in_flight_jobs,
                  COUNT(*) FILTER (WHERE status = 'scheduled') AS scheduled_jobs,
                  COUNT(*) FILTER (WHERE status = 'backoff') AS backoff_jobs,
@@ -70,6 +70,7 @@ queueStatsSelect schema tableName kinds =
                  COUNT(*) FILTER (WHERE status = 'suspended') AS suspended_jobs,
                  COUNT(*) FILTER (WHERE status = 'cancelled') AS cancelled_jobs,
                  COUNT(*) FILTER (WHERE status = 'exhausted') AS exhausted_jobs,
+                 COUNT(*) FILTER (WHERE blocked) AS blocked_jobs,
                  EXTRACT(EPOCH FROM (
                    clock_timestamp() - MIN(GREATEST(inserted_at, not_visible_until)) FILTER (WHERE status = 'ready')
                  ))::float8 AS oldest_ready_age_seconds,
@@ -77,77 +78,48 @@ queueStatsSelect schema tableName kinds =
                    clock_timestamp() - MIN(last_attempted_at) FILTER (WHERE status = 'in_flight')
                  ))::float8 AS oldest_in_flight_age_seconds
           FROM (
-            SELECT inserted_at, not_visible_until, last_attempted_at, ${kindExpr} AS kind, ${jobStatusCaseSQL} AS status
-            FROM ${tbl}
+            SELECT inserted_at, not_visible_until, last_attempted_at, ${kindExpr} AS kind, ${jobStatusCaseSQL} AS status,
+                   ${blocked} AS blocked
+            FROM ${tbl} job
+            LEFT JOIN (${heads}) head ON head.id = job.id
           ) classified
           GROUP BY GROUPING SETS ((), (kind))
         ) rollup
-        CROSS JOIN (${blocked}) blocked
-        GROUP BY blocked.blocked_jobs
       |]
 
--- | The count of ready rows a claim would skip: behind a group's head, or behind a
--- full concurrency or rate-limit key. Only rows under a group or a key reach the head join.
-blockedJobsSQL :: SchemaName -> TableName -> Text
-blockedJobsSQL schema tableName =
-  let tbl = jobQueueTable schema tableName
-      concTbl = arbiterConcurrencyTable schema
+-- | Whether a row is one a claim would skip, over alias @job@ joined to its group
+-- head as @head@: behind the head, or behind a full concurrency or rate-limit key.
+-- The CASE keeps the key probes off every row a claim would not consider.
+blockedExpr :: SchemaName -> Text
+blockedExpr schema =
+  let concTbl = arbiterConcurrencyTable schema
       concPolicies = arbiterConcurrencyPoliciesTable schema
       buckets = arbiterRateLimitsTable schema
       rlPolicies = arbiterRateLimitPoliciesTable schema
-      heads = groupHeadsSQL schema tableName
+      claimable = claimablePred "job"
       concOk = concHeadroomPred concTbl concPolicies "job"
       rlOk = rateLimitHeadroomPred buckets rlPolicies "job"
    in [text|
-        SELECT COUNT(*)::int8 AS blocked_jobs
-        FROM ${tbl} job
-        LEFT JOIN (${heads}) head ON head.id = job.id
-        WHERE NOT job.suspended
-          AND job.cancel_requested_at IS NULL
-          AND (job.not_visible_until IS NULL OR job.not_visible_until <= NOW())
-          AND job.attempts < COALESCE(job.max_attempts, ${defaultMaxAttemptsSQL})
-          AND (job.group_key IS NOT NULL OR job.concurrency_key IS NOT NULL OR job.rate_limit_key IS NOT NULL)
-          AND ((job.group_key IS NOT NULL AND head.id IS NULL) OR NOT ${concOk} OR NOT ${rlOk})
+        CASE WHEN ${claimable}
+             THEN (job.group_key IS NOT NULL AND head.id IS NULL) OR NOT ${concOk} OR NOT ${rlOk}
+             ELSE FALSE END
       |]
 
+-- | A batch limit of one row. The head is judged as a single claim takes it.
+headOnly :: Text
+headOnly = "1"
+
 -- | The id of each open group's head, the row a claim of that group takes first.
--- Mirrors the claim's group candidates and its two index-served head runs.
 groupHeadsSQL :: SchemaName -> TableName -> Text
 groupHeadsSQL schema tableName =
   let tbl = jobQueueTable schema tableName
       groupsTbl = jobQueueGroupsTable schema tableName
-      candidate =
-        [text|
-          job.group_key = summary.group_key
-          AND NOT job.suspended
-          AND job.cancel_requested_at IS NULL
-          AND (job.not_visible_until IS NULL OR job.not_visible_until <= NOW())
-          AND job.attempts < COALESCE(job.max_attempts, ${defaultMaxAttemptsSQL})
-        |]
+      headBatch = groupHeadBatch tbl "summary.group_key" [] headOnly
    in [text|
         SELECT head.id
         FROM ${groupsTbl} summary
         CROSS JOIN LATERAL (
-          SELECT merged.id
-          FROM (
-            (
-              SELECT job.id, job.attempts, job.priority
-              FROM ${tbl} job
-              WHERE ${candidate} AND job.attempts > 0
-              ORDER BY job.attempts DESC, job.priority ASC, job.id ASC
-              LIMIT 1
-            )
-            UNION ALL
-            (
-              SELECT job.id, job.attempts, job.priority
-              FROM ${tbl} job
-              WHERE ${candidate} AND job.attempts = 0
-              ORDER BY job.priority ASC, job.id ASC
-              LIMIT 1
-            )
-          ) merged
-          ORDER BY merged.attempts DESC, merged.priority ASC, merged.id ASC
-          LIMIT 1
+          ${headBatch}
         ) head
         WHERE summary.job_count > 0
           AND ((summary.ready_count > 0 AND summary.in_flight_until IS NULL) OR summary.next_due <= NOW())

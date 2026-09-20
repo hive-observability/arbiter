@@ -14,6 +14,7 @@ module Arbiter.Core.Sql.Jobs
   , sortDirSql
   , throttledPredicateSQL
   , jobStatusCaseSQL
+  , claimablePred
   , listJobsFilteredSQL
   , listJobsWithStatusSQL
   , countJobsFilteredSQL
@@ -27,7 +28,9 @@ module Arbiter.Core.Sql.Jobs
   , jobColsExceptId
   , dlqCarriedCols
   , requeuedCols
+  , requeuedVals
   , enqueuedAgainCols
+  , enqueuedAgainVals
   , jobColumns
   , dedupUpdateSet
   , insertJobSQL
@@ -57,7 +60,7 @@ import Arbiter.Core.Job.Schema
   , jobQueueDLQTable
   , jobQueueTable
   )
-import Arbiter.Core.Job.Types (JobRead, JobStatus, defaultMaxAttemptsSQL)
+import Arbiter.Core.Job.Types (JobRead, JobStatus, defaultMaxAttemptsSQL, minMaxAttemptsSQL)
 import Arbiter.Core.Sql.QQ (sql)
 import Arbiter.Core.Sql.Query (Query, mwhen, rows)
 
@@ -186,6 +189,17 @@ jobStatusCaseSQL =
       WHEN attempts >= COALESCE(max_attempts, ${defaultMaxAttemptsSQL}) THEN 'exhausted'
       ELSE 'ready'
     END
+  |]
+
+-- | The rows a claim considers, over a row alias: unsuspended, uncancelled, visible,
+-- and within the attempt budget.
+claimablePred :: Text -> Text
+claimablePred alias =
+  [text|
+    NOT ${alias}.suspended
+    AND ${alias}.cancel_requested_at IS NULL
+    AND (${alias}.not_visible_until IS NULL OR ${alias}.not_visible_until <= NOW())
+    AND ${alias}.attempts < COALESCE(${alias}.max_attempts, ${defaultMaxAttemptsSQL})
   |]
 
 -- | All job columns plus the derived @status@ column, aliased @job@, for filtering.
@@ -352,22 +366,47 @@ dlqCarriedCols =
   |]
 
 -- | Job columns a DLQ retry carries back to the main table. The retry re-arms the rest.
-requeuedCols :: Text
-requeuedCols =
-  [text|
-    payload, group_key, priority, max_attempts, parent_id, parent_state, traceparent, tracestate,
-    archive_for, kind, rate_limit_key, rate_limit_prefix, concurrency_key, concurrency_prefix,
-    rate_limit_cost
-  |]
+requeuedColumnNames :: [Text]
+requeuedColumnNames =
+  [ "payload"
+  , "group_key"
+  , "priority"
+  , "max_attempts"
+  , "parent_id"
+  , "parent_state"
+  , "traceparent"
+  , "tracestate"
+  , "archive_for"
+  , "kind"
+  , "rate_limit_key"
+  , "rate_limit_prefix"
+  , "concurrency_key"
+  , "concurrency_prefix"
+  , "rate_limit_cost"
+  ]
 
--- | 'requeuedCols' for an archive re-enqueue, without the parent link.
+requeuedCols :: Text
+requeuedCols = joinColumns requeuedColumnNames
+
+-- | 'requeuedCols' as select expressions, with the attempt limit clamped.
+requeuedVals :: Text
+requeuedVals = joinColumns (map clampedAttemptLimit requeuedColumnNames)
+
+-- | 'requeuedColumnNames' for an archive re-enqueue, without the parent link.
+enqueuedAgainColumnNames :: [Text]
+enqueuedAgainColumnNames = filter (`notElem` ["parent_id", "parent_state"]) requeuedColumnNames
+
 enqueuedAgainCols :: Text
-enqueuedAgainCols =
-  [text|
-    payload, group_key, priority, max_attempts, traceparent, tracestate,
-    archive_for, kind, rate_limit_key, rate_limit_prefix, concurrency_key, concurrency_prefix,
-    rate_limit_cost
-  |]
+enqueuedAgainCols = joinColumns enqueuedAgainColumnNames
+
+-- | 'enqueuedAgainCols' as select expressions, with the attempt limit clamped.
+enqueuedAgainVals :: Text
+enqueuedAgainVals = joinColumns (map clampedAttemptLimit enqueuedAgainColumnNames)
+
+clampedAttemptLimit :: Text -> Text
+clampedAttemptLimit column
+  | column == "max_attempts" = [text|GREATEST(COALESCE(max_attempts, ${defaultMaxAttemptsSQL}), ${minMaxAttemptsSQL})|]
+  | otherwise = column
 
 -- | @DO UPDATE SET@ body for a replace-dedup upsert. Copies each writable column
 -- from the excluded row, then re-arms the replaced job for a fresh run.

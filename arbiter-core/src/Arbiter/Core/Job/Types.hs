@@ -48,6 +48,7 @@ module Arbiter.Core.Job.Types
   , defaultMaxAttempts
   , defaultMaxAttemptsSQL
   , minMaxAttempts
+  , minMaxAttemptsSQL
   , dayRetention
   , isRollup
 
@@ -163,6 +164,10 @@ defaultMaxAttemptsSQL = T.pack (show defaultMaxAttempts)
 -- | Lowest attempt limit a job is stamped with. Every job gets at least one attempt.
 minMaxAttempts :: Int32
 minMaxAttempts = 1
+
+-- | 'minMaxAttempts' as a SQL literal.
+minMaxAttemptsSQL :: Text
+minMaxAttemptsSQL = T.pack (show minMaxAttempts)
 
 -- | 24h in seconds, a convenience value for 'archiveFor'.
 dayRetention :: Int32

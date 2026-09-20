@@ -294,7 +294,7 @@ main = hspec $ do
     it "measures queue ages from clock_timestamp, so none of them can go negative" $ do
       let rendered = squished (statsSQL [])
       rendered `shouldSatisfy` T.isInfixOf "clock_timestamp() - MIN(last_attempted_at)"
-      rendered `shouldSatisfy` T.isInfixOf "clock_timestamp() - MIN(inserted_at)"
+      rendered `shouldSatisfy` T.isInfixOf "clock_timestamp() - MIN(GREATEST(inserted_at, not_visible_until))"
       rendered `shouldSatisfy` (not . T.isInfixOf "NOW() - MIN(")
 
     it "renders each job filter against the column its table names" $ do
@@ -318,7 +318,8 @@ main = hspec $ do
       let rendered = squished (statsSQL (kindsFor @KindPayload))
       rendered `shouldSatisfy` T.isInfixOf "GROUP BY GROUPING SETS ((), (kind))"
       rendered `shouldSatisfy` T.isInfixOf "jsonb_object_agg"
-      T.count "FROM \"arbiter\".\"jobs\"" rendered `shouldBe` 1
+      -- One full pass. The rest are the per-group head lookups.
+      T.count "FROM \"arbiter\".\"jobs\"" rendered - T.count "job.group_key = summary.group_key" rendered `shouldBe` 1
 
     it "rolls up only the labels the payload declares" $
       squished (statsSQL (kindsFor @KindPayload))

@@ -390,9 +390,14 @@ timedOut :: MigrationResult String -> Bool
 timedOut (MigrationError message) = "Timed out waiting on the arbiter migration lock" `isInfixOf` message
 timedOut MigrationSuccess = False
 
--- | The next event-stream payload, or 'Nothing' when none lands within a second.
+-- | The next event for the reconciliation queue, within a second. Every schema in the
+-- database shares the channel.
 nextEvent :: PG.Connection -> IO (Maybe ByteString)
-nextEvent lconn = fmap notificationData <$> timeout 1_000_000 (getNotification lconn)
+nextEvent lconn = timeout 1_000_000 own
+  where
+    own = do
+      payload <- notificationData <$> getNotification lconn
+      if BS.isInfixOf "\"table\" : \"migration_reconciliation_q\"" payload then pure payload else own
 
 assertEvent :: ByteString -> Maybe ByteString -> IO ()
 assertEvent event = assertBool ("expected a " <> BS8.unpack event <> " event") . maybe False (BS.isInfixOf event)

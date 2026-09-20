@@ -24,7 +24,7 @@ import NeatInterpolation (text)
 import Arbiter.Core.Codec (archiveRowCodec, codecColumns, jobRowCodec, joinColumns)
 import Arbiter.Core.Job.Schema (jobQueueArchiveTable, jobQueueTable)
 import Arbiter.Core.Job.Types (JobRead)
-import Arbiter.Core.Sql.Jobs (enqueuedAgainCols, jobColsExceptId, jobColumns)
+import Arbiter.Core.Sql.Jobs (enqueuedAgainCols, enqueuedAgainVals, jobColsExceptId, jobColumns)
 import Arbiter.Core.Sql.QQ (sql)
 import Arbiter.Core.Sql.Query (Query, rows)
 
@@ -123,7 +123,7 @@ reEnqueueFromArchiveSQL schema tableName archiveId =
         (jobRowCodec tableName)
         [sql|
           INSERT INTO ${tbl} (${enqueuedAgainCols})
-          SELECT ${enqueuedAgainCols}
+          SELECT ${enqueuedAgainVals}
           FROM ${archiveTbl}
           WHERE id = #{archiveId :: CInt8}
           RETURNING ${jobColumns}
