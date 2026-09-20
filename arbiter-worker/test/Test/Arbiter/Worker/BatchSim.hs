@@ -244,6 +244,13 @@ extendRow job now rows = case Map.lookup (jobId job) rows of
     | otherwise ->
         (VisibilityExtended (jobId job), Map.insert (jobId job) row {rowLease = Just (addTime leaseTimeout now)} rows)
 
+-- | The heartbeat's one statement over a batch.
+extendRows :: [Job] -> Statement [SetVisibilityResult]
+extendRows jobs now table =
+  let step acc job = let (result, acc') = extendRow job now acc in (acc', result)
+      (table', results) = mapAccumL step table jobs
+   in (results, table')
+
 -- | A force-cancel over one row. The holder to notify, and the op that landed.
 flagRow :: JobId -> Statement (Maybe Holder, Maybe Op)
 flagRow job now rows = case Map.lookup job rows of
@@ -388,7 +395,7 @@ guardConfigFor rows recorder script deadline =
         case reply of
           Refuses -> refuseExtend
           Hangs -> hangExtend
-          Extends -> traverse (\job -> statement rows (extendRow job)) jobs
+          Extends -> statement rows (extendRows jobs)
     , configExtended = pure ()
     , configLog = \_ _ _ -> pure ()
     , configHeartbeat = \_ _ _ -> pure ()
