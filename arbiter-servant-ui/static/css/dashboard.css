@@ -699,16 +699,16 @@ label.queue-sort-label,
 /* ---- Queue-list landing: a grid of queue cards, the app's hero surface ---- */
 .queue-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
-  gap: 1rem;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 1.35rem;
 }
 
 .queue-card {
   position: relative;
   display: flex;
   flex-direction: column;
-  gap: 1rem;
-  padding: 1.1rem 1.2rem 1.25rem;
+  gap: 1.35rem;
+  padding: 1.5rem 1.6rem 1.65rem;
   background-color: var(--arb-surface);
   border: 1px solid var(--arb-border-accent);
   border-radius: 0.6rem;
@@ -872,7 +872,7 @@ label.queue-sort-label,
 .queue-card-body {
   display: flex;
   flex-direction: column;
-  gap: 0.9rem;
+  gap: 1.2rem;
 }
 
 .queue-card-hero {
@@ -905,28 +905,38 @@ label.queue-sort-label,
   text-shadow: 0 0 18px rgba(0, 212, 255, 0.45);
 }
 
-/* The ready hero with, when there is one, the count a claim skips beside it. */
+/* The waiting hero over its ready and blocked split. Both lines always render so
+   every card is the same height. */
 .queue-card-headline {
   display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.queue-card-split {
+  display: flex;
   align-items: baseline;
-  gap: 1.1rem;
-  flex-wrap: wrap;
+  gap: 0.9rem;
+  white-space: nowrap;
 }
 
-.queue-card-headline > .queue-card-hero {
-  align-self: auto;
-}
-
-.queue-card-blocked {
+.queue-card-split-ready,
+.queue-card-split-blocked {
   display: inline-flex;
   align-items: baseline;
   gap: 0.4rem;
+}
+
+.queue-card-split-blocked {
   color: var(--arb-purple-on-bg);
 }
 
-.queue-card-blocked .qc-val {
-  color: inherit;
+.queue-card-split .qc-val {
   font-weight: 600;
+}
+
+.queue-card-split-blocked .qc-val {
+  color: inherit;
 }
 
 .queue-card-ready-label {
@@ -944,9 +954,9 @@ label.queue-sort-label,
 .queue-card-stats {
   display: grid;
   grid-template-columns: repeat(2, 1fr);
-  gap: 0.45rem 1rem;
+  gap: 0.7rem 1.25rem;
   margin: 0;
-  padding-top: 0.85rem;
+  padding-top: 1.1rem;
   border-top: 1px solid var(--arb-border);
 }
 

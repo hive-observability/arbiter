@@ -73,7 +73,11 @@
       <div x-html="LOAD_ERROR_HTML"></div>
       <!-- Instance roll-up: the whole-fleet answer to "is anything wrong". -->
       <div class="queue-summary" :class="summaryClass(rows.length > 0)">
-        <div class="qs-item">
+        <div class="qs-item" title="Visible jobs waiting for a claim: ready plus blocked">
+          <span class="qs-val" x-text="fmtCount(summary.waiting)"></span>
+          <span class="qs-lbl">waiting</span>
+        </div>
+        <div class="qs-item" title="Jobs a claim takes now">
           <span class="qs-val" x-text="fmtCount(summary.ready)"></span>
           <span class="qs-lbl">ready</span>
         </div>
@@ -134,13 +138,14 @@
             <select id="queue-sort-select" class="queue-sort-select" x-model="sortBy"
               @change="sortDir = defaultSortDir(sortBy)">
               <option value="queue">Name</option>
+              <option value="waiting">Waiting</option>
               <option value="ready">Ready</option>
               <option value="blocked">Blocked</option>
               <option value="inFlight">In-flight</option>
               <option value="backoff">Backoff</option>
               <option value="throttled">Throttled</option>
               <option value="dlq">DLQ</option>
-              <option value="oldest">Oldest ready</option>
+              <option value="oldest">Oldest waiting</option>
               <option value="oldestInFlight">Oldest running</option>
             </select>
             <button type="button" class="queue-sort-dir" @click="sortDir = sortDir === 'asc' ? 'desc' : 'asc'"
@@ -194,11 +199,16 @@
             <div class="queue-card-body">
               <div class="queue-card-headline">
                 <a class="queue-card-hero" :href="queueUrl(r.queue, 'ready')" @click="navTo($event, r.queue, 'ready')">
-                  <span class="queue-card-ready" :class="zeroClass(visibleReady(r.stats))" x-text="fmtCount(visibleReady(r.stats))"></span>
-                  <span class="queue-card-ready-label">ready</span>
+                  <span class="queue-card-ready" :class="zeroClass(waitingJobs(r.stats))" x-text="fmtCount(waitingJobs(r.stats))"></span>
+                  <span class="queue-card-ready-label">waiting</span>
                 </a>
-                <span class="queue-card-blocked" x-show="r.stats?.blockedJobs > 0" title="Visible jobs a claim skips for now: behind a group head, a full concurrency key, or an empty rate-limit bucket">
-                  <span class="qc-val" x-text="fmtCount(r.stats?.blockedJobs)"></span><span class="qc-lbl">blocked</span>
+                <span class="queue-card-split">
+                  <span class="queue-card-split-ready" title="Jobs a claim takes now">
+                    <span class="qc-val" :class="zeroClass(r.stats?.readyJobs)" x-text="fmtCount(r.stats?.readyJobs)"></span><span class="qc-lbl">ready</span>
+                  </span>
+                  <span class="queue-card-split-blocked" :class="zeroClass(r.stats?.blockedJobs)" title="Visible jobs a claim skips for now: behind a group head, a full concurrency key, or an empty rate-limit bucket">
+                    <span class="qc-val" x-text="fmtCount(r.stats?.blockedJobs)"></span><span class="qc-lbl">blocked</span>
+                  </span>
                 </span>
               </div>
               <div class="queue-card-stats">
@@ -238,7 +248,8 @@
           <thead>
             <tr>
               <th class="sortable" @click="toggleSort('queue')" @keydown.enter.prevent="toggleSort('queue')" @keydown.space.prevent="toggleSort('queue')" tabindex="0" :aria-sort="sortBy === 'queue' ? (sortDir === 'asc' ? 'ascending' : 'descending') : 'none'">Queue<span class="sort-caret" x-text="sortIndicator('queue')" aria-hidden="true"></span></th>
-              <th class="num sortable" @click="toggleSort('ready')" @keydown.enter.prevent="toggleSort('ready')" @keydown.space.prevent="toggleSort('ready')" tabindex="0" :aria-sort="sortBy === 'ready' ? (sortDir === 'asc' ? 'ascending' : 'descending') : 'none'">Ready<span class="sort-caret" x-text="sortIndicator('ready')" aria-hidden="true"></span></th>
+              <th class="num sortable" title="Visible jobs waiting for a claim: ready plus blocked" @click="toggleSort('waiting')" @keydown.enter.prevent="toggleSort('waiting')" @keydown.space.prevent="toggleSort('waiting')" tabindex="0" :aria-sort="sortBy === 'waiting' ? (sortDir === 'asc' ? 'ascending' : 'descending') : 'none'">Waiting<span class="sort-caret" x-text="sortIndicator('waiting')" aria-hidden="true"></span></th>
+              <th class="num sortable" title="Jobs a claim takes now" @click="toggleSort('ready')" @keydown.enter.prevent="toggleSort('ready')" @keydown.space.prevent="toggleSort('ready')" tabindex="0" :aria-sort="sortBy === 'ready' ? (sortDir === 'asc' ? 'ascending' : 'descending') : 'none'">Ready<span class="sort-caret" x-text="sortIndicator('ready')" aria-hidden="true"></span></th>
               <th class="num sortable" title="Visible jobs a claim skips for now: behind a group head, a full concurrency key, or an empty rate-limit bucket" @click="toggleSort('blocked')" @keydown.enter.prevent="toggleSort('blocked')" @keydown.space.prevent="toggleSort('blocked')" tabindex="0" :aria-sort="sortBy === 'blocked' ? (sortDir === 'asc' ? 'ascending' : 'descending') : 'none'">Blocked<span class="sort-caret" x-text="sortIndicator('blocked')" aria-hidden="true"></span></th>
               <th class="num sortable" @click="toggleSort('inFlight')" @keydown.enter.prevent="toggleSort('inFlight')" @keydown.space.prevent="toggleSort('inFlight')" tabindex="0" :aria-sort="sortBy === 'inFlight' ? (sortDir === 'asc' ? 'ascending' : 'descending') : 'none'">In-flight<span class="sort-caret" x-text="sortIndicator('inFlight')" aria-hidden="true"></span></th>
               <th class="num sortable" @click="toggleSort('scheduled')" @keydown.enter.prevent="toggleSort('scheduled')" @keydown.space.prevent="toggleSort('scheduled')" tabindex="0" :aria-sort="sortBy === 'scheduled' ? (sortDir === 'asc' ? 'ascending' : 'descending') : 'none'">Scheduled<span class="sort-caret" x-text="sortIndicator('scheduled')" aria-hidden="true"></span></th>
@@ -257,7 +268,8 @@
                 <td class="text-truncate">
                   <a class="queue-row-name" :href="queueJobsUrl(r.queue, '')" @click="navToJobs($event, r.queue)" x-text="r.queue" :title="r.queue"></a>
                 </td>
-                <td class="num"><a class="queue-row-num" :class="zeroClass(visibleReady(r.stats))" :href="queueUrl(r.queue, 'ready')" @click="navTo($event, r.queue, 'ready')" x-text="fmtCount(visibleReady(r.stats))"></a></td>
+                <td class="num"><a class="queue-row-num" :class="zeroClass(waitingJobs(r.stats))" :href="queueUrl(r.queue, 'ready')" @click="navTo($event, r.queue, 'ready')" x-text="fmtCount(waitingJobs(r.stats))"></a></td>
+                <td class="num" :class="zeroClass(r.stats?.readyJobs)" x-text="fmtCount(r.stats?.readyJobs)"></td>
                 <td class="num" :class="zeroClass(r.stats?.blockedJobs)" x-text="fmtCount(r.stats?.blockedJobs)"></td>
                 <td class="num"><a class="queue-row-num" :class="zeroClass(r.stats?.inFlightJobs)" :href="queueUrl(r.queue, 'in_flight')" @click="navTo($event, r.queue, 'in_flight')" x-text="fmtCount(r.stats?.inFlightJobs)"></a></td>
                 <td class="num"><a class="queue-row-num" :class="zeroClass(r.stats?.scheduledJobs)" :href="queueUrl(r.queue, 'scheduled')" @click="navTo($event, r.queue, 'scheduled')" x-text="fmtCount(r.stats?.scheduledJobs)"></a></td>
@@ -405,10 +417,10 @@
           <div class="col-sm-6 col-lg-3">
             <a class="card text-center stat-card" :href="jobsUrl('ready')" @click="goToJobs($event, 'ready')">
               <div class="card-body">
-                <h3 class="card-title text-muted">Ready</h3>
-                <p class="display-6" :class="zeroClass(visibleReady(stats))" x-text="stats ? visibleReady(stats) : EMPTY"></p>
+                <h3 class="card-title text-muted">Waiting</h3>
+                <p class="display-6" :class="zeroClass(waitingJobs(stats))" x-text="stats ? waitingJobs(stats) : EMPTY"></p>
                 <p class="stat-card-sub" x-show="stats?.blockedJobs > 0" title="Visible jobs a claim skips for now: behind a group head, a full concurrency key, or an empty rate-limit bucket">
-                  <span x-text="stats?.blockedJobs"></span> blocked
+                  <span x-text="stats?.readyJobs"></span> ready &middot; <span x-text="stats?.blockedJobs"></span> blocked
                 </p>
               </div>
             </a>

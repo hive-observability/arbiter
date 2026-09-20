@@ -1065,8 +1065,9 @@ function eventBusTab() {
   };
 }
 
-// Visible jobs waiting for a claim. Blocked rows are the subset a claim skips for now.
-function visibleReady(stats) {
+// Visible jobs waiting for a claim: the claimable ready rows plus the blocked ones
+// a claim skips for now. The ready job filter lists both.
+function waitingJobs(stats) {
   return (stats?.readyJobs ?? 0) + (stats?.blockedJobs ?? 0);
 }
 
