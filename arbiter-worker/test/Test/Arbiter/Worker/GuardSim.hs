@@ -453,11 +453,11 @@ spec = describe "Guard simulation" $ do
         , [() | Heartbeat 1 _ <- events] `is` 1
         ]
 
-  it "keeps a batch whose extend lands as the fence gives up" $
-    simulate
+  it "keeps a batch whose extend lands as the fence gives up"
+    $ simulate
       (plainSetup 1 2 Nothing [Answer 0.995 []]) {settleLag = 0.01}
       (\w -> handler w 1 0 (threadDelay 3) >> threadDelay 5)
-      $ \events -> [() | (1, Done, _) <- endings events] `is` 1
+    $ \events -> [() | (1, Done, _) <- endings events] `is` 1
 
   it "stops a batch whose extend hangs, at the lease" $
     simulate (plainSetup 1 2 Nothing [Hang]) (\w -> handler w 1 0 (threadDelay 10) >> threadDelay 5) $ \events ->

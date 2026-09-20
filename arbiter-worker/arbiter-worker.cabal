@@ -50,6 +50,9 @@ library
     Arbiter.Worker.Cron
     Arbiter.Worker.Heartbeat
     Arbiter.Worker.Heartbeat.Guard
+    Arbiter.Worker.Heartbeat.Guard.Loop
+    Arbiter.Worker.Heartbeat.Guard.Signal
+    Arbiter.Worker.Heartbeat.Guard.State
     Arbiter.Worker.Logger
     Arbiter.Worker.WorkQueue
 
