@@ -15,7 +15,8 @@
 --
 -- The lease fence waits for an extend that carries the batch, until that extend
 -- gives up. Otherwise the fence could stop a batch whose row the extend has just
--- re-leased.
+-- re-leased. A statement that has returned holds the fence until its results are
+-- settled, and a batch the fence stopped first takes no results.
 --
 -- Written against io-classes, so the pool runs it in IO and the tests run it
 -- under io-sim.
@@ -177,6 +178,8 @@ data Extending = Extending
   , givesUp :: !Time
   , carries :: !(Set Int)
   -- ^ The batches the statement covers.
+  , landed :: !Bool
+  -- ^ The statement returned. Its results are being settled.
   }
 
 -- | The pool's heartbeat guard.
@@ -276,18 +279,22 @@ pendingOf entry = do
   timers <- readTVarIO (guardedTimers entry)
   if isJust (couriers timers) then batchPending (guardedBatch entry) else pure []
 
--- | When the lease fence fires. An extend carrying the batch holds it until the extend gives up.
-leaseFence :: Maybe Extending -> Guarded n job -> Timers n -> Time
+-- | When the lease fence fires. An extend carrying the batch holds it until the extend
+-- gives up, or, once the statement has returned, until it is over.
+leaseFence :: Maybe Extending -> Guarded n job -> Timers n -> Maybe Time
 leaseFence extending entry timers = case extending of
-  Just running | Set.member (guardedToken entry) (carries running), issuedAt running < lease -> max lease (givesUp running)
-  _ -> lease
+  Just running
+    | carried running, landed running -> Nothing
+    | carried running -> Just (max lease (givesUp running))
+  _ -> Just lease
   where
     lease = leaseAt timers
+    carried running = Set.member (guardedToken entry) (carries running) && issuedAt running < lease
 
 -- | When the guard next acts on a batch. Beats wait for the extend in flight.
 dueTimes :: Maybe Extending -> (Guarded n job, Timers n) -> [Time]
 dueTimes extending (entry, timers) =
-  [leaseFence extending entry timers | not (stopped timers)]
+  [at | not (stopped timers), Just at <- [leaseFence extending entry timers]]
     <> [beatAt timers | not (stopped timers), isNothing extending]
     <> [deadline | not (fenced timers), Just deadline <- [guardedDeadline entry]]
 
@@ -332,7 +339,7 @@ runHeartbeatGuard guard = forever $ do
   woke <- getMonotonicTime
   (extending, current) <- atomically ((,) <$> readTVar (guardExtending guard) <*> snapshot guard)
   -- A batch the fence stops gets no beat.
-  leased <- filterM (fence guard woke extending) current
+  leased <- filterM (fence guard woke) current
   let due = [entry | (entry, timers) <- leased, beatAt timers <= woke]
   unless (null due || isJust extending) $ do
     let bound =
@@ -341,7 +348,7 @@ runHeartbeatGuard guard = forever $ do
             (minimum (configTimeout (guardConfig guard) : [leaseAt timers `diffTime` woke | (_, timers) <- leased]))
     issued <- getMonotonicTime
     atomically $
-      writeTVar (guardExtending guard) (Just (Extending issued (addTime bound issued) (Set.fromList (map guardedToken due))))
+      writeTVar (guardExtending guard) (Just (Extending issued (addTime bound issued) (Set.fromList (map guardedToken due)) False))
     void . forkIO $
       extend guard issued bound due `finally` atomically over
   where
@@ -349,13 +356,17 @@ runHeartbeatGuard guard = forever $ do
     over = writeTVar (guardExtending guard) Nothing *> wake guard
 
 -- | Signal a handler past its lease or its deadline. Whether its lease still stands.
-fence
-  :: (MonadFork n, MonadSTM n) => HeartbeatGuard n job -> Time -> Maybe Extending -> (Guarded n job, Timers n) -> n Bool
-fence guard woke extending (entry, timers) = do
-  let lapsed = not (stopped timers) && woke >= leaseFence extending entry timers
+-- The lease verdict and the stop are one transaction against the extend in flight.
+fence :: (MonadFork n, MonadSTM n) => HeartbeatGuard n job -> Time -> (Guarded n job, Timers n) -> n Bool
+fence guard woke (entry, timers) = do
+  (lapsed, standing) <- atomically $ do
+    extending <- readTVar (guardExtending guard)
+    current <- readTVar (guardedTimers entry)
+    let lapsed = not (stopped current) && maybe False (woke >=) (leaseFence extending entry current)
+    when lapsed (writeTVar (guardedTimers entry) current {stopped = True})
+    pure (lapsed, not (stopped current || lapsed))
   when lapsed $ do
     live <- pendingOf entry
-    adjust entry (\t -> t {stopped = True})
     unless (null live) $
       signal
         guard
@@ -366,7 +377,7 @@ fence guard woke extending (entry, timers) = do
     when (not (fenced timers) && woke >= deadline) $ do
       adjust entry (\t -> t {fenced = True})
       signal guard woke entry (toException (JobDeadlineExceeded (durationMessage guard)))
-  pure (not (stopped timers || lapsed))
+  pure standing
 
 -- | Ask the handler to stop, from a courier thread. A second ask within one beat is dropped.
 signal :: (MonadFork n, MonadSTM n) => HeartbeatGuard n job -> Time -> Guarded n job -> SomeException -> n ()
@@ -392,6 +403,7 @@ extend
 extend guard issued bound due = do
   lives <- traverse (\entry -> (,) entry <$> pendingOf entry) due
   outcome <- timeout bound (trySync (configExtend config (concatMap snd lives)))
+  atomically $ modifyTVar' (guardExtending guard) (fmap (\running -> running {landed = True}))
   case outcome of
     Nothing -> traverse_ retryLater due
     Just (Left exception) -> do
@@ -415,7 +427,7 @@ extend guard issued bound due = do
 trySync :: (MonadCatch n) => n a -> n (Either SomeException a)
 trySync = tryJust (\exc -> if isSyncException exc then Just exc else Nothing)
 
--- | Act on one batch's verdicts from the extend.
+-- | Act on one batch's verdicts from the extend. A stopped batch takes none.
 settle
   :: (MonadFork n, MonadMonotonicTime n, MonadSTM n)
   => HeartbeatGuard n job
@@ -435,11 +447,13 @@ settle guard issued currentTime byJob (entry, live) = do
       unrenewed = [jobId | result <- mine, jobId <- unextended result, Set.member jobId stillPending]
       extendedIds = Set.fromList [jobId | VisibilityExtended jobId <- mine]
       extended = filter ((`Set.member` extendedIds) . key) live
-  adjust entry $ \timers ->
+  applied <- atomically $ stateTVar (guardedTimers entry) $ \timers ->
     let lease = if null unrenewed then addTime (configTimeout config) issued else leaseAt timers
-     in timers {leaseAt = lease, beatAt = addTime (heartbeatWait (configInterval config) True (lease `diffTime` issued)) issued}
+     in if stopped timers
+          then (False, timers)
+          else (True, timers {leaseAt = lease, beatAt = addTime (heartbeatWait (configInterval config) True (lease `diffTime` issued)) issued})
   now <- getMonotonicTime
-  case (cancelledJobs, stolenJobs) of
+  when applied $ case (cancelledJobs, stolenJobs) of
     (_ : _, _) -> signal guard now entry (toException (JobForceCancelled cancelledJobs (stolenJobs <> goneJobs)))
     ([], _ : _) -> signal guard now entry (toException (JobGoneException reclaimedReason stolenJobs))
     ([], []) ->
