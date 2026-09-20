@@ -227,7 +227,7 @@
               </div>
               <div class="queue-card-ages">
                 <a class="queue-card-age" :href="queueUrl(r.queue, 'ready')" @click="navTo($event, r.queue, 'ready')"
-                  title="Age of the oldest job waiting to be claimed">
+                  title="Age of the oldest ready or blocked job, since it became visible">
                   <span class="qa-lbl">oldest ready</span>
                   <span class="qa-val" :class="zeroClass(r.stats?.oldestReadyAgeSeconds)" x-text="fmtAge(r.stats?.oldestReadyAgeSeconds)"></span>
                 </a>
@@ -481,11 +481,14 @@
               <div class="card-body">
                 <h3 class="card-title text-muted">DLQ</h3>
                 <p class="display-6" :class="stats?.dlqJobs > 0 ? 'bad' : zeroClass(stats?.dlqJobs)" x-text="stats?.dlqJobs ?? EMPTY"></p>
+                <p class="stat-card-sub" x-show="stats?.exhaustedJobs > 0" title="Visible jobs out of attempts, awaiting the reaper's sweep into the DLQ">
+                  <span x-text="stats?.exhaustedJobs"></span> exhausted
+                </p>
               </div>
             </a>
           </div>
           <div class="col-sm-6 col-lg-4">
-            <div class="card text-center" title="Age of the oldest job currently ready to claim">
+            <div class="card text-center" title="Age of the oldest ready or blocked job, since it became visible">
               <div class="card-body">
                 <h3 class="card-title text-muted">Oldest Ready</h3>
                 <p class="display-6" :class="zeroClass(stats?.oldestReadyAgeSeconds)" x-text="fmtAge(stats?.oldestReadyAgeSeconds, EMPTY)"></p>

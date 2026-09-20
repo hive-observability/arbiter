@@ -21,6 +21,7 @@ import Arbiter.Core.Job.Schema (SchemaName, TableName, jobQueueDLQTable, jobQueu
 import Arbiter.Core.Job.Types (defaultMaxAttemptsSQL)
 import Arbiter.Core.Queues (arbiterQueuesTable)
 import Arbiter.Core.RateLimit.Schema (arbiterRateLimitPoliciesTable, arbiterRateLimitsTable)
+import Arbiter.Core.Sql.Claim (concHeadroomPred)
 import Arbiter.Core.Sql.Jobs (jobStatusCaseSQL, unionAllOverQueueTables)
 import Arbiter.Core.Sql.QQ (sql)
 import Arbiter.Core.Sql.Query (Query, rawRows)
@@ -35,21 +36,17 @@ getQueueStatsSQL :: RowCodec a -> SchemaName -> TableName -> [Text] -> Query a
 getQueueStatsSQL codec schema tableName kinds = rawRows codec (queueStatsSelect schema tableName kinds)
 
 -- | One queue's stats row. The classified rows are aggregated once per kind and once
--- over the whole table in one pass. @total_row@ marks the whole-table row. The count
--- moves a ready row a claim would skip into blocked.
+-- over the whole table in one pass. @total_row@ marks the whole-table row. The ready
+-- rows a claim would skip are counted apart and moved into blocked.
 queueStatsSelect :: SchemaName -> TableName -> [Text] -> Text
 queueStatsSelect schema tableName kinds =
   let tbl = jobQueueTable schema tableName
       dlqTbl = jobQueueDLQTable schema tableName
-      concTbl = arbiterConcurrencyTable schema
-      concPolicies = arbiterConcurrencyPoliciesTable schema
-      buckets = arbiterRateLimitsTable schema
-      rlPolicies = arbiterRateLimitPoliciesTable schema
       kindExpr = declaredKindSQL kinds
-      heads = groupHeadsSQL schema tableName
+      blocked = blockedJobsSQL schema tableName
    in [text|
         SELECT MAX(total_jobs) FILTER (WHERE total_row = 1) AS total_jobs,
-               MAX(ready_jobs) FILTER (WHERE total_row = 1) AS ready_jobs,
+               MAX(ready_jobs) FILTER (WHERE total_row = 1) - blocked.blocked_jobs AS ready_jobs,
                MAX(in_flight_jobs) FILTER (WHERE total_row = 1) AS in_flight_jobs,
                MAX(scheduled_jobs) FILTER (WHERE total_row = 1) AS scheduled_jobs,
                MAX(backoff_jobs) FILTER (WHERE total_row = 1) AS backoff_jobs,
@@ -57,7 +54,7 @@ queueStatsSelect schema tableName kinds =
                MAX(suspended_jobs) FILTER (WHERE total_row = 1) AS suspended_jobs,
                MAX(cancelled_jobs) FILTER (WHERE total_row = 1) AS cancelled_jobs,
                MAX(exhausted_jobs) FILTER (WHERE total_row = 1) AS exhausted_jobs,
-               MAX(blocked_jobs) FILTER (WHERE total_row = 1) AS blocked_jobs,
+               blocked.blocked_jobs,
                MAX(oldest_ready_age_seconds) FILTER (WHERE total_row = 1) AS oldest_ready_age_seconds,
                MAX(oldest_in_flight_age_seconds) FILTER (WHERE total_row = 1) AS oldest_in_flight_age_seconds,
                (SELECT COUNT(*)::int8 FROM ${dlqTbl}) AS dlq_jobs,
@@ -73,32 +70,44 @@ queueStatsSelect schema tableName kinds =
                  COUNT(*) FILTER (WHERE status = 'suspended') AS suspended_jobs,
                  COUNT(*) FILTER (WHERE status = 'cancelled') AS cancelled_jobs,
                  COUNT(*) FILTER (WHERE status = 'exhausted') AS exhausted_jobs,
-                 COUNT(*) FILTER (WHERE status = 'blocked') AS blocked_jobs,
                  EXTRACT(EPOCH FROM (
-                   clock_timestamp() - MIN(GREATEST(inserted_at, not_visible_until)) FILTER (WHERE status IN ('ready', 'blocked'))
+                   clock_timestamp() - MIN(GREATEST(inserted_at, not_visible_until)) FILTER (WHERE status = 'ready')
                  ))::float8 AS oldest_ready_age_seconds,
                  EXTRACT(EPOCH FROM (
                    clock_timestamp() - MIN(last_attempted_at) FILTER (WHERE status = 'in_flight')
                  ))::float8 AS oldest_in_flight_age_seconds
           FROM (
-            SELECT inserted_at, not_visible_until, last_attempted_at, kind,
-                   CASE WHEN status = 'ready' AND (group_blocked OR NOT conc_ok OR NOT rl_ok) THEN 'blocked' ELSE status END AS status
-            FROM (
-              SELECT job.inserted_at, job.not_visible_until, job.last_attempted_at,
-                     ${kindExpr} AS kind, ${jobStatusCaseSQL} AS status,
-                     (job.group_key IS NOT NULL AND head.id IS NULL) AS group_blocked,
-                     ${concHeadroomSQL} AS conc_ok,
-                     ${rateLimitHeadroomSQL} AS rl_ok
-              FROM ${tbl} job
-              LEFT JOIN (${heads}) head ON head.id = job.id
-              LEFT JOIN ${concTbl} counts ON counts.concurrency_key = job.concurrency_key
-              LEFT JOIN ${concPolicies} cpol ON cpol.prefix_id = counts.concurrency_prefix
-              LEFT JOIN ${buckets} bucket ON bucket.rate_limit_key = job.rate_limit_key
-              LEFT JOIN ${rlPolicies} policy ON policy.prefix_id = job.rate_limit_prefix
-            ) classified
-          ) judged
+            SELECT inserted_at, not_visible_until, last_attempted_at, ${kindExpr} AS kind, ${jobStatusCaseSQL} AS status
+            FROM ${tbl}
+          ) classified
           GROUP BY GROUPING SETS ((), (kind))
         ) rollup
+        CROSS JOIN (${blocked}) blocked
+        GROUP BY blocked.blocked_jobs
+      |]
+
+-- | The count of ready rows a claim would skip: behind a group's head, or behind a
+-- full concurrency or rate-limit key. Only rows under a group or a key reach the head join.
+blockedJobsSQL :: SchemaName -> TableName -> Text
+blockedJobsSQL schema tableName =
+  let tbl = jobQueueTable schema tableName
+      concTbl = arbiterConcurrencyTable schema
+      concPolicies = arbiterConcurrencyPoliciesTable schema
+      buckets = arbiterRateLimitsTable schema
+      rlPolicies = arbiterRateLimitPoliciesTable schema
+      heads = groupHeadsSQL schema tableName
+      concOk = concHeadroomPred concTbl concPolicies "job"
+      rlOk = rateLimitHeadroomPred buckets rlPolicies "job"
+   in [text|
+        SELECT COUNT(*)::int8 AS blocked_jobs
+        FROM ${tbl} job
+        LEFT JOIN (${heads}) head ON head.id = job.id
+        WHERE NOT job.suspended
+          AND job.cancel_requested_at IS NULL
+          AND (job.not_visible_until IS NULL OR job.not_visible_until <= NOW())
+          AND job.attempts < COALESCE(job.max_attempts, ${defaultMaxAttemptsSQL})
+          AND (job.group_key IS NOT NULL OR job.concurrency_key IS NOT NULL OR job.rate_limit_key IS NOT NULL)
+          AND ((job.group_key IS NOT NULL AND head.id IS NULL) OR NOT ${concOk} OR NOT ${rlOk})
       |]
 
 -- | The id of each open group's head, the row a claim of that group takes first.
@@ -145,28 +154,22 @@ groupHeadsSQL schema tableName =
           AND (summary.in_flight_until IS NULL OR summary.in_flight_until <= NOW())
       |]
 
--- | Whether a job's concurrency key has headroom, over the @job@, @counts@ and @cpol@
--- aliases. Mirrors the claim's headroom probe.
-concHeadroomSQL :: Text
-concHeadroomSQL =
-  let effLimit = effectivePolicyCol "cpol" "limit"
-   in [text|
-        (job.concurrency_key IS NULL OR job.claimed_by IS NOT NULL
-          OR (counts.concurrency_key IS NOT NULL
-              AND (${effLimit} IS NULL OR counts.in_flight < ${effLimit})))
-      |]
-
--- | Whether a job's rate-limit policy admits its cost, over the @job@, @bucket@ and
--- @policy@ aliases. The first claim seeds a full bucket for a key without one, so only
--- the policy's cap applies there.
-rateLimitHeadroomSQL :: Text
-rateLimitHeadroomSQL =
+-- | Whether a job's rate-limit policy admits its cost, over a row alias. A key without
+-- a policy is admitted. The first claim seeds a full bucket for a key without one, so
+-- only the policy's cap applies there. OFFSET 0 keeps the probe correlated.
+rateLimitHeadroomPred :: Text -> Text -> Text -> Text
+rateLimitHeadroomPred buckets rlPolicies alias =
   let effMax = effectivePolicyCol "policy" "max_tokens"
    in [text|
-        (job.rate_limit_key IS NULL OR policy.prefix_id IS NULL
-          OR (${effMax} > 0
-              AND (bucket.rate_limit_key IS NULL
-                   OR LEAST(GREATEST(job.rate_limit_cost, 0), ${effMax}) <= ${refilledBucketTokens})))
+        (${alias}.rate_limit_key IS NULL OR NOT EXISTS (
+          SELECT 1 FROM ${rlPolicies} policy
+          LEFT JOIN ${buckets} bucket ON bucket.rate_limit_key = ${alias}.rate_limit_key
+          WHERE policy.prefix_id = ${alias}.rate_limit_prefix
+            AND NOT (${effMax} > 0
+                     AND (bucket.rate_limit_key IS NULL
+                          OR LEAST(GREATEST(${alias}.rate_limit_cost, 0), ${effMax}) <= ${refilledBucketTokens}))
+          OFFSET 0
+        ))
       |]
 
 -- | A stored label the payload declares, and NULL for anything else.

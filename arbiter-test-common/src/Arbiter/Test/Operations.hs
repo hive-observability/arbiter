@@ -2021,6 +2021,13 @@ operationsSpec mkMessage mkResult runM = do
       HL.exhaustedJobs stats `shouldBe` 1
       HL.oldestReadyAgeSeconds stats `shouldBe` Nothing
 
+    it "insertJob stamps a job asked for zero attempts with one" $ \env -> do
+      Just inserted <- runM env (HL.insertJob (setMaxAttempts (Just 0) (defaultJob (mkMessage "ZeroAttempts"))))
+      maxAttempts inserted `shouldBe` Just minMaxAttempts
+      stats <- runM env (HL.getQueueStats @payload)
+      HL.readyJobs stats `shouldBe` 1
+      HL.exhaustedJobs stats `shouldBe` 0
+
     it "getQueueStats counts grouped jobs behind their head as blocked" $ \env -> do
       forM_ [1 .. 3 :: Int] $ \index ->
         void $ runM env (HL.insertJob (defaultGroupedJob "blocked-group" (mkMessage (T.pack ("B" <> show index)))))

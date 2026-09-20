@@ -80,6 +80,7 @@ import Arbiter.Core.Job.Types
   , TraceContext (..)
   , dedupParts
   , defaultMaxAttempts
+  , minMaxAttempts
   , toTraceContext
   )
 import Arbiter.Core.Job.Types qualified as JT
@@ -281,7 +282,7 @@ jobCodecWith idColumn queueName =
     <*> ro (ncol "last_attempted_at" CTimestamptz)
     <*> lmap (JT.notVisibleUntil . sourceJob) (rwN "not_visible_until" CTimestamptz)
     <*> dedupCodec
-    <*> lmap (Just . fromMaybe defaultMaxAttempts . JT.maxAttempts . sourceJob) (rwN "max_attempts" CInt4)
+    <*> lmap (Just . max minMaxAttempts . fromMaybe defaultMaxAttempts . JT.maxAttempts . sourceJob) (rwN "max_attempts" CInt4)
     <*> lmap sourceParentId (rwN "parent_id" CInt8)
     <*> lmap sourceParentState (rwN "parent_state" CJsonb)
     <*> traceCodec

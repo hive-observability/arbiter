@@ -5,6 +5,7 @@
 module Arbiter.Core.Sql.Claim
   ( ClaimAdmission (..)
   , claimJobsBatchedSQL
+  , concHeadroomPred
   ) where
 
 import Data.Text (Text)
