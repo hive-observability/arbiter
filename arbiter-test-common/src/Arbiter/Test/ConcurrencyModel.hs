@@ -310,7 +310,7 @@ prop_groupedDrain run withConn schema = withTests 40 $ property $ do
       round_ =
         run
           ( do
-              claimed <- Ops.claimJobsBatchedCached statements maxBatches
+              claimed <- fst <$> Ops.claimJobsBatchedCached statements maxBatches
               let got = concatMap NE.toList (claimed :: [NE.NonEmpty (JobRead CLPayload)])
               traverse_ HL.ackJob got
               pure (length got)

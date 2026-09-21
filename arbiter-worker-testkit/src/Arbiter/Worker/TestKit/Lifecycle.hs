@@ -1528,6 +1528,30 @@ lifecycleSpec TestBackend {schema, table, connStr, mkSimple, mkEnv, pollOnly, mk
 
         all_ <- runM env $ Ops.listCronSchedules schema Nothing
         map CS.name all_ `shouldSatisfy` (\names -> "cron-here" `elem` names && "cron-elsewhere" `elem` names)
+
+    describe "Undecodable payload" $ do
+      it "dead-letters a row its payload type rejects and runs the rest of the claim" $ \env -> do
+        completedRef <- newIORef []
+        config :: WorkerConfig m payload <-
+          transactionalWorkerConfig 10 $
+            mkHandler (noResult (\job -> liftIO $ atomicModifyIORef' completedRef (\seen -> (payload job : seen, ()))))
+        Just poison <- runM env $ HL.insertJob (defaultJob (mkSimple "poison"))
+        void $ runM env $ HL.insertJob (defaultJob (mkSimple "sibling"))
+        void $
+          withConn connStr $ \conn ->
+            PG.execute
+              conn
+              (fromString . T.unpack $ "UPDATE " <> Schema.jobQueueTable schema table <> " SET payload = '{\"bogus\": 1}' WHERE id = ?")
+              (Only (primaryKey poison))
+
+        withAsync (runM env $ runWorkerPool config {workerCount = 2, pollInterval = 0.1, visibilityTimeout = 60}) $ \_ -> do
+          waitUntil 5_000 $ (== [mkSimple "sibling"]) <$> readIORef completedRef
+          dlq <-
+            withConn connStr $ \conn ->
+              PG.query_ conn (fromString . T.unpack $ "SELECT job_id, last_error FROM " <> Schema.jobQueueDLQTable schema table)
+                :: IO [(Int64, Text)]
+          map fst dlq `shouldBe` [primaryKey poison]
+          map snd dlq `shouldSatisfy` all (T.isPrefixOf "Failed to decode job payload")
   where
     lockRow = lockJobRow schema table
     withOpsTable :: IO a -> IO a

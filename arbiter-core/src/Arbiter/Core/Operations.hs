@@ -25,6 +25,7 @@ module Arbiter.Core.Operations
   , claimNextVisibleJobsBatched
   , claimJobsCached
   , claimJobsBatchedCached
+  , RejectedRow
   , addRateLimitTokens
   , pruneRateLimitBuckets
   , resetRateLimitBuckets
@@ -333,10 +334,30 @@ import Arbiter.Core.Sql.Stats qualified as Tmpl
 import Arbiter.Core.Sql.Tree qualified as Tmpl
 import Arbiter.Core.Trace (currentTraceContext, stampTraceContext)
 
+-- | Decode a row's payload, or the reason it was rejected.
+parsePayload :: (JobPayload payload) => JobRead Value -> Either Text (JobRead payload)
+parsePayload job = case fromJSON (payload job) of
+  Success decoded -> Right (mapPayload (const decoded) job)
+  Error err -> Left ("Failed to decode job payload: " <> T.pack err)
+
 decodePayload :: (JobPayload payload, MonadArbiter m) => JobRead Value -> m (JobRead payload)
-decodePayload job = case fromJSON (payload job) of
-  Success decoded -> pure $ mapPayload (const decoded) job
-  Error err -> throwParsing $ "Failed to decode job payload: " <> T.pack err
+decodePayload = either throwParsing pure . parsePayload
+
+-- | A claimed row its payload type rejected, with the error it was dead-lettered under.
+type RejectedRow = (JobRead Value, Text)
+
+-- | Decode the rows a claim holds. A row its payload type rejects is moved to the
+-- DLQ under the decode error, so it cannot poison the next claim.
+decodeClaimed
+  :: forall payload m
+   . (JobPayload payload, MonadArbiter m)
+  => [JobRead Value]
+  -> m ([JobRead payload], [RejectedRow])
+decodeClaimed rows = do
+  schemaName <- MA.getSchema
+  let (rejected, decoded) = partitionEithers (map (\row -> first ((,) row) (parsePayload row)) rows)
+  traverse_ (\(row, err) -> moveToDLQ TakeLocks schemaName (JT.queueName row) err row) rejected
+  pure (decoded, rejected)
 
 visibilityUpdateCodec :: RowCodec VisibilityUpdateInfo
 visibilityUpdateCodec =
@@ -885,7 +906,7 @@ claimNextVisibleJobsAs
   -> m [JobRead payload]
 claimNextVisibleJobsAs schemaName tableName maxJobs timeout workerId =
   -- Batch size 1 is the single-job claim.
-  claimJobsCached (mkJobStatements @payload schemaName tableName 1 0 timeout workerId) maxJobs
+  fst <$> claimJobsCached (mkJobStatements @payload schemaName tableName 1 0 timeout workerId) maxJobs
 
 -- | 'claimNextVisibleJobsAs' over a pool's staged statements.
 claimJobsCached
@@ -893,9 +914,9 @@ claimJobsCached
    . (JobPayload payload, MonadArbiter m)
   => JobStatements
   -> Int
-  -> m [JobRead payload]
+  -> m ([JobRead payload], [RejectedRow])
 claimJobsCached statements maxJobs =
-  MA.executeQueryPrepared (claimFor statements maxJobs) >>= traverse decodePayload
+  MA.executeQueryPrepared (claimFor statements maxJobs) >>= decodeClaimed
 
 -- | 'claimNextVisibleJobs' claiming up to @batchSize@ jobs from each of @maxBatches@
 -- groups. Stamps 'anonymousClaimant'.
@@ -909,7 +930,8 @@ claimNextVisibleJobsBatched
   -> NominalDiffTime
   -> m [NonEmpty (JobRead payload)]
 claimNextVisibleJobsBatched schemaName tableName batchSize maxBatches timeout =
-  claimJobsBatchedCached (mkJobStatements @payload schemaName tableName batchSize 0 timeout anonymousClaimant) maxBatches
+  fst
+    <$> claimJobsBatchedCached (mkJobStatements @payload schemaName tableName batchSize 0 timeout anonymousClaimant) maxBatches
 
 -- | 'claimNextVisibleJobsBatched' over a pool's staged statements.
 claimJobsBatchedCached
@@ -917,16 +939,15 @@ claimJobsBatchedCached
    . (JobPayload payload, MonadArbiter m)
   => JobStatements
   -> Int
-  -> m [NonEmpty (JobRead payload)]
+  -> m ([NonEmpty (JobRead payload)], [RejectedRow])
 claimJobsBatchedCached statements maxBatches
-  | claimBatchSize statements < 1 = pure []
-  | maxBatches < 1 = pure []
+  | claimBatchSize statements < 1 = pure ([], [])
+  | maxBatches < 1 = pure ([], [])
   | otherwise = do
-      rawJobs <- MA.executeQueryPrepared (claimFor statements maxBatches)
-      jobs <- traverse decodePayload rawJobs
+      (jobs, rejected) <- MA.executeQueryPrepared (claimFor statements maxBatches) >>= decodeClaimed
       let sorted = sortOn groupKey jobs
           groups = groupBy (\jobA jobB -> groupKey jobA == groupKey jobB) sorted
-      pure $ concatMap (chunksOfNE (claimBatchSize statements)) $ mapMaybe NE.nonEmpty groups
+      pure (concatMap (chunksOfNE (claimBatchSize statements)) (mapMaybe NE.nonEmpty groups), rejected)
 
 -- | Split a NonEmpty list into chunks of at most @size@ elements.
 chunksOfNE :: Int -> NonEmpty a -> [NonEmpty a]
