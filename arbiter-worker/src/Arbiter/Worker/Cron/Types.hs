@@ -16,7 +16,6 @@ module Arbiter.Worker.Cron.Types
   , matchesInTimezone
   , nextRunInTimezone
   , nextRunFromExpression
-  , formatMinuteInTimezone
   , truncateToMinute
   , formatMinute
   , enumMinutes
@@ -51,6 +50,7 @@ import Data.Time.Zones (LocalToUTCResult (..), TZ, localTimeToUTCFull, utcToLoca
 import Data.Time.Zones.All (fromTZName, tzByLabel)
 import GHC.Generics (Generic)
 import System.Cron (CronSchedule, nextMatch, parseCronSchedule, scheduleMatches)
+import System.Cron.Types qualified as Cron
 
 -- | How overlapping cron ticks are deduplicated.
 data OverlapPolicy
@@ -176,7 +176,8 @@ resolveTZ :: Text -> Maybe TZ
 resolveTZ name = fmap tzByLabel (fromTZName (encodeUtf8 name))
 
 -- | Match a cron schedule against a UTC tick, evaluated in @tz@.
--- 'Nothing' means UTC. An unknown tz name returns 'False'.
+-- 'Nothing' means UTC. An unknown tz name returns 'False'. A fixed-time schedule
+-- skips the second reading of a repeated local hour. A wildcard one runs through both.
 matchesInTimezone :: Maybe Text -> CronSchedule -> UTCTime -> Bool
 matchesInTimezone Nothing sched tick = scheduleMatches sched tick
 matchesInTimezone (Just tzName) sched tick =
@@ -184,14 +185,24 @@ matchesInTimezone (Just tzName) sched tick =
     Nothing -> False
     Just zone ->
       let local = utcToLocalTimeTZ zone tick
-          asUtc = localTimeToUTC utc local
-       in scheduleMatches sched asUtc
+       in scheduleMatches sched (localTimeToUTC utc local) && (wildcard sched || not (secondReading zone local tick))
+
+-- | A schedule whose minute or hour field starts with @*@, as Vixie cron classifies it.
+wildcard :: CronSchedule -> Bool
+wildcard sched = any startsWithStar [Cron.minuteSpec (Cron.minute sched), Cron.hourSpec (Cron.hour sched)]
+  where
+    startsWithStar (Cron.Field Cron.Star) = True
+    startsWithStar (Cron.StepField' step) = Cron.sfField step == Cron.Star
+    startsWithStar _ = False
+
+-- | Whether @tick@ is the second reading of an ambiguous @local@.
+secondReading :: TZ -> LocalTime -> UTCTime -> Bool
+secondReading zone local tick = case localTimeToUTCFull zone local of
+  LTUAmbiguous _ second _ _ -> tick >= second
+  _ -> False
 
 -- | The first tick after @now@ that @sched@ matches, evaluated in @tz@.
 -- 'Nothing' means UTC. An unknown tz name returns 'Nothing'.
---
--- A replayed local minute is reported. Its insert is deduped while the earlier run
--- is still live.
 nextRunInTimezone :: Maybe Text -> CronSchedule -> UTCTime -> Maybe UTCTime
 nextRunInTimezone Nothing sched now = nextMatch sched now
 nextRunInTimezone (Just tzName) sched now = do
@@ -204,7 +215,8 @@ nextRunInTimezone (Just tzName) sched now = do
       find (matchesInTimezone (Just tzName) sched) (enumMinutes (addUTCTime 60 (truncateToMinute now)) endsAt)
     seek zone from = do
       localMinute <- nextMatch sched from
-      find (> now) (ticksWearing zone (utcToLocalTime utc localMinute)) <|> seek zone localMinute
+      find (\tick -> tick > now && matchesInTimezone (Just tzName) sched tick) (ticksWearing zone (utcToLocalTime utc localMinute))
+        <|> seek zone localMinute
 
 -- | When @tick@ is in the first pass of a repeated local hour, when that hour reads again.
 replayEnd :: TZ -> UTCTime -> Maybe UTCTime
@@ -223,15 +235,6 @@ ticksWearing zone local = case localTimeToUTCFull zone local of
 nextRunFromExpression :: Maybe Text -> Text -> UTCTime -> Maybe UTCTime
 nextRunFromExpression tzName expr now =
   either (const Nothing) (\sched -> nextRunInTimezone tzName sched now) (parseCronSchedule expr)
-
--- | Format a UTC tick as @YYYY-MM-DDTHH:MM@ in the given timezone.
--- DST fall-back maps two UTC instants to the same local minute. Dedup keys
--- built from it collapse those to a single fire.
-formatMinuteInTimezone :: Maybe Text -> UTCTime -> Text
-formatMinuteInTimezone tzName tick =
-  maybe (formatMinute tick) localMinute (tzName >>= resolveTZ)
-  where
-    localMinute zone = T.pack (formatTime defaultTimeLocale "%Y-%m-%dT%H:%M" (utcToLocalTimeTZ zone tick))
 
 -- | Truncate a 'UTCTime' to the current minute (zero out seconds).
 truncateToMinute :: UTCTime -> UTCTime

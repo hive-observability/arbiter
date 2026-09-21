@@ -47,7 +47,8 @@ job [spawn its children](job-trees.md#spawning-children-at-runtime).
 **Time zones.** Expressions are UTC. `cronJobInTimezone` takes an
 [IANA name](https://www.iana.org/time-zones). `30 2 * * *` skips a spring
 transition day with no 02:30. `30 1 * * *` runs once on a fall transition day
-with two 01:30s.
+with two 01:30s. A `*` minute or hour field (`*/5 * * * *`, `0 * * * *`) runs
+through both 01:00 hours.
 
 **Backfill.** `Backfill n` replays ticks missed in the last `n` seconds after
 downtime or a scheduler pause.

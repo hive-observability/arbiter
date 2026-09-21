@@ -33,7 +33,6 @@ import Arbiter.Worker.Cron
   , enumMinutes
   , enumerateCatchUpTicks
   , formatMinute
-  , formatMinuteInTimezone
   , makeDedupKeyFromParts
   , matchesInTimezone
   , nextRunInTimezone
@@ -90,12 +89,12 @@ spec = do
     it "SkipOverlap produces arbiter_cron:<name> (no time)" $ do
       let Right cron = cronJob "nightly" "0 3 * * *" SkipOverlap (\_ _ -> defaultJob (SimpleTask "x"))
           tick = mkTime 2025 6 15 3 0 0
-      makeDedupKeyFromParts (name cron) (overlap cron) (timezone cron) tick `shouldBe` "arbiter_cron:nightly"
+      makeDedupKeyFromParts (name cron) (overlap cron) tick `shouldBe` "arbiter_cron:nightly"
 
-    it "AllowOverlap produces arbiter_cron:<name>:<time>" $ do
+    it "AllowOverlap produces arbiter_cron:<name>:<utc minute>" $ do
       let Right cron = cronJob "nightly" "0 3 * * *" AllowOverlap (\_ _ -> defaultJob (SimpleTask "x"))
           tick = mkTime 2025 6 15 3 0 0
-      makeDedupKeyFromParts (name cron) (overlap cron) (timezone cron) tick `shouldBe` "arbiter_cron:nightly:2025-06-15T03:00"
+      makeDedupKeyFromParts (name cron) (overlap cron) tick `shouldBe` "arbiter_cron:nightly:2025-06-15T03:00"
 
   describe "timezone handling" $ do
     it "cronJobInTimezone rejects an unknown Olson name" $ do
@@ -198,25 +197,24 @@ spec = do
                   (takeWhile (< next) (iterate (addUTCTime 60) (addUTCTime 60 now)))
       map earlierMatch starts `shouldBe` [Nothing, Nothing, Nothing]
 
-    it "nextRunInTimezone keeps the replayed hour's second pass" $ do
-      -- 01:30 EST is a later tick than 01:35 EDT. A local-minute walk alone misses it.
+    it "nextRunInTimezone skips a fixed-time schedule's second pass" $ do
+      -- 01:30 EDT ran at 05:30. 01:30 EST is the same local minute and does not fire.
       let Right sched = parseCronSchedule "30 1 * * *"
           zone = Just "America/New_York"
           now = mkTime 2025 11 2 5 35 0
-      nextRunInTimezone zone sched now `shouldBe` Just (mkTime 2025 11 2 6 30 0)
+      nextRunInTimezone zone sched now `shouldBe` Just (mkTime 2025 11 3 6 30 0)
 
-    it "nextRunInTimezone reports a replayed minute" $ do
-      -- 01:45 EDT ran at 05:45. 01:45 EST is a separate tick and fires once the first is gone.
-      let Right sched = parseCronSchedule "45 1 * * *"
+    it "nextRunInTimezone reports a wildcard schedule's replayed minute" $ do
+      -- 01:15 EST is a later tick than 01:15 EDT. A local-minute walk alone misses it.
+      let Right sched = parseCronSchedule "*/15 1 * * *"
           zone = Just "America/New_York"
           now = mkTime 2025 11 2 6 0 0
-      nextRunInTimezone zone sched now `shouldBe` Just (mkTime 2025 11 2 6 45 0)
+      nextRunInTimezone zone sched now `shouldBe` Just (mkTime 2025 11 2 6 15 0)
 
-    it "DST fall-back: '30 1 * * *' in America/New_York matches twice in UTC" $ do
+    it "DST fall-back: '30 1 * * *' in America/New_York matches once" $ do
       -- On 2025-11-02 in NY, clocks fall back 02:00 EDT -> 01:00 EST. Local
-      -- 01:30 happens twice: once as EDT (05:30 UTC) and once as EST
-      -- (06:30 UTC). Both UTC ticks should match locally, and the local-minute
-      -- dedup key collapses them to a single fire.
+      -- 01:30 reads twice, at 05:30 UTC and 06:30 UTC. A fixed-time schedule
+      -- fires on the first reading only.
       let Right sched = parseCronSchedule "30 1 * * *"
           zone = Just "America/New_York"
           ticks =
@@ -225,11 +223,21 @@ spec = do
             , minute <- [0 .. 59]
             ]
           matches = filter (matchesInTimezone zone sched) ticks
-      length matches `shouldBe` 2
-      -- Both matches format to the same local minute. AllowOverlap dedup blocks
-      -- the second insert.
-      map (formatMinuteInTimezone zone) matches
-        `shouldBe` ["2025-11-02T01:30", "2025-11-02T01:30"]
+      matches `shouldBe` [mkTime 2025 11 2 5 30 0]
+
+    it "DST fall-back: a wildcard minute or hour field runs through both passes" $ do
+      -- The local day of 2025-11-02 runs from 04:00Z to 04:59Z the next day, 25
+      -- real hours. A schedule whose minute or hour field starts with * runs in
+      -- both 01:00 hours, as Vixie cron does.
+      let Right everyFive = parseCronSchedule "*/5 * * * *"
+          Right hourly = parseCronSchedule "0 * * * *"
+          Right withinOne = parseCronSchedule "*/30 1 * * *"
+          zone = Just "America/New_York"
+          ticks = enumMinutes (mkTime 2025 11 2 4 0 0) (mkTime 2025 11 3 4 59 0)
+          countMatches sched = length (filter (matchesInTimezone zone sched) ticks)
+      countMatches everyFive `shouldBe` 25 * 12
+      countMatches hourly `shouldBe` 25
+      countMatches withinOne `shouldBe` 4
 
     it "two schedules in different zones produce different UTC fire times" $ do
       let Right sched = parseCronSchedule "0 9 * * *"
@@ -249,16 +257,6 @@ spec = do
           nonMatch = mkTime 2025 6 15 8 0 0
       matchesInTimezone Nothing sched tick `shouldBe` True
       matchesInTimezone Nothing sched nonMatch `shouldBe` False
-
-    it "formatMinuteInTimezone with Nothing == formatMinute" $ do
-      let tick = mkTime 2025 6 15 12 30 0
-      formatMinuteInTimezone Nothing tick `shouldBe` formatMinute tick
-
-    it "formatMinuteInTimezone formats the local minute" $ do
-      -- 2025-06-15T12:30 UTC = 08:30 in America/New_York (EDT, UTC-4)
-      let tick = mkTime 2025 6 15 12 30 0
-      formatMinuteInTimezone (Just "America/New_York") tick
-        `shouldBe` "2025-06-15T08:30"
 
   describe "computeDelayMicros" $ do
     it "normal case: 15s before next minute" $ do

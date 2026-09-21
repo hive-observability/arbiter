@@ -18,6 +18,7 @@ import Arbiter.Worker.Cron
   , CronJob (..)
   , OverlapPolicy (..)
   , cronJob
+  , cronJobInTimezone
   , formatMinute
   , initCronSchedules
   , newCronLog
@@ -629,6 +630,29 @@ cronSpec TestBackend {schema, table, connStr, mkSimple, mkEnv, runM} =
         runM env $ catchUpAt schema table [cron] tick
         afterRetry <- runM env $ HL.listJobs 100 0 :: IO [JobRead payload]
         afterRetry `shouldBe` []
+
+      it "DST fall-back: a fixed-time schedule fires once after its first job is acked" $ \env -> do
+        -- 01:30 America/New_York on 2025-11-02 reads at 05:30Z and 06:30Z.
+        let Right cron =
+              cronJobInTimezone
+                "fall-back"
+                "America/New_York"
+                "30 1 * * *"
+                AllowOverlap
+                (\_ _ -> defaultJob (mkSimple "once"))
+            firstPass = mkTime 2025 11 2 5 30 0
+            secondPass = mkTime 2025 11 2 6 30 0
+        runM env $ do
+          initCronSchedules schema table [cron] silentLogConfig
+          catchUpAt schema table [cron] firstPass
+
+        claimed <- runM env $ HL.claimNextVisibleJobs 100 60 :: IO [JobRead payload]
+        length claimed `shouldBe` 1
+        runM env $ traverse_ (void . HL.ackJob) claimed
+
+        runM env $ catchUpAt schema table [cron] secondPass
+        afterSecond <- runM env $ HL.listJobs 100 0 :: IO [JobRead payload]
+        afterSecond `shouldBe` []
 
       it "gate prevents double-fire when last_fired_at already covers the minute" $ \env -> do
         -- Simulates a fast pool that already fired and acked 12:00. The gate

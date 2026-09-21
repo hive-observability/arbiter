@@ -165,7 +165,7 @@ processCronCatchUp cronLog schemaName queueName jobs now = do
           $ logCron cronLog Info
           $ "Replaying " <> T.pack (show replayCount) <> " missed tick(s) for '" <> name cron <> "'"
         for_ ticksToFire $ \tick ->
-          tryInsertCronJob cronLog schemaName cron effectiveOv effectiveTz (tickKindFor currentTick tick) tick
+          tryInsertCronJob cronLog schemaName cron effectiveOv (tickKindFor currentTick tick) tick
 
 data TickOutcome = NotLeader | Ran
 
@@ -232,13 +232,13 @@ resolveAndParse cron mRow =
 -- either fails the other rolls back.
 tryInsertCronJob
   :: (QueueOperation m payload)
-  => CronLog -> Text -> CronJob payload -> OverlapPolicy -> Maybe Text -> TickKind -> UTCTime -> m ()
-tryInsertCronJob cronLog schemaName cron effectiveOv effectiveTz kind tick = do
+  => CronLog -> Text -> CronJob payload -> OverlapPolicy -> TickKind -> UTCTime -> m ()
+tryInsertCronJob cronLog schemaName cron effectiveOv kind tick = do
   result <- tryCron cronLog ("Cron schedule '" <> name cron <> "' insert") . withDbTransaction $ do
     -- Gate first. Another pool may have fired this minute.
     fired <- Ops.tryFireCronGate schemaName (name cron) tick
     when fired $ do
-      let key = makeDedupKeyFromParts (name cron) effectiveOv effectiveTz tick
+      let key = makeDedupKeyFromParts (name cron) effectiveOv tick
           jobWrite = setDedupKey (Just (IgnoreDuplicate key)) $ builder cron kind tick
       void $ HL.insertJob jobWrite
     void $ Ops.touchCronChecked schemaName tick [name cron]
@@ -307,12 +307,11 @@ logCron cronLog level msg = liftIO $ tryLog (cronLogConfig cronLog) level msg
 tryCron :: (MonadUnliftIO m) => CronLog -> Text -> m a -> m (Either SomeException a)
 tryCron cronLog = tryReportedOn (cronLogConfig cronLog) Error (cronLogGates cronLog)
 
--- | For 'AllowOverlap', the key includes the tick formatted in the schedule's
--- timezone. A DST fall-back minute fires one time.
-makeDedupKeyFromParts :: Text -> OverlapPolicy -> Maybe Text -> UTCTime -> Text
-makeDedupKeyFromParts jobName overlapPolicy zone tick = case overlapPolicy of
+-- | For 'AllowOverlap', the key includes the UTC tick minute.
+makeDedupKeyFromParts :: Text -> OverlapPolicy -> UTCTime -> Text
+makeDedupKeyFromParts jobName overlapPolicy tick = case overlapPolicy of
   SkipOverlap -> skipOverlapKey jobName
-  AllowOverlap -> "arbiter_cron:" <> jobName <> ":" <> formatMinuteInTimezone zone tick
+  AllowOverlap -> "arbiter_cron:" <> jobName <> ":" <> formatMinute tick
 
 -- | The tick-independent key a 'SkipOverlap' schedule reuses. At most one of its
 -- jobs is active.
