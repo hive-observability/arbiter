@@ -82,6 +82,7 @@ test-suite arbiter-servant-tests
     , arbiter-servant
     , arbiter-simple       >=0.1 && <0.2
     , arbiter-test-common  >=0.1 && <0.2
+    , arbiter-worker       >=0.1 && <0.2
     , base
     , bytestring
     , containers

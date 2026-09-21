@@ -77,6 +77,7 @@ import Arbiter.Core.Job.Types
   , JobWrite
   , PayloadColumns (..)
   , PayloadKeys (..)
+  , Stored
   , TraceContext (..)
   , dedupParts
   , defaultMaxAttempts
@@ -98,6 +99,7 @@ data Col a where
   CBool :: Col Bool
   CTimestamptz :: Col UTCTime
   CJsonb :: Col Value
+  CStored :: Col (Stored payload)
   CFloat8 :: Col Double
   CUuid :: Col UUID
 
@@ -240,6 +242,7 @@ pgType = \case
   CBool -> "boolean"
   CTimestamptz -> "timestamptz"
   CJsonb -> "jsonb"
+  CStored -> "jsonb"
   CFloat8 -> "float8"
   CUuid -> "uuid"
 
@@ -263,15 +266,16 @@ type JobCodec a = Codec (JobWriteSource Value) a
 
 -- | Main-table codec. The write source contains public enqueue fields,
 -- payload columns, parent id, rollup state, and suspension state.
-jobCodec :: Text -> Codec (JobWriteSource payload) (JobRead Value)
+jobCodec :: Text -> Codec (JobWriteSource payload) (JobRead (Stored stored))
 jobCodec = jobCodecWith "id"
 
 -- | 'jobCodec' with an explicit primary-key column.
-jobCodecWith :: Text -> Text -> Codec (JobWriteSource payload) (JobRead Value)
+jobCodecWith :: Text -> Text -> Codec (JobWriteSource payload) (JobRead (Stored stored))
 jobCodecWith idColumn queueName =
   Job
     <$> ro (col idColumn CInt8)
-    <*> lmap sourceEncoded (rw "payload" CJsonb)
+    <*> ro (col "payload" CStored)
+    <* wo "payload" CJsonb sourceEncoded
     <*> pure queueName
     <*> lmap (JT.groupKey . sourceJob) (rwN "group_key" CText)
     <*> ro (col "inserted_at" CTimestamptz)
@@ -293,8 +297,8 @@ jobCodecWith idColumn queueName =
     <*> lmap sourceColumns payloadCodec
 
 -- | Decoder for a main-table job row.
-jobRowCodec :: Text -> RowCodec (JobRead Value)
-jobRowCodec queueName = cDecode (jobCodec queueName :: JobCodec (JobRead Value))
+jobRowCodec :: forall payload. Text -> RowCodec (JobRead (Stored payload))
+jobRowCodec queueName = cDecode (jobCodec queueName :: JobCodec (JobRead (Stored payload)))
 
 traceCodec :: Codec (JobWriteSource payload) (Maybe TraceContext)
 traceCodec =
@@ -334,26 +338,26 @@ prefixedKeyCodec keyCol prefixCol ctor keyOf prefixOf =
 
 -- | Writable job columns with PostgreSQL types, in insert order.
 jobWriteColumns :: [(Text, Text)]
-jobWriteColumns = cColumns (jobCodec "" :: JobCodec (JobRead Value))
+jobWriteColumns = cColumns (jobCodec "" :: JobCodec (JobRead (Stored Value)))
 
 -- | Writable job column names, in insert order.
 writeColumnNames :: [Text]
 writeColumnNames = map fst jobWriteColumns
 
 -- | Envelope codec for the DLQ/archive tables: @id@, a timestamp column, and the job snapshot (@job_id@ for @id@).
-jobEnvelopeCodec :: Text -> Text -> RowCodec (Int64, UTCTime, JobRead Value)
+jobEnvelopeCodec :: forall payload. Text -> Text -> RowCodec (Int64, UTCTime, JobRead (Stored payload))
 jobEnvelopeCodec tsColumn queueName =
   (,,)
     <$> col "id" CInt8
     <*> col tsColumn CTimestamptz
-    <*> cDecode (jobCodecWith "job_id" queueName :: JobCodec (JobRead Value))
+    <*> cDecode (jobCodecWith "job_id" queueName :: JobCodec (JobRead (Stored payload)))
 
 -- | DLQ envelope. The shared job snapshot plus its DLQ id and failure time.
-dlqRowCodec :: Text -> RowCodec (Int64, UTCTime, JobRead Value)
+dlqRowCodec :: Text -> RowCodec (Int64, UTCTime, JobRead (Stored payload))
 dlqRowCodec = jobEnvelopeCodec "failed_at"
 
 -- | Archive envelope. The shared job snapshot plus the @result@ a completed root job stored.
-archiveRowCodec :: Text -> RowCodec (Int64, UTCTime, JobRead Value, Maybe Value)
+archiveRowCodec :: Text -> RowCodec (Int64, UTCTime, JobRead (Stored payload), Maybe Value)
 archiveRowCodec queueName =
   (\(envelopeId, completed, job) result -> (envelopeId, completed, job, result))
     <$> jobEnvelopeCodec "completed_at" queueName

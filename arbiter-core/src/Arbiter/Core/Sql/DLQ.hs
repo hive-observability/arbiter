@@ -14,7 +14,6 @@ module Arbiter.Core.Sql.DLQ
   , countDLQChildrenBatchSQL
   ) where
 
-import Data.Aeson (Value)
 import Data.Int (Int64)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -22,7 +21,7 @@ import NeatInterpolation (text)
 
 import Arbiter.Core.Codec (jobRowCodec)
 import Arbiter.Core.Job.Schema (jobQueueDLQTable, jobQueueTable)
-import Arbiter.Core.Job.Types (JobRead, defaultMaxAttemptsSQL)
+import Arbiter.Core.Job.Types (JobRead, Stored, defaultMaxAttemptsSQL)
 import Arbiter.Core.Sql.Jobs (dlqCarriedCols, jobColumns, requeuedCols, requeuedVals)
 import Arbiter.Core.Sql.QQ (sql)
 import Arbiter.Core.Sql.Query (Query, mwhen, rows)
@@ -83,7 +82,7 @@ selectExhaustedJobsSQL schema tableName limit =
 -- finalizers. Keep a finalizer suspended when it has restored children. Make it
 -- ready when it has no children. Refuse a root whose parent is absent from the
 -- main queue. Remove the deduplication key during the retry.
-retryFromDLQSQL :: Text -> Text -> Int64 -> Query (JobRead Value)
+retryFromDLQSQL :: Text -> Text -> Int64 -> Query (JobRead (Stored payload))
 retryFromDLQSQL schema tableName dlqId =
   let dlqTbl = jobQueueDLQTable schema tableName
       tbl = jobQueueTable schema tableName

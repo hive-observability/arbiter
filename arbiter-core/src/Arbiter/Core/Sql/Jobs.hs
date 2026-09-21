@@ -43,7 +43,6 @@ module Arbiter.Core.Sql.Jobs
   , unionAllOverQueueTables
   ) where
 
-import Data.Aeson (Value)
 import Data.Int (Int64)
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
@@ -60,7 +59,7 @@ import Arbiter.Core.Job.Schema
   , jobQueueDLQTable
   , jobQueueTable
   )
-import Arbiter.Core.Job.Types (JobRead, JobStatus, defaultMaxAttemptsSQL, minMaxAttemptsSQL)
+import Arbiter.Core.Job.Types (JobRead, JobStatus, Stored, defaultMaxAttemptsSQL, minMaxAttemptsSQL)
 import Arbiter.Core.Sql.QQ (sql)
 import Arbiter.Core.Sql.Query (Query, mwhen, rows)
 
@@ -209,7 +208,7 @@ jobsWithStatusSubquery schema tableName =
    in [text|(SELECT ${jobColumns}, ${jobStatusCaseSQL} AS status FROM ${tbl}) job|]
 
 -- | List filtered jobs without the derived status.
-listJobsFilteredSQL :: Text -> Text -> Query () -> Text -> Int64 -> Int64 -> Query (JobRead Value)
+listJobsFilteredSQL :: Text -> Text -> Query () -> Text -> Int64 -> Int64 -> Query (JobRead (Stored payload))
 listJobsFilteredSQL schema tableName whereFrag orderBy limit offset =
   let tbl = jobQueueTable schema tableName
    in rows
@@ -244,7 +243,8 @@ getJobByIdWithStatusSQL schema tableName jobId =
    in [sql|SELECT * FROM ${sub} WHERE id = #{jobId :: CInt8}|]
 
 -- | List DLQ jobs under a dynamic WHERE and an @orderBy@ from 'buildDLQOrderBy'.
-listDLQFilteredSQL :: Text -> Text -> Query () -> Text -> Int64 -> Int64 -> Query (Int64, UTCTime, JobRead Value)
+listDLQFilteredSQL
+  :: Text -> Text -> Query () -> Text -> Int64 -> Int64 -> Query (Int64, UTCTime, JobRead (Stored payload))
 listDLQFilteredSQL schema tableName whereFrag orderBy limit offset =
   let dlqTbl = jobQueueDLQTable schema tableName
    in rows
@@ -443,7 +443,7 @@ replaceableGuard tbl dlqTbl =
   |]
 
 -- | Insert a job. The write fragment carries the column list and parameters.
-insertJobSQL :: SchemaName -> TableName -> Query () -> Query (JobRead Value)
+insertJobSQL :: SchemaName -> TableName -> Query () -> Query (JobRead (Stored payload))
 insertJobSQL schema tableName valuesFrag =
   let tbl = jobQueueTable schema tableName
    in rows
@@ -457,7 +457,7 @@ insertJobSQL schema tableName valuesFrag =
 -- | Insert under the replace dedup strategy. Replaces an existing job that is idle
 -- and childless in the main queue and the DLQ. @ON CONFLICT DO UPDATE@ fires the
 -- groups UPDATE trigger, which maintains a cross-group move.
-insertJobReplaceSQL :: SchemaName -> TableName -> Query () -> Query (JobRead Value)
+insertJobReplaceSQL :: SchemaName -> TableName -> Query () -> Query (JobRead (Stored payload))
 insertJobReplaceSQL schema tableName valuesFrag =
   let tbl = jobQueueTable schema tableName
       dlqTbl = jobQueueDLQTable schema tableName
@@ -475,7 +475,7 @@ insertJobReplaceSQL schema tableName valuesFrag =
 
 -- | Batch insert over @unnest@ed parallel arrays. An ignore-dedup job is skipped on
 -- conflict. A replace-dedup job updates an idle existing row.
-insertJobsBatchSQL :: SchemaName -> TableName -> Query () -> Query (JobRead Value)
+insertJobsBatchSQL :: SchemaName -> TableName -> Query () -> Query (JobRead (Stored payload))
 insertJobsBatchSQL schema tableName batchSrc =
   rows (jobRowCodec tableName) (insertJobsBatchBase schema tableName batchSrc [text|RETURNING ${jobColumns}|])
 
@@ -507,7 +507,7 @@ insertJobsBatchBase schema tableName batchSrc returning =
 -- ---------------------------------------------------------------------------
 
 -- | Fetch a job by id.
-getJobByIdSQL :: Text -> Text -> Int64 -> Query (JobRead Value)
+getJobByIdSQL :: Text -> Text -> Int64 -> Query (JobRead (Stored payload))
 getJobByIdSQL schema tableName jobId =
   let tbl = jobQueueTable schema tableName
    in rows
@@ -519,7 +519,7 @@ getJobByIdSQL schema tableName jobId =
         |]
 
 -- | Fetch a job by its dedup key. The partial unique index guarantees at most one row.
-getJobByDedupKeySQL :: Text -> Text -> Text -> Query (JobRead Value)
+getJobByDedupKeySQL :: Text -> Text -> Text -> Query (JobRead (Stored payload))
 getJobByDedupKeySQL schema tableName key =
   let tbl = jobQueueTable schema tableName
    in rows

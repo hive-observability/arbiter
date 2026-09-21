@@ -215,7 +215,9 @@ nextRunInTimezone (Just tzName) sched now = do
       find (matchesInTimezone (Just tzName) sched) (enumMinutes (addUTCTime 60 (truncateToMinute now)) endsAt)
     seek zone from = do
       localMinute <- nextMatch sched from
-      find (\tick -> tick > now && matchesInTimezone (Just tzName) sched tick) (ticksWearing zone (utcToLocalTime utc localMinute))
+      find
+        (\tick -> tick > now && matchesInTimezone (Just tzName) sched tick)
+        (ticksWearing zone (utcToLocalTime utc localMinute))
         <|> seek zone localMinute
 
 -- | When @tick@ is in the first pass of a repeated local hour, when that hour reads again.

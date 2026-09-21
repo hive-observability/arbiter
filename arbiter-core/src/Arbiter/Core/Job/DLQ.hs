@@ -8,7 +8,7 @@ module Arbiter.Core.Job.DLQ
   , JobSnapshot
   ) where
 
-import Data.Aeson (FromJSON (..), ToJSON (..), object, withObject, (.:), (.=))
+import Data.Aeson (FromJSON (..), KeyValue (..), ToJSON (..), object, pairs, withObject, (.:))
 import Data.Int (Int64)
 import Data.Time (UTCTime)
 import GHC.Generics (Generic)
@@ -32,12 +32,15 @@ data DLQJob payload = DLQJob
   deriving stock (Eq, Generic, Show)
 
 instance (ToJSON payload) => ToJSON (DLQJob payload) where
-  toJSON dlq =
-    object
-      [ "dlqPrimaryKey" .= dlqPrimaryKey dlq
-      , "failedAt" .= failedAt dlq
-      , "jobSnapshot" .= jobSnapshot dlq
-      ]
+  toJSON = object . dlqJobFields
+  toEncoding = pairs . mconcat . dlqJobFields
+
+dlqJobFields :: (KeyValue e kv, ToJSON payload) => DLQJob payload -> [kv]
+dlqJobFields dlq =
+  [ "dlqPrimaryKey" .= dlqPrimaryKey dlq
+  , "failedAt" .= failedAt dlq
+  , "jobSnapshot" .= jobSnapshot dlq
+  ]
 
 instance (FromJSON payload) => FromJSON (DLQJob payload) where
   parseJSON = withObject "DLQJob" $ \obj ->

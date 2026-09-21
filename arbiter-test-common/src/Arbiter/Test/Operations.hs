@@ -8,6 +8,7 @@ module Arbiter.Test.Operations
   ) where
 
 import Arbiter.Core.Codec (Col (..), col, pval)
+import Arbiter.Core.Exceptions (ParsingException (..))
 import Arbiter.Core.HighLevel (SetVisibilityResult (..))
 import Arbiter.Core.HighLevel qualified as HL
 import Arbiter.Core.Job.Archive (archivePrimaryKey)
@@ -2087,6 +2088,41 @@ operationsSpec mkMessage mkResult runM = do
       Just archived <- runM env (HL.getArchivedJobById @payload (primaryKey inserted))
       Just again <- runM env (HL.reEnqueueFromArchive @payload (archivePrimaryKey archived))
       maxAttempts again `shouldBe` Just defaultMaxAttempts
+
+    it "retryFromDLQ leaves a row its payload type rejects in the DLQ" $ \env -> do
+      Just inserted <- runM env (HL.insertJob (defaultJob (mkMessage "BogusDLQ")))
+      claimed <- claimJobs env 1
+      void $ runM env (HL.moveToDLQ "Failed" (head claimed))
+      dlqJobs <- dlqAll env
+      let dlqId = DLQ.dlqPrimaryKey (head dlqJobs)
+      runM env $ do
+        schemaName <- getSchema
+        let dlqTbl = Schema.jobQueueDLQTable schemaName (HL.queueTable @payload @m)
+        void $
+          execStatement
+            ("UPDATE " <> dlqTbl <> " SET payload = '{\"bogus\": 1}' WHERE job_id = ?")
+            [pval CInt8 (primaryKey inserted)]
+      runM env (HL.retryFromDLQ @payload dlqId) `shouldThrow` \ParsingException {} -> True
+      runM env (HL.dlqJobExists @payload dlqId) `shouldReturn` True
+      stats <- runM env (HL.getQueueStats @payload)
+      HL.readyJobs stats `shouldBe` 0
+
+    it "reEnqueueFromArchive enqueues nothing for a row its payload type rejects" $ \env -> do
+      Just inserted <-
+        runM env (HL.insertJob (setArchiveFor (Just dayRetention) (defaultJob (mkMessage "BogusArchive"))))
+      claimed <- claimJobs env 1
+      void $ runM env (HL.ackJob (head claimed))
+      Just archived <- runM env (HL.getArchivedJobById @payload (primaryKey inserted))
+      runM env $ do
+        schemaName <- getSchema
+        let archiveTbl = Schema.jobQueueArchiveTable schemaName (HL.queueTable @payload @m)
+        void $
+          execStatement
+            ("UPDATE " <> archiveTbl <> " SET payload = '{\"bogus\": 1}' WHERE job_id = ?")
+            [pval CInt8 (primaryKey inserted)]
+      runM env (HL.reEnqueueFromArchive @payload (archivePrimaryKey archived)) `shouldThrow` \ParsingException {} -> True
+      stats <- runM env (HL.getQueueStats @payload)
+      HL.readyJobs stats `shouldBe` 0
 
     it "getQueueStats counts grouped jobs behind their head as blocked" $ \env -> do
       forM_ [1 .. 3 :: Int] $ \index ->

@@ -35,6 +35,7 @@ import Arbiter.Core.Job.Types
   ( JobRead
   , JobStatus
   , PayloadKeys (PayloadKeys)
+  , Stored
   , defaultJob
   , jobStatusToText
   , setArchiveFor
@@ -394,6 +395,10 @@ jobFields =
             <*> prop @(Maybe ConcurrencyKey) "concurrency"
         )
     <* prop @Bool "isRollup"
+
+-- | A stored payload documents as the payload it decodes to.
+instance (ToSchema payload) => ToSchema (Stored payload) where
+  declareNamedSchema _ = declareNamedSchema (Proxy @payload)
 
 instance (ToSchema payload) => ToSchema (JobRead payload) where
   declareNamedSchema _ = objectSchema (carrying @payload "Job") [] (jobFields @payload)

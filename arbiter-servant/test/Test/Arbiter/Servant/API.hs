@@ -8,16 +8,21 @@
 module Test.Arbiter.Servant.API (spec) where
 
 import Arbiter.Core.CronSchedule qualified as CS
+import Arbiter.Core.Exceptions (ParsingException (..))
 import Arbiter.Core.HighLevel qualified as HL
+import Arbiter.Core.Job.Archive (ArchiveJob, archivePrimaryKey)
 import Arbiter.Core.Job.DLQ (DLQJob (..), dlqPrimaryKey)
+import Arbiter.Core.Job.Schema qualified as Schema
 import Arbiter.Core.Job.Types
   ( DedupKey (..)
   , HasKind
   , JobRead
   , JobStatus (..)
+  , Stored
   , attempts
   , claimSeq
   , claimedBy
+  , decodeStored
   , dedupKey
   , defaultGroupedJob
   , defaultJob
@@ -25,6 +30,7 @@ import Arbiter.Core.Job.Types
   , notVisibleUntil
   , payload
   , primaryKey
+  , setArchiveFor
   , setDedupKey
   , setNotVisibleUntil
   , suspended
@@ -37,11 +43,15 @@ import Arbiter.Core.Worker qualified as W
 import Arbiter.Simple (createSimpleEnvWithPool, runSimpleDb)
 import Arbiter.Test.RateLimit (RLReg, rateLimitTable, setupRateLimitPolicy)
 import Arbiter.Test.Setup (cleanupData, createSharedPool, setupOnce, truncateToMicros)
+import Arbiter.Worker.Logger (LogConfig (..), LogDestination (..), defaultLogConfig)
+import Control.Exception (finally)
 import Control.Monad (forM_, void)
 import Data.Aeson (FromJSON, ToJSON, Value, decode, encode, object, toJSON, (.=))
 import Data.Aeson.QQ.Simple (aesonQQ)
 import Data.ByteString (ByteString)
+import Data.ByteString qualified as BS
 import Data.ByteString.Lazy qualified as LB
+import Data.IORef (atomicModifyIORef', newIORef, readIORef)
 import Data.Int (Int64)
 import Data.List.NonEmpty (NonEmpty (..))
 import Data.Map.Strict qualified as Map
@@ -59,6 +69,7 @@ import GHC.Generics (Generic)
 import Network.HTTP.Types (status200, status204, status400, status404, status409)
 import Test.Hspec
 import Test.Hspec.Wai
+import Test.Hspec.Wai.Internal (runWaiSession)
 
 import Arbiter.Servant (ArbiterServerConfig (..), arbiterApp, initArbiterServer)
 import Arbiter.Servant.Types
@@ -158,6 +169,15 @@ spec connStr = do
 
   let cleanupDb :: IO ()
       cleanupDb = withResource sharedPool $ \conn -> cleanupData testSchema testTable conn
+
+      corruptPayload :: Text -> Text -> Int64 -> IO ()
+      corruptPayload tbl idColumn jobId =
+        void $
+          withResource sharedPool $ \conn ->
+            PG.execute
+              conn
+              (fromString . T.unpack $ "UPDATE " <> tbl <> " SET payload = '{\"bogus\": 1}' WHERE " <> idColumn <> " = ?")
+              (PG.Only jobId)
 
   mkEnv <- runIO (createSimpleEnvWithPool (Proxy @ServantTestRegistry) sharedPool testSchema)
 
@@ -401,7 +421,7 @@ spec connStr = do
       liftIO $ do
         body :: JobsResponse ServantTestPayload <- decodeBody resp
         jobsTotal body `shouldBe` 1
-        map (payload . ajwsJob) (jobs body) `shouldBe` [TestCalculation 1 2]
+        map (decodeStored . payload . ajwsJob) (jobs body) `shouldBe` [Right (TestCalculation 1 2)]
 
     it "GET /api/v1/arbiter_servant_test/kinds lists every label the payload carries" $ do
       resp <- get "/api/v1/arbiter_servant_test/kinds"
@@ -536,7 +556,7 @@ spec connStr = do
             liftIO $ do
               body :: JobsResponse ServantTestPayload <- decodeBody resp
               jobsTotal body `shouldBe` 1
-              map (payload . ajwsJob) (jobs body) `shouldBe` [pay]
+              map (decodeStored . payload . ajwsJob) (jobs body) `shouldBe` [Right pay]
       expectOne "ready" (TestMessage "ready-job")
       expectOne "in_flight" (TestMessage "inflight-job")
       expectOne "backoff" (TestMessage "backoff-job")
@@ -628,6 +648,20 @@ spec connStr = do
         dlqTotal body `shouldBe` 1
         length (dlqJobs body) `shouldBe` 1
 
+    it "GET jobs, job detail and dlq splice the stored payload bytes into the response" $ do
+      -- JSONB spaces its output. A payload aeson re-encoded would carry no spaces.
+      let stored = "\"payload\":{\"tag\": \"TestMessage\", \"contents\": \"as stored\"}"
+          splices resp = LB.toStrict (simpleBody resp) `shouldSatisfy` BS.isInfixOf stored
+      jobId <- liftIO $ do
+        Just jobRead <- runSimpleDb mkEnv $ HL.insertJob (defaultJob (TestMessage "as stored"))
+        pure $ primaryKey jobRead
+
+      get "/api/v1/arbiter_servant_test/jobs" >>= liftIO . splices
+      get (TE.encodeUtf8 $ "/api/v1/arbiter_servant_test/jobs/" <> T.pack (show jobId)) >>= liftIO . splices
+      post (TE.encodeUtf8 $ "/api/v1/arbiter_servant_test/jobs/" <> T.pack (show jobId) <> "/move-to-dlq") ""
+        `shouldRespondWith` 204
+      get "/api/v1/arbiter_servant_test/dlq" >>= liftIO . splices
+
     it "POST /api/v1/arbiter_servant_test/jobs/:id/move-to-dlq returns 404 for non-existent job" $ do
       post "/api/v1/arbiter_servant_test/jobs/99999/move-to-dlq" "" `shouldRespondWith` 404
 
@@ -648,8 +682,8 @@ spec connStr = do
 
       -- Verify children are suspended
       liftIO $ do
-        allJobs :: [JobRead ServantTestPayload] <- runSimpleDb mkEnv $ Ops.listJobs testSchema testTable 10 0
-        let childJobs = filter (\listed -> payload listed == TestMessage "child") allJobs
+        allJobs :: [JobRead (Stored ServantTestPayload)] <- runSimpleDb mkEnv $ Ops.listJobs testSchema testTable 10 0
+        let childJobs = filter (\listed -> decodeStored (payload listed) == Right (TestMessage "child")) allJobs
         length childJobs `shouldBe` 1
         forM_ childJobs $ \listed -> suspended listed `shouldBe` True
 
@@ -678,8 +712,8 @@ spec connStr = do
 
       -- Verify children are no longer suspended
       liftIO $ do
-        allJobs :: [JobRead ServantTestPayload] <- runSimpleDb mkEnv $ Ops.listJobs testSchema testTable 10 0
-        let childJobs = filter (\listed -> payload listed == TestMessage "child") allJobs
+        allJobs :: [JobRead (Stored ServantTestPayload)] <- runSimpleDb mkEnv $ Ops.listJobs testSchema testTable 10 0
+        let childJobs = filter (\listed -> decodeStored (payload listed) == Right (TestMessage "child")) allJobs
         length childJobs `shouldBe` 1
         suspended (head childJobs) `shouldBe` False
 
@@ -768,9 +802,51 @@ spec connStr = do
 
       -- Verify job is back in main queue
       liftIO $ do
-        allJobs :: [JobRead ServantTestPayload] <-
+        allJobs :: [JobRead (Stored ServantTestPayload)] <-
           runSimpleDb mkEnv $ Ops.listJobs testSchema testTable 10 0
         length allJobs `shouldBe` 1
+
+    it "POST /api/v1/arbiter_servant_test/dlq/:id/retry leaves a row its payload type rejects in the DLQ" $ do
+      dlqId <- liftIO $ do
+        Just jobRead <- runSimpleDb mkEnv $ HL.insertJob (defaultJob (TestMessage "bogus"))
+        _ <- runSimpleDb mkEnv $ HL.moveToDLQ "Test error" jobRead
+        corruptPayload (Schema.jobQueueDLQTable testSchema testTable) "job_id" (primaryKey jobRead)
+        dlqs :: [DLQJob (Stored ServantTestPayload)] <- runSimpleDb mkEnv $ Ops.listDLQJobs testSchema testTable 1 0
+        pure $ dlqPrimaryKey (head dlqs)
+
+      liftIO $
+        runWaiSession (post (TE.encodeUtf8 $ "/api/v1/arbiter_servant_test/dlq/" <> T.pack (show dlqId) <> "/retry") "") app
+          `shouldThrow` \ParsingException {} -> True
+
+      resp <- get "/api/v1/arbiter_servant_test/dlq"
+      liftIO $ do
+        body :: DLQResponse ServantTestPayload <- decodeBody resp
+        dlqTotal body `shouldBe` 1
+      jobsResp <- get "/api/v1/arbiter_servant_test/jobs"
+      liftIO $ do
+        queued :: JobsResponse ServantTestPayload <- decodeBody jobsResp
+        jobsTotal queued `shouldBe` 0
+
+    it "POST /api/v1/arbiter_servant_test/archive/:id/reenqueue enqueues nothing for a row its payload type rejects" $ do
+      archiveId <- liftIO $ do
+        Just jobRead <- runSimpleDb mkEnv $ HL.insertJob (setArchiveFor (Just 86400) (defaultJob (TestMessage "bogus")))
+        [claimed] <- runSimpleDb mkEnv $ HL.claimNextVisibleJobsAs @ServantTestPayload 1 60 UUID.nil
+        _ <- runSimpleDb mkEnv $ HL.ackJob claimed
+        corruptPayload (Schema.jobQueueArchiveTable testSchema testTable) "job_id" (primaryKey jobRead)
+        Just archived :: Maybe (ArchiveJob (Stored ServantTestPayload)) <-
+          runSimpleDb mkEnv $ Ops.getArchivedJobById testSchema testTable (primaryKey jobRead)
+        pure $ archivePrimaryKey archived
+
+      liftIO $
+        runWaiSession
+          (post (TE.encodeUtf8 $ "/api/v1/arbiter_servant_test/archive/" <> T.pack (show archiveId) <> "/reenqueue") "")
+          app
+          `shouldThrow` \ParsingException {} -> True
+
+      resp <- get "/api/v1/arbiter_servant_test/jobs"
+      liftIO $ do
+        body :: JobsResponse ServantTestPayload <- decodeBody resp
+        jobsTotal body `shouldBe` 0
 
     it "DELETE /api/v1/arbiter_servant_test/dlq/:id permanently deletes job" $ do
       -- Insert a job, then move it to DLQ
@@ -791,7 +867,7 @@ spec connStr = do
 
       -- Verify job is absent from the main queue
       liftIO $ do
-        allJobs :: [JobRead ServantTestPayload] <-
+        allJobs :: [JobRead (Stored ServantTestPayload)] <-
           runSimpleDb mkEnv $ Ops.listJobs testSchema testTable 10 0
         length allJobs `shouldBe` 0
 
@@ -836,7 +912,7 @@ spec connStr = do
 
       -- Verify the job is suspended
       liftIO $ do
-        Just job :: Maybe (JobRead ServantTestPayload) <- runSimpleDb mkEnv $ Ops.getJobById testSchema testTable jobId
+        Just job :: Maybe (JobRead (Stored ServantTestPayload)) <- runSimpleDb mkEnv $ Ops.getJobById testSchema testTable jobId
         suspended job `shouldBe` True
 
     it "POST /:id/resume resumes a suspended job" $ do
@@ -850,7 +926,7 @@ spec connStr = do
 
       -- Verify the job is no longer suspended
       liftIO $ do
-        Just job :: Maybe (JobRead ServantTestPayload) <- runSimpleDb mkEnv $ Ops.getJobById testSchema testTable jobId
+        Just job :: Maybe (JobRead (Stored ServantTestPayload)) <- runSimpleDb mkEnv $ Ops.getJobById testSchema testTable jobId
         suspended job `shouldBe` False
 
     it "POST /:id/resume returns 404 for non-existent job" $ do
@@ -1023,7 +1099,34 @@ spec connStr = do
       liftIO $ length claimed `shouldBe` 1
       liftIO $ claimedBy (head claimed) `shouldNotBe` Nothing
 
-    it "POST /:id/ack completes a job the lease still holds" $ do
+    it "POST /claim keeps the decoded jobs and reports a rejected row it cannot dead-letter" $ do
+      logged <- liftIO (newIORef [])
+      let capturing = LogCallback (\_ msg _ -> atomicModifyIORef' logged (\seen -> (msg : seen, ())))
+          reportingApp = arbiterApp @ServantTestRegistry serverConfig {serverLogConfig = defaultLogConfig {logDestination = capturing}}
+          dlqTbl = Schema.jobQueueDLQTable testSchema testTable
+      claimed <- liftIO $ do
+        Just poison <- runSimpleDb mkEnv $ HL.insertJob (defaultJob (TestMessage "poison"))
+        void $ runSimpleDb mkEnv $ HL.insertJob (defaultJob (TestMessage "sibling"))
+        corruptPayload (Schema.jobQueueTable testSchema testTable) "id" (primaryKey poison)
+        withResource sharedPool $ \conn -> do
+          void $
+            PG.execute_
+              conn
+              ( fromString . T.unpack $
+                  "ALTER TABLE "
+                    <> dlqTbl
+                    <> " ADD CONSTRAINT reject_poison CHECK (job_id <> "
+                    <> T.pack (show (primaryKey poison))
+                    <> ")"
+              )
+          decodeClaim
+            <$> runWaiSession (postJson "/api/v1/arbiter_servant_test/claim" "{\"maxJobs\":2}") reportingApp
+              `finally` PG.execute_ conn (fromString . T.unpack $ "ALTER TABLE " <> dlqTbl <> " DROP CONSTRAINT reject_poison")
+      liftIO $ do
+        map payload claimed `shouldBe` [TestMessage "sibling"]
+        messages <- readIORef logged
+        messages `shouldSatisfy` any (T.isPrefixOf "Dead-letter undecodable job in arbiter_servant_test failed")
+
       liftIO $ void $ runSimpleDb mkEnv $ HL.insertJob (defaultJob (TestMessage "ack me"))
       claimed <- decodeClaim <$> postJson "/api/v1/arbiter_servant_test/claim" "{\"maxJobs\":1}"
       let job = head claimed
@@ -1031,7 +1134,8 @@ spec connStr = do
       postJson (ackPath job) (leaseBody job) `shouldRespondWith` 204
 
       liftIO $ do
-        gone :: Maybe (JobRead ServantTestPayload) <- runSimpleDb mkEnv $ Ops.getJobById testSchema testTable (primaryKey job)
+        gone :: Maybe (JobRead (Stored ServantTestPayload)) <-
+          runSimpleDb mkEnv $ Ops.getJobById testSchema testTable (primaryKey job)
         gone `shouldBe` Nothing
 
     it "POST /:id/ack refuses a lease the caller does not hold" $ do
@@ -1079,7 +1183,8 @@ spec connStr = do
       postJson (ackPath job) (leaseBody job) `shouldRespondWith` 409
 
       liftIO $ do
-        still :: Maybe (JobRead ServantTestPayload) <- runSimpleDb mkEnv $ Ops.getJobById testSchema testTable (primaryKey job)
+        still :: Maybe (JobRead (Stored ServantTestPayload)) <-
+          runSimpleDb mkEnv $ Ops.getJobById testSchema testTable (primaryKey job)
         fmap primaryKey still `shouldBe` Just (primaryKey job)
 
     it "POST /:id/nack hands the job back without spending an attempt" $ do
@@ -1090,7 +1195,7 @@ spec connStr = do
       postJson (nackPath job) (leaseBody job) `shouldRespondWith` 204
 
       liftIO $ do
-        Just back :: Maybe (JobRead ServantTestPayload) <-
+        Just back :: Maybe (JobRead (Stored ServantTestPayload)) <-
           runSimpleDb mkEnv $ Ops.getJobById testSchema testTable (primaryKey job)
         attempts back `shouldBe` attempts job - 1
 

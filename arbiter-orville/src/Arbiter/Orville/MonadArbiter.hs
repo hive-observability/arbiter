@@ -10,6 +10,7 @@ module Arbiter.Orville.MonadArbiter
 
 import Arbiter.Core.Codec (Col (..), NullCol (..), ParamType (..), SomeParam (..), runCodec)
 import Arbiter.Core.Exceptions (throwInternal)
+import Arbiter.Core.Job.Types.Internal (Stored (..), storedBytes)
 import Arbiter.Core.MonadArbiter (Query (..))
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Data.Aeson (Value, eitherDecodeStrict', encode)
@@ -115,6 +116,7 @@ colFieldDef name CText = O.unboundedTextField (T.unpack name)
 colFieldDef name CBool = O.booleanField (T.unpack name)
 colFieldDef name CTimestamptz = O.utcTimestampField (T.unpack name)
 colFieldDef name CJsonb = O.fieldOfType jsonbValue (T.unpack name)
+colFieldDef name CStored = O.fieldOfType storedJsonb (T.unpack name)
 colFieldDef name CFloat8 = O.doubleField (T.unpack name)
 colFieldDef name CUuid = O.uuidField (T.unpack name)
 
@@ -124,6 +126,10 @@ jsonbValue =
     (TL.toStrict . TLE.decodeUtf8 . encode)
     (eitherDecodeStrict' . TE.encodeUtf8)
     O.jsonb
+
+-- | The JSON bytes as stored, through orville's text-typed @jsonb@.
+storedJsonb :: O.SqlType (Stored payload)
+storedJsonb = O.convertSqlType (TE.decodeUtf8 . storedBytes) (Stored . TE.encodeUtf8) O.jsonb
 
 readRowCount :: LibPQ.Result -> IO Int64
 readRowCount res =

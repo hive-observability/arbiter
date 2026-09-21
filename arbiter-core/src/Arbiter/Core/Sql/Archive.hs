@@ -23,7 +23,7 @@ import NeatInterpolation (text)
 
 import Arbiter.Core.Codec (archiveRowCodec, codecColumns, jobRowCodec, joinColumns)
 import Arbiter.Core.Job.Schema (jobQueueArchiveTable, jobQueueTable)
-import Arbiter.Core.Job.Types (JobRead)
+import Arbiter.Core.Job.Types (JobRead, Stored)
 import Arbiter.Core.Sql.Jobs (enqueuedAgainCols, enqueuedAgainVals, jobColsExceptId, jobColumns)
 import Arbiter.Core.Sql.QQ (sql)
 import Arbiter.Core.Sql.Query (Query, rows)
@@ -88,7 +88,7 @@ purgeArchiveSQL schema tableName =
 
 -- | List archived jobs under a dynamic WHERE.
 listArchiveFilteredSQL
-  :: Text -> Text -> Query () -> Text -> Int64 -> Int64 -> Query (Int64, UTCTime, JobRead Value, Maybe Value)
+  :: Text -> Text -> Query () -> Text -> Int64 -> Int64 -> Query (Int64, UTCTime, JobRead (Stored payload), Maybe Value)
 listArchiveFilteredSQL schema tableName whereFrag orderBy limit offset =
   let archiveTbl = jobQueueArchiveTable schema tableName
    in rows
@@ -115,7 +115,7 @@ deleteArchiveJobsBatchSQL schema tableName archiveIds =
 
 -- | Re-enqueue an archived job as a fresh standalone job, keeping the archive
 -- row. Carries 'enqueuedAgainCols' and resets the other columns to their defaults.
-reEnqueueFromArchiveSQL :: Text -> Text -> Int64 -> Query (JobRead Value)
+reEnqueueFromArchiveSQL :: Text -> Text -> Int64 -> Query (JobRead (Stored payload))
 reEnqueueFromArchiveSQL schema tableName archiveId =
   let archiveTbl = jobQueueArchiveTable schema tableName
       tbl = jobQueueTable schema tableName

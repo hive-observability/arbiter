@@ -18,9 +18,11 @@ import Arbiter.Core.Job.Schema qualified as Schema
 import Arbiter.Core.Job.Types
   ( JobRead
   , ObservabilityHooks (..)
+  , Stored
   , attempts
   , claimSeq
   , claimedBy
+  , decodeStored
   , defaultJob
   , defaultObservabilityHooks
   , payload
@@ -54,10 +56,12 @@ import Arbiter.Worker.Logger (silentLogConfig)
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Exception (SomeException, finally, throwIO, try)
-import Control.Monad (void, when)
+import Control.Monad (replicateM, void, when)
 import Control.Monad.IO.Class (liftIO)
+import Data.Aeson qualified as Aeson
 import Data.ByteString (ByteString)
 import Data.ByteString.Char8 qualified as BSC
+import Data.ByteString.Lazy qualified as BL
 import Data.Either (isRight)
 import Data.Foldable (for_, toList, traverse_)
 import Data.IORef (atomicModifyIORef', newIORef, readIORef, writeIORef)
@@ -65,7 +69,7 @@ import Data.Int (Int64)
 import Data.List (find)
 import Data.List.NonEmpty (NonEmpty (..))
 import Data.Map.Strict qualified as Map
-import Data.Maybe (fromMaybe, isJust, isNothing)
+import Data.Maybe (catMaybes, fromMaybe, isJust, isNothing)
 import Data.String (fromString)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -1552,6 +1556,67 @@ lifecycleSpec TestBackend {schema, table, connStr, mkSimple, mkEnv, pollOnly, mk
                 :: IO [(Int64, Text)]
           map fst dlq `shouldBe` [primaryKey poison]
           map snd dlq `shouldSatisfy` all (T.isPrefixOf "Failed to decode job payload")
+
+      it "claims again after an all-poison claim rather than waiting for the next poll" $ \env -> do
+        completedRef <- newIORef []
+        config :: WorkerConfig m payload <-
+          transactionalWorkerConfig 10 $
+            mkHandler (noResult (\job -> liftIO $ atomicModifyIORef' completedRef (\seen -> (payload job : seen, ()))))
+        poison <- replicateM 5 $ runM env $ HL.insertJob (defaultJob (mkSimple "poison"))
+        void $ runM env $ HL.insertJob (defaultJob (mkSimple "sibling"))
+        void $
+          withConn connStr $ \conn ->
+            PG.execute
+              conn
+              ( fromString . T.unpack $
+                  "UPDATE " <> Schema.jobQueueTable schema table <> " SET payload = '{\"bogus\": 1}' WHERE id IN ?"
+              )
+              (Only (PG.In (map primaryKey (catMaybes poison))))
+
+        withAsync (runM env $ runWorkerPool config {workerCount = 2, pollInterval = 30, visibilityTimeout = 60}) $ \_ ->
+          waitUntil 5_000 $ (== [mkSimple "sibling"]) <$> readIORef completedRef
+
+      it "keeps the decoded jobs of a claim when a rejected row cannot be dead-lettered" $ \env -> do
+        Just poison <- runM env $ HL.insertJob (defaultJob (mkSimple "poison"))
+        void $ runM env $ HL.insertJob (defaultJob (mkSimple "sibling"))
+        let dlqTbl = Schema.jobQueueDLQTable schema table
+            poisonId = T.pack (show (primaryKey poison))
+        claimed <-
+          withConn connStr $ \conn -> do
+            void $
+              PG.execute
+                conn
+                (fromString . T.unpack $ "UPDATE " <> Schema.jobQueueTable schema table <> " SET payload = '{\"bogus\": 1}' WHERE id = ?")
+                (Only (primaryKey poison))
+            execute_ conn ("ALTER TABLE " <> dlqTbl <> " ADD CONSTRAINT reject_poison CHECK (job_id <> " <> poisonId <> ")")
+            (runM env (HL.claimNextVisibleJobs 2 60) :: IO [JobRead payload])
+              `finally` execute_ conn ("ALTER TABLE " <> dlqTbl <> " DROP CONSTRAINT reject_poison")
+        map payload claimed `shouldBe` [mkSimple "sibling"]
+        runM env (Ops.listDLQJobs schema table 100 0 :: m [DLQ.DLQJob (Stored payload)]) >>= (`shouldBe` [])
+        Just held <- runM env (Ops.getJobById @_ @payload schema table (primaryKey poison))
+        claimedBy held `shouldSatisfy` isJust
+
+      it "lists and encodes a row its payload type rejects, decoding only on request" $ \env -> do
+        Just poison <- runM env $ HL.insertJob (defaultJob (mkSimple "poison"))
+        void $
+          withConn connStr $ \conn ->
+            PG.execute
+              conn
+              (fromString . T.unpack $ "UPDATE " <> Schema.jobQueueTable schema table <> " SET payload = '{\"bogus\": 1}' WHERE id = ?")
+              (Only (primaryKey poison))
+        moved <- runM env $ Ops.moveToDLQ Ops.TakeLocks schema table "poison" poison
+        moved `shouldBe` 1
+
+        [entry] <- runM env (Ops.listDLQJobs schema table 100 0) :: IO [DLQ.DLQJob (Stored payload)]
+        let row = DLQ.jobSnapshot entry
+        primaryKey row `shouldBe` primaryKey poison
+        -- JSONB spaces its output. A payload spliced from the row keeps that spacing.
+        BL.toStrict (Aeson.encode entry) `shouldSatisfy` BSC.isInfixOf "\"payload\":{\"bogus\": 1}"
+        Aeson.toJSON (payload row) `shouldBe` Aeson.object ["bogus" Aeson..= (1 :: Int)]
+        decodeStored (payload row) `shouldSatisfy` either (T.isPrefixOf "Failed to decode job payload") (const False)
+        case Aeson.eitherDecode (Aeson.encode row) :: Either String (JobRead (Stored payload)) of
+          Left err -> expectationFailure err
+          Right decoded -> Aeson.toJSON (payload decoded) `shouldBe` Aeson.toJSON (payload row)
   where
     lockRow = lockJobRow schema table
     withOpsTable :: IO a -> IO a

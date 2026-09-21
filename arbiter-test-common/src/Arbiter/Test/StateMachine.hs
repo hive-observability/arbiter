@@ -9,6 +9,7 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TypeFamilies #-}
+{-# OPTIONS_GHC -Wno-x-partial #-}
 
 -- | Parameterized stateful property-based tests for the core job engine, using
 -- hedgehog. Works against any 'MonadArbiter' backend via a passed runner and a

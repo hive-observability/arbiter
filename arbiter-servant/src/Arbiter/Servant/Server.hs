@@ -26,6 +26,7 @@ module Arbiter.Servant.Server
   ) where
 
 import Arbiter.Core.CronSchedule qualified as CS
+import Arbiter.Core.Exceptions (throwParsing)
 import Arbiter.Core.Health qualified as Health
 import Arbiter.Core.HighLevel qualified as HL
 import Arbiter.Core.Job.Schema qualified as Schema
@@ -43,7 +44,7 @@ import Arbiter.Simple (Env (..), PoolState (..), SimpleDb, SimpleEnv, createSimp
 import Arbiter.Worker (MaintenancePace (..), runMaintenancePass, storeEncodedResult)
 import Arbiter.Worker.Config (maintenanceOpName)
 import Arbiter.Worker.Cron (nextRunFromExpression, updateCronScheduleChecked)
-import Arbiter.Worker.Logger (defaultLogConfig)
+import Arbiter.Worker.Logger (FailureGates, LogConfig, LogLevel (..), defaultLogConfig, newFailureGates, tryReportedOn)
 import Control.Concurrent (forkIOWithUnmask, threadDelay)
 import Control.Concurrent.Async (race_)
 import Control.Concurrent.MVar (MVar, modifyMVar, modifyMVar_, newMVar)
@@ -73,6 +74,7 @@ import Data.Either (fromRight)
 import Data.Foldable (traverse_)
 import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Int (Int64)
+import Data.Kind (Type)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (catMaybes, fromMaybe, isJust)
 import Data.Ord (clamp)
@@ -154,6 +156,11 @@ data ArbiterServerConfig (registry :: JobPayloadRegistry) = ArbiterServerConfig
   , maintenanceTimeout :: NominalDiffTime
   -- ^ Abort any single maintenance statement that runs longer than this.
   -- Default: 'defaultMaintenanceTimeout'.
+  , serverLogConfig :: LogConfig
+  -- ^ Where the server reports maintenance and dead-letter failures.
+  -- Default: 'defaultLogConfig'.
+  , deadLetterGates :: FailureGates
+  -- ^ Per-queue failure gates for dead-letter reports.
   }
 
 -- | A running SSE broadcast hub: the channel every client duplicates, and the
@@ -184,13 +191,12 @@ noContentOr = either throwError (const (pure NoContent))
 -- | Run a job mutation. When it touches no row, re-read the job and answer 404, or
 -- the 409 that @refuse@ derives from the job's state.
 mutateJob
-  :: forall payload registry
-   . (JobPayload payload)
-  => Text
+  :: forall (payload :: Type) registry
+   . Text
   -> ArbiterServerConfig registry
   -> Int64
   -> (Text -> SimpleDb registry IO Int64)
-  -> (Job.JobRead payload -> LBS.ByteString)
+  -> (Job.JobRead (Job.Stored payload) -> LBS.ByteString)
   -> Handler NoContent
 mutateJob tableName config jobId mutate refuse =
   noContentOr =<< runDb config (mutate schemaName >>= diagnose)
@@ -228,6 +234,7 @@ initArbiterServer _proxy connStr schemaName = do
   statsCache <- newCacheCell
   perQueueCache <- newCacheCell
   healthCell <- newCacheCell
+  gates <- newFailureGates
   pure
     ArbiterServerConfig
       { serverEnv = env
@@ -243,6 +250,8 @@ initArbiterServer _proxy connStr schemaName = do
       , maintenanceSparseInterval = defaultMaintenanceSparseInterval
       , maintenanceBucketIdle = defaultMaintenanceBucketIdle
       , maintenanceTimeout = defaultMaintenanceTimeout
+      , serverLogConfig = defaultLogConfig
+      , deadLetterGates = gates
       }
 
 -- | Jobs API handlers for a specific table.
@@ -260,22 +269,21 @@ jobsServer table config =
     , getJob = getJobHandler @registry @payload table config
     , cancelJob = cancelJobHandler @registry table config
     , forceCancelJob = forceCancelJobHandler @registry table config
-    , promoteJob = promoteJobHandler @registry @payload table config
-    , moveToDLQ = moveToDLQHandler @registry @payload table config
+    , promoteJob = promoteJobHandler @registry table config
+    , moveToDLQ = moveToDLQHandler @registry table config
     , pauseChildren = pauseChildrenHandler @registry table config
     , resumeChildren = resumeChildrenHandler @registry table config
-    , suspendJob = suspendJobHandler @registry @payload table config
-    , resumeJob = resumeJobHandler @registry @payload table config
-    , ackClaimedJob = ackClaimedJobHandler @registry @payload @result table config
-    , nackClaimedJob = nackClaimedJobHandler @registry @payload table config
-    , extendClaimedJob = extendClaimedJobHandler @registry @payload table config
+    , suspendJob = suspendJobHandler @registry table config
+    , resumeJob = resumeJobHandler @registry table config
+    , ackClaimedJob = ackClaimedJobHandler @registry @result table config
+    , nackClaimedJob = nackClaimedJobHandler @registry table config
+    , extendClaimedJob = extendClaimedJobHandler @registry table config
     }
 
 -- | List jobs with pagination and composable filters.
 listJobsHandler
-  :: forall registry payload
-   . (JobPayload payload)
-  => Text
+  :: forall registry (payload :: Type)
+   . Text
   -> ArbiterServerConfig registry
   -> Maybe Int
   -> Maybe Int
@@ -350,7 +358,8 @@ insertJobHandler tableName config (ApiJobWrite jobWrite) = do
     inserted <- Ops.insertJob schemaName tableName jobWrite
     case (inserted, Job.dedupKey jobWrite) of
       (Just fresh, _) -> pure (Just fresh)
-      (Nothing, Just (IgnoreDuplicate duplicateKey)) -> Ops.getJobByDedupKey schemaName tableName duplicateKey
+      (Nothing, Just (IgnoreDuplicate duplicateKey)) ->
+        Ops.getJobByDedupKey schemaName tableName duplicateKey >>= traverse (either throwParsing pure . Ops.decodeRow)
       _ -> pure Nothing
   case mJob of
     Just found -> pure $ JobResponse found
@@ -377,12 +386,11 @@ insertJobsBatchHandler tableName config (BatchInsertRequest jobWrites) = do
 
 -- | Fetch a job by id.
 getJobHandler
-  :: forall registry payload
-   . (JobPayload payload)
-  => Text
+  :: forall registry (payload :: Type)
+   . Text
   -> ArbiterServerConfig registry
   -> Int64
-  -> Handler (JobResponse (ApiJobWithStatus payload))
+  -> Handler (JobResponse (ApiJobWithStatus (Job.Stored payload)))
 getJobHandler tableName config jobId = do
   let schemaName = serverSchema config
   mJob <- runDb config $ Ops.getJobByIdWithStatus schemaName tableName jobId
@@ -414,14 +422,13 @@ forceCancelJobHandler tableName config jobId = do
 
 -- | Promote a job (make it immediately visible).
 promoteJobHandler
-  :: forall registry payload
-   . (JobPayload payload)
-  => Text
+  :: forall registry
+   . Text
   -> ArbiterServerConfig registry
   -> Int64
   -> Handler NoContent
 promoteJobHandler tableName config jobId =
-  mutateJob @payload tableName config jobId (\schemaName -> Ops.promoteJob schemaName tableName jobId) refuse
+  mutateJob tableName config jobId (\schemaName -> Ops.promoteJob schemaName tableName jobId) refuse
   where
     refuse job
       | Job.suspended job = "Job is suspended - use resume endpoint"
@@ -430,9 +437,8 @@ promoteJobHandler tableName config jobId =
 
 -- | Move a job to the dead letter queue.
 moveToDLQHandler
-  :: forall registry payload
-   . (JobPayload payload)
-  => Text
+  :: forall registry
+   . Text
   -> ArbiterServerConfig registry
   -> Int64
   -> Handler NoContent
@@ -440,7 +446,7 @@ moveToDLQHandler tableName config jobId =
   noContentOr =<< runDb config (withDbTransaction moved)
   where
     schemaName = serverSchema config
-    moved = Ops.getJobById @_ @payload schemaName tableName jobId >>= maybe (pure notFound) move
+    moved = Ops.getJobById schemaName tableName jobId >>= maybe (pure notFound) move
     notFound = Left err404 {errBody = "Job not found"}
     move job = decide <$> Ops.moveToDLQ Ops.TakeLocks schemaName tableName "Manually moved to DLQ via admin API" job
     decide rowsAffected
@@ -471,14 +477,13 @@ resumeChildrenHandler tableName config jobId =
 
 -- | Suspend a job (make it unclaimable).
 suspendJobHandler
-  :: forall registry payload
-   . (JobPayload payload)
-  => Text
+  :: forall registry
+   . Text
   -> ArbiterServerConfig registry
   -> Int64
   -> Handler NoContent
 suspendJobHandler tableName config jobId =
-  mutateJob @payload tableName config jobId (\schemaName -> Ops.suspendJob schemaName tableName jobId) refuse
+  mutateJob tableName config jobId (\schemaName -> Ops.suspendJob schemaName tableName jobId) refuse
   where
     refuse job
       | Job.suspended job = "Job is already suspended"
@@ -487,14 +492,13 @@ suspendJobHandler tableName config jobId =
 -- | Resume a suspended job, making it claimable again. Refuses a finalizer with children
 -- still running.
 resumeJobHandler
-  :: forall registry payload
-   . (JobPayload payload)
-  => Text
+  :: forall registry
+   . Text
   -> ArbiterServerConfig registry
   -> Int64
   -> Handler NoContent
 resumeJobHandler tableName config jobId =
-  mutateJob @payload tableName config jobId (\schemaName -> Ops.resumeJob schemaName tableName jobId) refuse
+  mutateJob tableName config jobId (\schemaName -> Ops.resumeJob schemaName tableName jobId) refuse
   where
     refuse job
       | not (Job.suspended job) = "Job is not suspended"
@@ -518,9 +522,8 @@ dlqServer table config =
 
 -- | List DLQ jobs with pagination and composable filters.
 listDLQHandler
-  :: forall registry payload
-   . (JobPayload payload)
-  => Text
+  :: forall registry (payload :: Type)
+   . Text
   -> ArbiterServerConfig registry
   -> Maybe Int
   -> Maybe Int
@@ -557,7 +560,7 @@ listDLQHandler tableName config mLimit mOffset mParentId mJobId mGroupKey mKind 
 
 -- | Retry a DLQ job back into the main queue. 409 when its parent is gone.
 retryFromDLQHandler
-  :: forall registry payload
+  :: forall registry (payload :: Type)
    . (JobPayload payload)
   => Text
   -> ArbiterServerConfig registry
@@ -567,7 +570,10 @@ retryFromDLQHandler tableName config dlqId =
   noContentOr =<< runDb config (withDbTransaction retried)
   where
     schemaName = serverSchema config
-    retried = Ops.retryFromDLQ @_ @payload schemaName tableName dlqId >>= maybe missing (const (pure (Right ())))
+    retried =
+      Ops.retryFromDLQ schemaName tableName dlqId
+        >>= traverse (Ops.typedRow @payload)
+        >>= maybe missing (const (pure (Right ())))
     missing = refuse <$> Ops.dlqJobExists schemaName tableName dlqId
     refuse exists
       | exists = Left err409 {errBody = "Cannot retry: parent job no longer exists (not in queue or DLQ)"}
@@ -613,9 +619,8 @@ archiveServer table config =
 
 -- | List archived jobs with pagination and composable filters.
 listArchiveHandler
-  :: forall registry payload
-   . (JobPayload payload)
-  => Text
+  :: forall registry (payload :: Type)
+   . Text
   -> ArbiterServerConfig registry
   -> Maybe Int
   -> Maybe Int
@@ -656,7 +661,7 @@ listArchiveHandler tableName config mLimit mOffset mParentId mJobId mGroupKey mK
 
 -- | Re-enqueue an archived job as a fresh job. 404 if the archive row is gone.
 reEnqueueArchiveHandler
-  :: forall registry payload
+  :: forall registry (payload :: Type)
    . (JobPayload payload)
   => Text
   -> ArbiterServerConfig registry
@@ -664,7 +669,9 @@ reEnqueueArchiveHandler
   -> Handler NoContent
 reEnqueueArchiveHandler tableName config archiveId = do
   let schemaName = serverSchema config
-  mJob <- runDb config $ Ops.reEnqueueFromArchive @_ @payload schemaName tableName archiveId
+  mJob <-
+    runDb config $
+      withDbTransaction (Ops.reEnqueueFromArchive schemaName tableName archiveId >>= traverse (Ops.typedRow @payload))
   case mJob of
     Just _ -> pure NoContent
     Nothing -> throwError err404 {errBody = "Archived job not found"}
@@ -767,21 +774,33 @@ claimJobsHandler tableName config req = liftIO $ do
     mQueue <- Ops.getQueue schemaName tableName
     if any Queues.paused mQueue
       then pure []
-      else Ops.claimNextVisibleJobsAs @_ @payload schemaName tableName wanted leaseSecs claimant
+      else do
+        (jobs, rejected) <-
+          Ops.claimJobsCached (Ops.mkJobStatements @payload schemaName tableName 1 0 leaseSecs claimant) wanted
+        traverse_ deadLetter rejected
+        pure jobs
   pure $ ClaimResponse claimed
+  where
+    deadLetter rejected =
+      tryReportedOn
+        (serverLogConfig config)
+        Error
+        (deadLetterGates config)
+        ("Dead-letter undecodable job in " <> tableName)
+        (Ops.deadLetterRejected rejected)
 
 -- | Complete a job that the caller holds. Store an optional result in the
 -- parent rollup or archive entry, as worker @ackWith@ does.
 ackClaimedJobHandler
-  :: forall registry payload result
-   . (EncodeJobResult result, JobPayload payload)
+  :: forall registry result
+   . (EncodeJobResult result)
   => Text
   -> ArbiterServerConfig registry
   -> Int64
   -> AckRequest result
   -> Handler NoContent
 ackClaimedJobHandler tableName config jobId req =
-  withHeldJob @registry @payload tableName config jobId (arLease req) $ \schemaName job ->
+  withHeldJob @registry tableName config jobId (arLease req) $ \schemaName job ->
     withDbTransaction $ do
       rows <- Ops.ackJob schemaName tableName job
       when (rows > 0) $ storeEncodedResult schemaName job (arResult req >>= encodeJobResult)
@@ -790,41 +809,38 @@ ackClaimedJobHandler tableName config jobId req =
 -- | Restore the attempt used by a claim. The job becomes available when its
 -- lease expires.
 nackClaimedJobHandler
-  :: forall registry payload
-   . (JobPayload payload)
-  => Text
+  :: forall registry
+   . Text
   -> ArbiterServerConfig registry
   -> Int64
   -> JobLease
   -> Handler NoContent
 nackClaimedJobHandler tableName config jobId lease =
-  withHeldJob @registry @payload tableName config jobId lease $ \schemaName job ->
+  withHeldJob @registry tableName config jobId lease $ \schemaName job ->
     Ops.nackJob schemaName tableName job
 
 -- | Extend a held lease. This is the HTTP consumer equivalent of a worker heartbeat.
 extendClaimedJobHandler
-  :: forall registry payload
-   . (JobPayload payload)
-  => Text
+  :: forall registry
+   . Text
   -> ArbiterServerConfig registry
   -> Int64
   -> ExtendRequest
   -> Handler NoContent
 extendClaimedJobHandler tableName config jobId req =
-  withHeldJob @registry @payload tableName config jobId (erLease req) $ \schemaName job ->
+  withHeldJob @registry tableName config jobId (erLease req) $ \schemaName job ->
     Ops.setVisibilityTimeout schemaName tableName (realToFrac (clamp leaseSecondsRange (erSeconds req))) job
 
 -- | Finalize the job identified by a lease. Refuse a lease that the caller no
 -- longer holds or a lease held by a worker pool. Each statement checks the claim
 -- sequence and writes no change after a lease is lost.
 withHeldJob
-  :: forall registry payload
-   . (JobPayload payload)
-  => Text
+  :: forall registry (payload :: Type)
+   . Text
   -> ArbiterServerConfig registry
   -> Int64
   -> JobLease
-  -> (Text -> Job.JobRead payload -> SimpleDb registry IO Int64)
+  -> (Text -> Job.JobRead (Job.Stored payload) -> SimpleDb registry IO Int64)
   -> Handler NoContent
 withHeldJob tableName config jobId lease finalize = do
   let schemaName = serverSchema config
@@ -877,7 +893,7 @@ maintenanceHandler config = liftIO $ do
           }
   failed <-
     runDb config $
-      runMaintenancePass defaultLogConfig report pace (maintenanceTimeout config)
+      runMaintenancePass (serverLogConfig config) report pace (maintenanceTimeout config)
   ops <- readIORef touched
   pure $ MaintenanceResponse ops (map maintenanceOpName failed)
 

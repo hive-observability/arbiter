@@ -12,6 +12,11 @@ module Arbiter.Core.Job.Types
   , PayloadColumns (..)
   , JobRead
   , jobReadPairs
+  , jobReadSeries
+  , Stored
+  , storedBytes
+  , toStored
+  , decodeStored
   , JobWrite
   , primaryKey
   , payload
@@ -84,8 +89,23 @@ module Arbiter.Core.Job.Types
   ) where
 
 import Control.Exception qualified as E
-import Data.Aeson (FromJSON (..), ToJSON (..), object, withObject, (.!=), (.:), (.:?), (.=))
+import Data.Aeson
+  ( FromJSON (..)
+  , KeyValue (..)
+  , ToJSON (..)
+  , eitherDecodeStrict
+  , encode
+  , object
+  , pairs
+  , withObject
+  , (.!=)
+  , (.:)
+  , (.:?)
+  , (.=)
+  )
+import Data.Aeson.Encoding (Series)
 import Data.Aeson.Types (Pair)
+import Data.ByteString.Lazy qualified as BL
 import Data.Int (Int32, Int64)
 import Data.Maybe (isJust)
 import Data.Text (Text)
@@ -101,6 +121,7 @@ import Arbiter.Core.Job.Status (JobStatus (..), jobStatusFromText, jobStatusToTe
 import Arbiter.Core.Job.TraceContext (TraceContext (..), toTraceContext)
 import Arbiter.Core.Job.Types.Internal
   ( JobRecord (..)
+  , Stored (..)
   , archiveFor
   , attempts
   , claimSeq
@@ -119,6 +140,7 @@ import Arbiter.Core.Job.Types.Internal
   , primaryKey
   , priority
   , queueName
+  , storedBytes
   , suspended
   , traceContext
   , updatedAt
@@ -185,6 +207,14 @@ type JobRead payload = Job payload Int64 Text UTCTime PayloadKeys
 -- suspension state. Use the exported setters to configure enqueue fields.
 type JobWrite payload = Job payload () () () ()
 
+-- | A payload's stored form.
+toStored :: (ToJSON payload) => payload -> Stored payload
+toStored = Stored . BL.toStrict . encode
+
+-- | Decode a stored payload, or the reason the type rejects it.
+decodeStored :: (FromJSON payload) => Stored payload -> Either Text payload
+decodeStored = either (Left . ("Failed to decode job payload: " <>) . T.pack) Right . eitherDecodeStrict . storedBytes
+
 -- | Decode the complete persisted representation of a job.
 instance (FromJSON payload) => FromJSON (JobRead payload) where
   parseJSON = withObject "Job" $ \obj ->
@@ -213,9 +243,16 @@ instance (FromJSON payload) => FromJSON (JobRead payload) where
 
 instance (ToJSON payload) => ToJSON (JobRead payload) where
   toJSON = object . jobReadPairs
+  toEncoding = pairs . jobReadSeries
 
 jobReadPairs :: (ToJSON payload) => JobRead payload -> [Pair]
-jobReadPairs job =
+jobReadPairs = jobReadFields
+
+jobReadSeries :: (ToJSON payload) => JobRead payload -> Series
+jobReadSeries = mconcat . jobReadFields
+
+jobReadFields :: (KeyValue e kv, ToJSON payload) => JobRead payload -> [kv]
+jobReadFields job =
   [ "primaryKey" .= primaryKey job
   , "payload" .= payload job
   , "queueName" .= queueName job

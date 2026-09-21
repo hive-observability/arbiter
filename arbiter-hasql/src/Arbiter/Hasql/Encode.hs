@@ -7,6 +7,7 @@ module Arbiter.Hasql.Encode
   ) where
 
 import Arbiter.Core.Codec (Col (..), ParamType (..), Params, SomeParam (..))
+import Arbiter.Core.Job.Types (storedBytes)
 import Data.Functor.Contravariant (contramap)
 import Data.Int (Int64)
 import Data.Text (Text)
@@ -43,5 +44,6 @@ colEncoder CText = E.text
 colEncoder CBool = E.bool
 colEncoder CTimestamptz = E.timestamptz
 colEncoder CJsonb = E.jsonb
+colEncoder CStored = contramap storedBytes E.jsonbBytes
 colEncoder CFloat8 = E.float8
 colEncoder CUuid = E.uuid

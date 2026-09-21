@@ -2,6 +2,8 @@
 
 module Arbiter.Core.Job.Types.Internal
   ( JobRecord (..)
+  , Stored (..)
+  , storedBytes
   , primaryKey
   , payload
   , queueName
@@ -25,14 +27,35 @@ module Arbiter.Core.Job.Types.Internal
   , payloadKeys
   ) where
 
-import Data.Aeson (Value)
+import Data.Aeson (FromJSON (..), ToJSON (..), Value (Null), decodeStrict, encode)
+import Data.Aeson.Encoding (unsafeToEncoding)
+import Data.ByteString (ByteString)
+import Data.ByteString.Builder (byteString)
+import Data.ByteString.Lazy qualified as BL
 import Data.Int (Int32, Int64)
+import Data.Kind (Type)
+import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Time (UTCTime)
 import Data.UUID.Types (UUID)
 
 import Arbiter.Core.Job.Dedup (DedupKey)
 import Arbiter.Core.Job.TraceContext (TraceContext)
+
+-- | A payload as the JSON bytes the database holds. The type it decodes to is a phantom.
+newtype Stored (payload :: Type) = Stored ByteString
+  deriving stock (Eq, Show)
+
+storedBytes :: Stored payload -> ByteString
+storedBytes (Stored bytes) = bytes
+
+-- | The bytes are emitted as they are. 'toJSON' has to parse them back.
+instance ToJSON (Stored payload) where
+  toJSON = fromMaybe Null . decodeStrict . storedBytes
+  toEncoding = unsafeToEncoding . byteString . storedBytes
+
+instance FromJSON (Stored payload) where
+  parseJSON = pure . Stored . BL.toStrict . encode
 
 -- | Internal representation shared by writable and stored jobs.
 data JobRecord payload key q insertedAt adm = Job

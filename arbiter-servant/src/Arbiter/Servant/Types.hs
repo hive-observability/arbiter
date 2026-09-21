@@ -1,4 +1,5 @@
 {-# LANGUAGE DeriveAnyClass #-}
+{-# LANGUAGE DerivingVia #-}
 {-# LANGUAGE DuplicateRecordFields #-}
 {-# LANGUAGE OverloadedStrings #-}
 
@@ -28,7 +29,7 @@ import Arbiter.Core.CronSchedule (CronScheduleRow (..), CronScheduleUpdate (..))
 import Arbiter.Core.Health (PgDbHealth (..))
 import Arbiter.Core.Job.Archive qualified as Archive
 import Arbiter.Core.Job.DLQ qualified as DLQ
-import Arbiter.Core.Job.Types (JobRead, JobStatus, JobWrite, jobReadPairs)
+import Arbiter.Core.Job.Types (JobRead, JobStatus, JobWrite, Stored, jobReadPairs, jobReadSeries)
 import Arbiter.Core.Job.Types qualified as Arb
 import Arbiter.Core.Operations (QueueOverview (..), QueueStats)
 import Arbiter.Core.Queues (QueueRow (..))
@@ -43,6 +44,7 @@ import Data.Aeson
   , ToJSON (..)
   , Value (Object)
   , object
+  , pairs
   , withObject
   , withText
   , (.!=)
@@ -58,7 +60,7 @@ import Data.Map.Strict (Map)
 import Data.Text (Text)
 import Data.Time.Clock (UTCTime)
 import Data.UUID.Types (UUID)
-import GHC.Generics (Generic)
+import GHC.Generics (Generic, Generically (..))
 
 -- | A job row plus its SQL-derived status, for the list endpoint.
 data ApiJobWithStatus payload = ApiJobWithStatus
@@ -77,6 +79,7 @@ newtype ApiJobWrite payload = ApiJobWrite {unApiJobWrite :: JobWrite payload}
 
 instance (ToJSON payload) => ToJSON (ApiJobWithStatus payload) where
   toJSON (ApiJobWithStatus job status) = object (jobReadPairs job <> ["status" .= status])
+  toEncoding (ApiJobWithStatus job status) = pairs (jobReadSeries job <> "status" .= status)
 
 instance (FromJSON payload) => FromJSON (ApiJobWithStatus payload) where
   parseJSON value = ApiJobWithStatus <$> parseJSON value <*> withObject "JobWithStatus" (.: "status") value
@@ -113,13 +116,13 @@ instance (FromJSON payload) => FromJSON (ApiJobWrite payload) where
 
 -- | Response wrapper for archived jobs.
 data ArchiveResponse payload = ArchiveResponse
-  { archiveJobs :: [Archive.ArchiveJob payload]
+  { archiveJobs :: [Archive.ArchiveJob (Stored payload)]
   , archiveTotal :: Int
   , archiveOffset :: Int
   , archiveLimit :: Int
   }
   deriving stock (Eq, Generic, Show)
-  deriving anyclass (FromJSON, ToJSON)
+  deriving (FromJSON, ToJSON) via Generically (ArchiveResponse payload)
 
 -- | Single-job response envelope, parameterized over the job representation
 -- ('JobRead' for insert, 'ApiJobWithStatus' for the detail endpoint).
@@ -127,11 +130,11 @@ newtype JobResponse a = JobResponse
   { job :: a
   }
   deriving stock (Eq, Generic, Show)
-  deriving anyclass (FromJSON, ToJSON)
+  deriving (FromJSON, ToJSON) via Generically (JobResponse a)
 
 -- | Response wrapper for multiple jobs.
 data JobsResponse payload = JobsResponse
-  { jobs :: [ApiJobWithStatus payload]
+  { jobs :: [ApiJobWithStatus (Stored payload)]
   , jobsTotal :: Int
   , jobsOffset :: Int
   , jobsLimit :: Int
@@ -140,7 +143,7 @@ data JobsResponse payload = JobsResponse
   , dlqChildCounts :: Map Int64 Int64
   }
   deriving stock (Eq, Generic, Show)
-  deriving anyclass (FromJSON, ToJSON)
+  deriving (FromJSON, ToJSON) via Generically (JobsResponse payload)
 
 -- | A consumer's request to lease visible jobs.
 data ClaimRequest = ClaimRequest
@@ -154,7 +157,7 @@ data ClaimRequest = ClaimRequest
 -- finalization.
 newtype ClaimResponse payload = ClaimResponse {jobs :: [JobRead payload]}
   deriving stock (Eq, Generic, Show)
-  deriving anyclass (FromJSON, ToJSON)
+  deriving (FromJSON, ToJSON) via Generically (ClaimResponse payload)
 
 -- | Proof that the caller still holds a claimed job.
 data JobLease = JobLease
@@ -219,13 +222,13 @@ instance FromJSON MaintenanceResponse where
 
 -- | Response wrapper for DLQ jobs.
 data DLQResponse payload = DLQResponse
-  { dlqJobs :: [DLQ.DLQJob payload]
+  { dlqJobs :: [DLQ.DLQJob (Stored payload)]
   , dlqTotal :: Int
   , dlqOffset :: Int
   , dlqLimit :: Int
   }
   deriving stock (Eq, Generic, Show)
-  deriving anyclass (FromJSON, ToJSON)
+  deriving (FromJSON, ToJSON) via Generically (DLQResponse payload)
 
 -- | Queue statistics response.
 data StatsResponse = StatsResponse
@@ -262,7 +265,7 @@ data BatchInsertResponse payload = BatchInsertResponse
   , insertedCount :: Int
   }
   deriving stock (Eq, Generic, Show)
-  deriving anyclass (FromJSON, ToJSON)
+  deriving (FromJSON, ToJSON) via Generically (BatchInsertResponse payload)
 
 -- | Request body for batch DLQ delete.
 data BatchDeleteRequest = BatchDeleteRequest

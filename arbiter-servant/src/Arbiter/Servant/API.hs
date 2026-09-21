@@ -23,7 +23,7 @@ module Arbiter.Servant.API
   , ConcurrencyAPI (..)
   ) where
 
-import Arbiter.Core.Job.Types (JobRead, JobStatus, jobStatusToText)
+import Arbiter.Core.Job.Types (JobRead, JobStatus, Stored, jobStatusToText)
 import Arbiter.Core.QueueRegistry (JobPayloadRegistry, SpecName, SpecPayload, SpecResult)
 import Arbiter.Core.Sql.Jobs
   ( ArchiveSortColumn
@@ -118,7 +118,7 @@ data JobsAPI payload result mode = JobsAPI
     getJob
       :: mode
         :- Capture "id" Int64
-          :> Get '[JSON] (JobResponse (ApiJobWithStatus payload))
+          :> Get '[JSON] (JobResponse (ApiJobWithStatus (Stored payload)))
   , -- DELETE /:table/jobs/:id (cancel job)
     cancelJob
       :: mode

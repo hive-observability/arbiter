@@ -26,6 +26,11 @@ module Arbiter.Core.Operations
   , claimJobsCached
   , claimJobsBatchedCached
   , RejectedRow
+  , deadLetterRejected
+  , decodeRow
+  , typedRow
+  , typedDLQRow
+  , typedArchiveRow
   , addRateLimitTokens
   , pruneRateLimitBuckets
   , resetRateLimitBuckets
@@ -210,6 +215,7 @@ import Data.Aeson
   , (.=)
   )
 import Data.Bifunctor (bimap, first)
+import Data.Coerce (coerce)
 import Data.Either (fromRight, isLeft, partitionEithers)
 import Data.Foldable (for_, toList, traverse_)
 import Data.Int (Int64)
@@ -227,6 +233,7 @@ import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Time (NominalDiffTime, UTCTime)
+import Data.Tuple (swap)
 import Data.UUID.Types (UUID)
 import Data.UUID.Types qualified as UUID
 import GHC.Generics (Generic)
@@ -269,10 +276,12 @@ import Arbiter.Core.Job.Types
   , JobStatus (..)
   , JobWrite
   , PayloadColumns (..)
+  , Stored
   , archiveFor
   , attempts
   , claimSeq
   , claimedBy
+  , decodeStored
   , dedupParts
   , groupKey
   , isRollup
@@ -284,6 +293,7 @@ import Arbiter.Core.Job.Types
   , primaryKey
   )
 import Arbiter.Core.Job.Types qualified as JT
+import Arbiter.Core.Job.Types.Internal (JobRecord (..))
 import Arbiter.Core.MonadArbiter (MonadArbiter, countOr0, countOr0Prepared, withDbTransaction)
 import Arbiter.Core.MonadArbiter qualified as MA
 import Arbiter.Core.Operations.Gates
@@ -334,30 +344,39 @@ import Arbiter.Core.Sql.Stats qualified as Tmpl
 import Arbiter.Core.Sql.Tree qualified as Tmpl
 import Arbiter.Core.Trace (currentTraceContext, stampTraceContext)
 
--- | Decode a row's payload, or the reason it was rejected.
-parsePayload :: (JobPayload payload) => JobRead Value -> Either Text (JobRead payload)
-parsePayload job = case fromJSON (payload job) of
-  Success decoded -> Right (mapPayload (const decoded) job)
-  Error err -> Left ("Failed to decode job payload: " <> T.pack err)
+-- | Decode a row's stored payload, or the reason the type rejects it.
+decodeRow :: (FromJSON payload) => JobRead (Stored payload) -> Either Text (JobRead payload)
+decodeRow row = (\typed -> row {payload = typed}) <$> decodeStored (payload row)
 
-decodePayload :: (JobPayload payload, MonadArbiter m) => JobRead Value -> m (JobRead payload)
-decodePayload = either throwParsing pure . parsePayload
+-- | 'decodeRow', throwing 'ParsingException' for a payload the type rejects.
+typedRow :: (FromJSON payload, MonadArbiter m) => JobRead (Stored payload) -> m (JobRead payload)
+typedRow = either throwParsing pure . decodeRow
 
--- | A claimed row its payload type rejected, with the error it was dead-lettered under.
-type RejectedRow = (JobRead Value, Text)
+typedDLQRow :: (FromJSON payload, MonadArbiter m) => DLQ.DLQJob (Stored payload) -> m (DLQ.DLQJob payload)
+typedDLQRow entry = (\snapshot -> entry {DLQ.jobSnapshot = snapshot}) <$> typedRow (DLQ.jobSnapshot entry)
 
--- | Decode the rows a claim holds. A row its payload type rejects is moved to the
--- DLQ under the decode error, so it cannot poison the next claim.
+typedArchiveRow
+  :: (FromJSON payload, MonadArbiter m) => Archive.ArchiveJob (Stored payload) -> m (Archive.ArchiveJob payload)
+typedArchiveRow entry = (\snapshot -> entry {Archive.jobSnapshot = snapshot}) <$> typedRow (Archive.jobSnapshot entry)
+
+-- | A claimed row its payload type rejected, with the decode error.
+type RejectedRow payload = (JobRead (Stored payload), Text)
+
+-- | Split the rows a claim holds into decoded jobs and rejected rows. The caller
+-- dead-letters the rejected rows with 'deadLetterRejected'.
 decodeClaimed
-  :: forall payload m
-   . (JobPayload payload, MonadArbiter m)
-  => [JobRead Value]
-  -> m ([JobRead payload], [RejectedRow])
-decodeClaimed rows = do
+  :: forall payload
+   . (JobPayload payload)
+  => [JobRead (Stored Value)]
+  -> ([JobRead payload], [RejectedRow payload])
+decodeClaimed rows = swap (partitionEithers (map ((\row -> first ((,) row) (decodeRow row)) . mapPayload coerce) rows))
+
+-- | Move a rejected row to the DLQ under its decode error, so it cannot poison the next claim.
+-- Returns the number of rows moved. Zero means the claim was voided first.
+deadLetterRejected :: (MonadArbiter m) => RejectedRow payload -> m Int64
+deadLetterRejected (row, err) = do
   schemaName <- MA.getSchema
-  let (rejected, decoded) = partitionEithers (map (\row -> first ((,) row) (parsePayload row)) rows)
-  traverse_ (\(row, err) -> moveToDLQ TakeLocks schemaName (JT.queueName row) err row) rejected
-  pure (decoded, rejected)
+  moveToDLQ TakeLocks schemaName (JT.queueName row) err row
 
 visibilityUpdateCodec :: RowCodec VisibilityUpdateInfo
 visibilityUpdateCodec =
@@ -495,7 +514,7 @@ insertJobTreeNodeStamped schemaName tableName stamp parent state suspended job =
 
 insertJobSource
   :: forall m payload
-   . (JobPayload payload, MonadArbiter m)
+   . (MonadArbiter m)
   => SchemaName
   -> TableName
   -> JobWrite payload
@@ -511,7 +530,7 @@ insertJobSource schemaName tableName job source = do
     rawJobs <- MA.executeQuery query
     case rawJobs of
       [] -> maybe (throwParsing "insertJob: No rows returned from INSERT") (const (pure Nothing)) (JT.dedupKey job)
-      (raw : _) -> Just <$> decodePayload raw
+      (raw : _) -> pure (Just raw {payload = JT.payload job})
 
 -- | Batch-insert direct tree leaves under one parent.
 insertJobTreeLeavesStamped
@@ -547,7 +566,7 @@ insertBatchSource
   -> m [JobRead payload]
 insertBatchSource schemaName tableName batchSrc =
   withDbTransaction $
-    MA.executeQuery (Tmpl.insertJobsBatchSQL schemaName tableName batchSrc) >>= traverse decodePayload
+    MA.executeQuery (Tmpl.insertJobsBatchSQL schemaName tableName batchSrc) >>= traverse typedRow
 
 -- | Insert children under a job this worker holds, making it a rollup finalizer.
 -- Ack it in the same transaction.
@@ -906,7 +925,7 @@ claimNextVisibleJobsAs
   -> m [JobRead payload]
 claimNextVisibleJobsAs schemaName tableName maxJobs timeout workerId =
   -- Batch size 1 is the single-job claim.
-  fst <$> claimJobsCached (mkJobStatements @payload schemaName tableName 1 0 timeout workerId) maxJobs
+  claimJobsCached (mkJobStatements @payload schemaName tableName 1 0 timeout workerId) maxJobs >>= deadLetterRest
 
 -- | 'claimNextVisibleJobsAs' over a pool's staged statements.
 claimJobsCached
@@ -914,9 +933,14 @@ claimJobsCached
    . (JobPayload payload, MonadArbiter m)
   => JobStatements
   -> Int
-  -> m ([JobRead payload], [RejectedRow])
+  -> m ([JobRead payload], [RejectedRow payload])
 claimJobsCached statements maxJobs =
-  MA.executeQueryPrepared (claimFor statements maxJobs) >>= decodeClaimed
+  decodeClaimed <$> MA.executeQueryPrepared (claimFor statements maxJobs)
+
+-- | Dead-letter a claim's rejected rows and keep the decoded jobs. A row whose move
+-- fails stays claimed until its visibility timeout, so the next claim retries it.
+deadLetterRest :: (MonadArbiter m) => (a, [RejectedRow payload]) -> m a
+deadLetterRest (jobs, rejected) = jobs <$ traverse_ (tryAny . deadLetterRejected) rejected
 
 -- | 'claimNextVisibleJobs' claiming up to @batchSize@ jobs from each of @maxBatches@
 -- groups. Stamps 'anonymousClaimant'.
@@ -930,8 +954,8 @@ claimNextVisibleJobsBatched
   -> NominalDiffTime
   -> m [NonEmpty (JobRead payload)]
 claimNextVisibleJobsBatched schemaName tableName batchSize maxBatches timeout =
-  fst
-    <$> claimJobsBatchedCached (mkJobStatements @payload schemaName tableName batchSize 0 timeout anonymousClaimant) maxBatches
+  claimJobsBatchedCached (mkJobStatements @payload schemaName tableName batchSize 0 timeout anonymousClaimant) maxBatches
+    >>= deadLetterRest
 
 -- | 'claimNextVisibleJobsBatched' over a pool's staged statements.
 claimJobsBatchedCached
@@ -939,12 +963,12 @@ claimJobsBatchedCached
    . (JobPayload payload, MonadArbiter m)
   => JobStatements
   -> Int
-  -> m ([NonEmpty (JobRead payload)], [RejectedRow])
+  -> m ([NonEmpty (JobRead payload)], [RejectedRow payload])
 claimJobsBatchedCached statements maxBatches
   | claimBatchSize statements < 1 = pure ([], [])
   | maxBatches < 1 = pure ([], [])
   | otherwise = do
-      (jobs, rejected) <- MA.executeQueryPrepared (claimFor statements maxBatches) >>= decodeClaimed
+      (jobs, rejected) <- decodeClaimed <$> MA.executeQueryPrepared (claimFor statements maxBatches)
       let sorted = sortOn groupKey jobs
           groups = groupBy (\jobA jobB -> groupKey jobA == groupKey jobB) sorted
       pure (concatMap (chunksOfNE (claimBatchSize statements)) (mapMaybe NE.nonEmpty groups), rejected)
@@ -1002,7 +1026,7 @@ mkAckStatements schemaName tableName =
 -- | A pool's statements, rendered once. A call binds only its parameters.
 data JobStatements = JobStatements
   { claimBatchSize :: Int
-  , claimFor :: Int -> Q.Query (JobRead Value)
+  , claimFor :: Int -> Q.Query (JobRead (Stored Value))
   -- ^ The claim at a capacity, with this pool's claimant bound.
   , statementsAck :: AckStatements
   }
@@ -1389,17 +1413,16 @@ moveToDLQBatch schemaName tableName jobsWithErrors = withDbTransaction $ do
 -- is left behind.
 retryFromDLQ
   :: forall m payload
-   . (JobPayload payload, MonadArbiter m)
+   . (MonadArbiter m)
   => SchemaName
   -- ^ Schema name
   -> TableName
   -- ^ Table name
   -> Int64
   -- ^ DLQ job id
-  -> m (Maybe (JobRead payload))
+  -> m (Maybe (JobRead (Stored payload)))
 retryFromDLQ schemaName tableName dlqId = withDbTransaction $ do
-  rawJobs <- MA.executeQuery (Tmpl.retryFromDLQSQL schemaName tableName dlqId)
-  traverse decodePayload (listToMaybe rawJobs)
+  listToMaybe <$> MA.executeQuery (Tmpl.retryFromDLQSQL schemaName tableName dlqId)
 
 -- | Whether a DLQ job with the given id exists.
 dlqJobExists
@@ -1419,7 +1442,7 @@ dlqJobExists schemaName tableName dlqId =
 -- orders by @id DESC@.
 listJobsFilteredOrdered
   :: forall m payload
-   . (JobPayload payload, MonadArbiter m)
+   . (MonadArbiter m)
   => SchemaName
   -- ^ Schema name
   -> TableName
@@ -1434,22 +1457,20 @@ listJobsFilteredOrdered
   -- ^ Limit
   -> Int
   -- ^ Offset
-  -> m [JobRead payload]
+  -> m [JobRead (Stored payload)]
 listJobsFilteredOrdered schemaName tableName filters mSortBy mSortDir limit offset
   | any isStatusFilter filters =
       map fst <$> listJobsWithStatus schemaName tableName filters mSortBy mSortDir limit offset
   | otherwise = do
       let orderBy = Tmpl.buildJobsOrderBy mSortBy mSortDir
-      rawJobs <-
-        MA.executeQuery $
-          Tmpl.listJobsFilteredSQL
-            schemaName
-            tableName
-            (buildWhereClause filters)
-            orderBy
-            (fromIntegral limit)
-            (fromIntegral offset)
-      traverse decodePayload rawJobs
+      MA.executeQuery $
+        Tmpl.listJobsFilteredSQL
+          schemaName
+          tableName
+          (buildWhereClause filters)
+          orderBy
+          (fromIntegral limit)
+          (fromIntegral offset)
 
 isStatusFilter :: Tmpl.JobFilter -> Bool
 isStatusFilter (Tmpl.FilterStatus _) = True
@@ -1457,14 +1478,14 @@ isStatusFilter _ = False
 
 -- | Decode a job row and its derived @status@ column. Validate the status after
 -- the backend codec runs. An unknown SQL value causes a parsing failure.
-jobRowWithStatusCodec :: TableName -> RowCodec (JobRead Value, Text)
+jobRowWithStatusCodec :: TableName -> RowCodec (JobRead (Stored payload), Text)
 jobRowWithStatusCodec tableName =
   (,) <$> jobRowCodec tableName <*> col "status" CText
 
 -- | 'listJobsFilteredOrdered' that also returns each job's derived status.
 listJobsWithStatus
   :: forall m payload
-   . (JobPayload payload, MonadArbiter m)
+   . (MonadArbiter m)
   => SchemaName
   -> TableName
   -> [Tmpl.JobFilter]
@@ -1472,7 +1493,7 @@ listJobsWithStatus
   -> Maybe Tmpl.SortDir
   -> Int
   -> Int
-  -> m [(JobRead payload, JobStatus)]
+  -> m [(JobRead (Stored payload), JobStatus)]
 listJobsWithStatus schemaName tableName filters mSortBy mSortDir limit offset = do
   let orderBy = Tmpl.buildJobsOrderBy mSortBy mSortDir
       query =
@@ -1486,20 +1507,17 @@ listJobsWithStatus schemaName tableName filters mSortBy mSortDir limit offset = 
   rows <- MA.executeQuery (Q.rows (jobRowWithStatusCodec tableName) query)
   traverse decodeJobStatusRow rows
 
--- | Decode the payload and strictly validate the SQL-derived status.
+-- | Strictly validate the SQL-derived status.
 decodeJobStatusRow
-  :: (JobPayload payload, MonadArbiter m)
-  => (JobRead Value, Text)
-  -> m (JobRead payload, JobStatus)
-decodeJobStatusRow (job, rawStatus) = do
-  decodedJob <- decodePayload job
-  status <- either throwParsing pure (jobStatusFromText rawStatus)
-  pure (decodedJob, status)
+  :: (MonadArbiter m)
+  => (JobRead (Stored payload), Text)
+  -> m (JobRead (Stored payload), JobStatus)
+decodeJobStatusRow (job, rawStatus) = (,) job <$> either throwParsing pure (jobStatusFromText rawStatus)
 
 -- | List filtered jobs, newest first.
 listJobsFiltered
   :: forall m payload
-   . (JobPayload payload, MonadArbiter m)
+   . (MonadArbiter m)
   => SchemaName
   -- ^ Schema name
   -> TableName
@@ -1510,7 +1528,7 @@ listJobsFiltered
   -- ^ Limit
   -> Int
   -- ^ Offset
-  -> m [JobRead payload]
+  -> m [JobRead (Stored payload)]
 listJobsFiltered schemaName tableName filters =
   listJobsFilteredOrdered schemaName tableName filters Nothing Nothing
 
@@ -1531,7 +1549,7 @@ countJobsFiltered schemaName tableName filters = do
 -- arguments orders by @failed_at DESC@.
 listDLQFilteredOrdered
   :: forall m payload
-   . (JobPayload payload, MonadArbiter m)
+   . (MonadArbiter m)
   => SchemaName
   -- ^ Schema name
   -> TableName
@@ -1546,7 +1564,7 @@ listDLQFilteredOrdered
   -- ^ Limit
   -> Int
   -- ^ Offset
-  -> m [DLQ.DLQJob payload]
+  -> m [DLQ.DLQJob (Stored payload)]
 listDLQFilteredOrdered schemaName tableName filters mSortBy mSortDir limit offset = do
   let orderBy = Tmpl.buildDLQOrderBy mSortBy mSortDir
   rawRows <-
@@ -1558,12 +1576,12 @@ listDLQFilteredOrdered schemaName tableName filters mSortBy mSortDir limit offse
         orderBy
         (fromIntegral limit)
         (fromIntegral offset)
-  traverse decodeDLQRow rawRows
+  pure (map toDLQRow rawRows)
 
 -- | List filtered DLQ jobs, most recently failed first.
 listDLQFiltered
   :: forall m payload
-   . (JobPayload payload, MonadArbiter m)
+   . (MonadArbiter m)
   => SchemaName
   -- ^ Schema name
   -> TableName
@@ -1574,7 +1592,7 @@ listDLQFiltered
   -- ^ Limit
   -> Int
   -- ^ Offset
-  -> m [DLQ.DLQJob payload]
+  -> m [DLQ.DLQJob (Stored payload)]
 listDLQFiltered schemaName tableName filters =
   listDLQFilteredOrdered schemaName tableName filters Nothing Nothing
 
@@ -1591,24 +1609,19 @@ countDLQFiltered
 countDLQFiltered schemaName tableName filters =
   countStrict "countDLQFiltered" (Tmpl.countDLQFilteredSQL schemaName tableName (buildWhereClause filters))
 
-decodeDLQRow
-  :: (JobPayload payload, MonadArbiter m)
-  => (Int64, UTCTime, JobRead Value)
-  -> m (DLQ.DLQJob payload)
-decodeDLQRow (dlqId, dlqFailedAt, rawJob) = do
-  jobSnapshot <- decodePayload rawJob
-  pure $
-    DLQ.DLQJob
-      { DLQ.dlqPrimaryKey = dlqId
-      , DLQ.failedAt = dlqFailedAt
-      , DLQ.jobSnapshot = jobSnapshot
-      }
+toDLQRow :: (Int64, UTCTime, JobRead (Stored payload)) -> DLQ.DLQJob (Stored payload)
+toDLQRow (dlqId, dlqFailedAt, jobSnapshot) =
+  DLQ.DLQJob
+    { DLQ.dlqPrimaryKey = dlqId
+    , DLQ.failedAt = dlqFailedAt
+    , DLQ.jobSnapshot = jobSnapshot
+    }
 
 -- | List archived (completed) jobs with composable filters and a typed sort
 -- (defaulting to most recent first).
 listArchiveFiltered
   :: forall m payload
-   . (JobPayload payload, MonadArbiter m)
+   . (MonadArbiter m)
   => SchemaName
   -> TableName
   -> [Tmpl.JobFilter]
@@ -1618,7 +1631,7 @@ listArchiveFiltered
   -- ^ Limit
   -> Int
   -- ^ Offset
-  -> m [Archive.ArchiveJob payload]
+  -> m [Archive.ArchiveJob (Stored payload)]
 listArchiveFiltered schemaName tableName filters mSortBy mSortDir limit offset = do
   let orderBy = Tmpl.buildArchiveOrderBy mSortBy mSortDir
   rawRows <-
@@ -1630,27 +1643,27 @@ listArchiveFiltered schemaName tableName filters mSortBy mSortDir limit offset =
         orderBy
         (fromIntegral limit)
         (fromIntegral offset)
-  traverse decodeArchiveRow rawRows
+  pure (map toArchiveRow rawRows)
 
 -- | List archived jobs (most recent first).
 listArchiveJobs
   :: forall m payload
-   . (JobPayload payload, MonadArbiter m)
+   . (MonadArbiter m)
   => SchemaName
   -> TableName
   -> Int
   -> Int
-  -> m [Archive.ArchiveJob payload]
+  -> m [Archive.ArchiveJob (Stored payload)]
 listArchiveJobs schemaName tableName = listArchiveFiltered schemaName tableName [] Nothing Nothing
 
 -- | Fetch a single archived job by its original job id.
 getArchivedJobById
   :: forall m payload
-   . (JobPayload payload, MonadArbiter m)
+   . (MonadArbiter m)
   => SchemaName
   -> TableName
   -> Int64
-  -> m (Maybe (Archive.ArchiveJob payload))
+  -> m (Maybe (Archive.ArchiveJob (Stored payload)))
 getArchivedJobById schemaName tableName jobId =
   listToMaybe
     <$> listArchiveFiltered schemaName tableName [Tmpl.FilterJobId jobId] Nothing Nothing 1 0
@@ -1669,11 +1682,10 @@ deleteArchiveJobsBatch schemaName tableName archiveIds =
 -- row. Returns the new job, or @Nothing@ when the archive row no longer exists.
 reEnqueueFromArchive
   :: forall m payload
-   . (JobPayload payload, MonadArbiter m)
-  => SchemaName -> TableName -> Int64 -> m (Maybe (JobRead payload))
+   . (MonadArbiter m)
+  => SchemaName -> TableName -> Int64 -> m (Maybe (JobRead (Stored payload)))
 reEnqueueFromArchive schemaName tableName archiveId = withDbTransaction $ do
-  rawJobs <- MA.executeQuery (Tmpl.reEnqueueFromArchiveSQL schemaName tableName archiveId)
-  traverse decodePayload (listToMaybe rawJobs)
+  listToMaybe <$> MA.executeQuery (Tmpl.reEnqueueFromArchiveSQL schemaName tableName archiveId)
 
 -- | Store a completed root job's result on its archive row. No-ops when the job
 -- was not archived. Returns rows updated.
@@ -1694,13 +1706,13 @@ updateArchiveResultsBatch schemaName tableName pairs =
 -- | List archived jobs in a group, most recent first.
 listArchivedJobsByGroupKey
   :: forall m payload
-   . (JobPayload payload, MonadArbiter m)
+   . (MonadArbiter m)
   => SchemaName
   -> TableName
   -> Text
   -> Int
   -> Int
-  -> m [Archive.ArchiveJob payload]
+  -> m [Archive.ArchiveJob (Stored payload)]
 listArchivedJobsByGroupKey schemaName tableName key =
   listArchiveFiltered schemaName tableName [Tmpl.FilterGroupKey key] Nothing Nothing
 
@@ -1714,19 +1726,14 @@ countArchiveFiltered
 countArchiveFiltered schemaName tableName filters =
   countStrict "countArchiveFiltered" (Tmpl.countArchiveFilteredSQL schemaName tableName (buildWhereClause filters))
 
-decodeArchiveRow
-  :: (JobPayload payload, MonadArbiter m)
-  => (Int64, UTCTime, JobRead Value, Maybe Value)
-  -> m (Archive.ArchiveJob payload)
-decodeArchiveRow (aId, aCompletedAt, rawJob, aResult) = do
-  snapshot <- decodePayload rawJob
-  pure $
-    Archive.ArchiveJob
-      { Archive.archivePrimaryKey = aId
-      , Archive.completedAt = aCompletedAt
-      , Archive.jobSnapshot = snapshot
-      , Archive.archivedResult = aResult
-      }
+toArchiveRow :: (Int64, UTCTime, JobRead (Stored payload), Maybe Value) -> Archive.ArchiveJob (Stored payload)
+toArchiveRow (aId, aCompletedAt, snapshot, aResult) =
+  Archive.ArchiveJob
+    { Archive.archivePrimaryKey = aId
+    , Archive.completedAt = aCompletedAt
+    , Archive.jobSnapshot = snapshot
+    , Archive.archivedResult = aResult
+    }
 
 -- | Purge expired archived jobs across all queues. Each row uses its
 -- @archive_expires_at@ value. Return the total rows purged and queues with
@@ -1741,7 +1748,7 @@ purgeArchives =
 -- | List DLQ jobs, most recently failed first.
 listDLQJobs
   :: forall m payload
-   . (JobPayload payload, MonadArbiter m)
+   . (MonadArbiter m)
   => SchemaName
   -- ^ Schema name
   -> TableName
@@ -1750,13 +1757,13 @@ listDLQJobs
   -- ^ Limit
   -> Int
   -- ^ Offset
-  -> m [DLQ.DLQJob payload]
+  -> m [DLQ.DLQJob (Stored payload)]
 listDLQJobs schemaName tableName = listDLQFiltered schemaName tableName []
 
 -- | List a parent's DLQ'd children, most recently failed first.
 listDLQJobsByParent
   :: forall m payload
-   . (JobPayload payload, MonadArbiter m)
+   . (MonadArbiter m)
   => SchemaName
   -- ^ Schema name
   -> TableName
@@ -1767,7 +1774,7 @@ listDLQJobsByParent
   -- ^ Limit
   -> Int
   -- ^ Offset
-  -> m [DLQ.DLQJob payload]
+  -> m [DLQ.DLQJob (Stored payload)]
 listDLQJobsByParent schemaName tableName parentJobId =
   listDLQFiltered schemaName tableName [Tmpl.FilterParentId parentJobId]
 
@@ -1840,7 +1847,7 @@ deleteCancelledJobs schemaName tableName owner =
 -- | List jobs, newest first.
 listJobs
   :: forall m payload
-   . (JobPayload payload, MonadArbiter m)
+   . (MonadArbiter m)
   => SchemaName
   -- ^ Schema name
   -> TableName
@@ -1849,32 +1856,31 @@ listJobs
   -- ^ Limit
   -> Int
   -- ^ Offset
-  -> m [JobRead payload]
+  -> m [JobRead (Stored payload)]
 listJobs schemaName tableName = listJobsFiltered schemaName tableName []
 
 -- | Fetch a job by id.
 getJobById
   :: forall m payload
-   . (JobPayload payload, MonadArbiter m)
+   . (MonadArbiter m)
   => SchemaName
   -- ^ Schema name
   -> TableName
   -- ^ Table name
   -> Int64
   -- ^ Job id
-  -> m (Maybe (JobRead payload))
+  -> m (Maybe (JobRead (Stored payload)))
 getJobById schemaName tableName jobId = do
-  rawJobs <- MA.executeQuery (Tmpl.getJobByIdSQL schemaName tableName jobId)
-  traverse decodePayload (listToMaybe rawJobs)
+  listToMaybe <$> MA.executeQuery (Tmpl.getJobByIdSQL schemaName tableName jobId)
 
 -- | 'getJobById' that also returns the job's derived status.
 getJobByIdWithStatus
   :: forall m payload
-   . (JobPayload payload, MonadArbiter m)
+   . (MonadArbiter m)
   => SchemaName
   -> TableName
   -> Int64
-  -> m (Maybe (JobRead payload, JobStatus))
+  -> m (Maybe (JobRead (Stored payload), JobStatus))
 getJobByIdWithStatus schemaName tableName jobId = do
   rows <-
     MA.executeQuery $
@@ -1884,19 +1890,18 @@ getJobByIdWithStatus schemaName tableName jobId = do
 -- | Get a single job by its dedup key.
 getJobByDedupKey
   :: forall m payload
-   . (JobPayload payload, MonadArbiter m)
+   . (MonadArbiter m)
   => SchemaName
   -> TableName
   -> Text
-  -> m (Maybe (JobRead payload))
+  -> m (Maybe (JobRead (Stored payload)))
 getJobByDedupKey schemaName tableName key = do
-  rawJobs <- MA.executeQuery (Tmpl.getJobByDedupKeySQL schemaName tableName key)
-  traverse decodePayload (listToMaybe rawJobs)
+  listToMaybe <$> MA.executeQuery (Tmpl.getJobByDedupKeySQL schemaName tableName key)
 
 -- | Get all jobs for a specific group key.
 getJobsByGroup
   :: forall m payload
-   . (JobPayload payload, MonadArbiter m)
+   . (MonadArbiter m)
   => SchemaName
   -- ^ Schema name
   -> TableName
@@ -1907,7 +1912,7 @@ getJobsByGroup
   -- ^ Limit
   -> Int
   -- ^ Offset
-  -> m [JobRead payload]
+  -> m [JobRead (Stored payload)]
 getJobsByGroup schemaName tableName key =
   listJobsFiltered schemaName tableName [Tmpl.FilterGroupKey key]
 
@@ -2193,7 +2198,7 @@ jobExists schemaName tableName jobId =
 -- | List jobs filtered by parent_id with pagination.
 getJobsByParent
   :: forall m payload
-   . (JobPayload payload, MonadArbiter m)
+   . (MonadArbiter m)
   => Text
   -- ^ Schema name
   -> TableName
@@ -2204,7 +2209,7 @@ getJobsByParent
   -- ^ Limit
   -> Int
   -- ^ Offset
-  -> m [JobRead payload]
+  -> m [JobRead (Stored payload)]
 getJobsByParent schemaName tableName pid =
   listJobsFiltered schemaName tableName [Tmpl.FilterParentId pid]
 

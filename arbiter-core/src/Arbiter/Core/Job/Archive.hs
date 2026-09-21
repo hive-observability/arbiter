@@ -7,7 +7,7 @@ module Arbiter.Core.Job.Archive
   ( ArchiveJob (..)
   ) where
 
-import Data.Aeson (FromJSON (..), ToJSON (..), Value, object, withObject, (.:), (.:?), (.=))
+import Data.Aeson (FromJSON (..), KeyValue (..), ToJSON (..), Value, object, pairs, withObject, (.:), (.:?))
 import Data.Int (Int64)
 import Data.Time (UTCTime)
 import GHC.Generics (Generic)
@@ -28,13 +28,16 @@ data ArchiveJob payload = ArchiveJob
   deriving stock (Eq, Generic, Show)
 
 instance (ToJSON payload) => ToJSON (ArchiveJob payload) where
-  toJSON archived =
-    object
-      [ "archivePrimaryKey" .= archivePrimaryKey archived
-      , "completedAt" .= completedAt archived
-      , "jobSnapshot" .= jobSnapshot archived
-      , "result" .= archivedResult archived
-      ]
+  toJSON = object . archiveJobFields
+  toEncoding = pairs . mconcat . archiveJobFields
+
+archiveJobFields :: (KeyValue e kv, ToJSON payload) => ArchiveJob payload -> [kv]
+archiveJobFields archived =
+  [ "archivePrimaryKey" .= archivePrimaryKey archived
+  , "completedAt" .= completedAt archived
+  , "jobSnapshot" .= jobSnapshot archived
+  , "result" .= archivedResult archived
+  ]
 
 instance (FromJSON payload) => FromJSON (ArchiveJob payload) where
   parseJSON = withObject "ArchiveJob" $ \obj ->

@@ -629,7 +629,7 @@ listDLQJobs
   -> Int
   -- ^ Offset
   -> m [DLQ.DLQJob payload]
-listDLQJobs limit offset = onQueue @payload $ \schemaName tableName -> Ops.listDLQJobs schemaName tableName limit offset
+listDLQJobs limit offset = onQueue @payload $ \schemaName tableName -> Ops.listDLQJobs schemaName tableName limit offset >>= traverse Ops.typedDLQRow
 
 -- | List archived jobs, most recently completed first.
 listArchiveJobs
@@ -640,7 +640,7 @@ listArchiveJobs
   -> Int
   -- ^ Offset
   -> m [Archive.ArchiveJob payload]
-listArchiveJobs limit offset = onQueue @payload $ \schemaName tableName -> Ops.listArchiveJobs schemaName tableName limit offset
+listArchiveJobs limit offset = onQueue @payload $ \schemaName tableName -> Ops.listArchiveJobs schemaName tableName limit offset >>= traverse Ops.typedArchiveRow
 
 -- | Fetch a single archived job by its original job id.
 getArchivedJobById
@@ -649,7 +649,7 @@ getArchivedJobById
   => Int64
   -- ^ Original job id
   -> m (Maybe (Archive.ArchiveJob payload))
-getArchivedJobById jobId = onQueue @payload $ \schemaName tableName -> Ops.getArchivedJobById schemaName tableName jobId
+getArchivedJobById jobId = onQueue @payload $ \schemaName tableName -> Ops.getArchivedJobById schemaName tableName jobId >>= traverse Ops.typedArchiveRow
 
 -- | List archived jobs in a group, most recent first, with pagination.
 listArchivedJobsByGroupKey
@@ -664,7 +664,7 @@ listArchivedJobsByGroupKey
   -> m [Archive.ArchiveJob payload]
 listArchivedJobsByGroupKey groupKey limit offset =
   onQueue @payload $ \schemaName tableName ->
-    Ops.listArchivedJobsByGroupKey schemaName tableName groupKey limit offset
+    Ops.listArchivedJobsByGroupKey schemaName tableName groupKey limit offset >>= traverse Ops.typedArchiveRow
 
 -- | Delete one archived job by its archive primary key. Returns rows deleted.
 deleteArchiveJob
@@ -692,7 +692,8 @@ reEnqueueFromArchive
   => Int64
   -- ^ Archive primary key
   -> m (Maybe (JobRead payload))
-reEnqueueFromArchive archiveId = onQueue @payload $ \schemaName tableName -> Ops.reEnqueueFromArchive schemaName tableName archiveId
+reEnqueueFromArchive archiveId = onQueue @payload $ \schemaName tableName ->
+  withDbTransaction (Ops.reEnqueueFromArchive schemaName tableName archiveId >>= traverse Ops.typedRow)
 
 -- | Retry a DLQ job, re-inserting it into the queue with a fresh attempt count.
 -- 'Nothing' when the DLQ row is gone.
@@ -702,7 +703,8 @@ retryFromDLQ
   => Int64
   -- ^ DLQ job id
   -> m (Maybe (JobRead payload))
-retryFromDLQ dlqId = onQueue @payload $ \schemaName tableName -> Ops.retryFromDLQ schemaName tableName dlqId
+retryFromDLQ dlqId = onQueue @payload $ \schemaName tableName ->
+  withDbTransaction (Ops.retryFromDLQ schemaName tableName dlqId >>= traverse Ops.typedRow)
 
 -- | Whether a DLQ job with the given id exists.
 dlqJobExists
@@ -757,7 +759,7 @@ listJobsFiltered
   -> Int
   -- ^ Offset
   -> m [JobRead payload]
-listJobsFiltered filters limit offset = onQueue @payload $ \schemaName tableName -> Ops.listJobsFiltered schemaName tableName filters limit offset
+listJobsFiltered filters limit offset = onQueue @payload $ \schemaName tableName -> Ops.listJobsFiltered schemaName tableName filters limit offset >>= traverse Ops.typedRow
 
 -- | Count filtered jobs.
 countJobsFiltered
@@ -779,7 +781,7 @@ listDLQFiltered
   -> Int
   -- ^ Offset
   -> m [DLQ.DLQJob payload]
-listDLQFiltered filters limit offset = onQueue @payload $ \schemaName tableName -> Ops.listDLQFiltered schemaName tableName filters limit offset
+listDLQFiltered filters limit offset = onQueue @payload $ \schemaName tableName -> Ops.listDLQFiltered schemaName tableName filters limit offset >>= traverse Ops.typedDLQRow
 
 -- | Count filtered DLQ jobs.
 countDLQFiltered
@@ -803,7 +805,7 @@ listJobs
   -> Int
   -- ^ Offset
   -> m [JobRead payload]
-listJobs limit offset = onQueue @payload $ \schemaName tableName -> Ops.listJobs schemaName tableName limit offset
+listJobs limit offset = onQueue @payload $ \schemaName tableName -> Ops.listJobs schemaName tableName limit offset >>= traverse Ops.typedRow
 
 -- | Fetch a job by id.
 getJobById
@@ -812,7 +814,7 @@ getJobById
   => Int64
   -- ^ Job id
   -> m (Maybe (JobRead payload))
-getJobById jobId = onQueue @payload $ \schemaName tableName -> Ops.getJobById schemaName tableName jobId
+getJobById jobId = onQueue @payload $ \schemaName tableName -> Ops.getJobById schemaName tableName jobId >>= traverse Ops.typedRow
 
 -- | Whether a job with the given id exists in this payload's queue table.
 jobExists
@@ -834,7 +836,7 @@ getJobsByGroup
   -> Int
   -- ^ Offset
   -> m [JobRead payload]
-getJobsByGroup groupKey limit offset = onQueue @payload $ \schemaName tableName -> Ops.getJobsByGroup schemaName tableName groupKey limit offset
+getJobsByGroup groupKey limit offset = onQueue @payload $ \schemaName tableName -> Ops.getJobsByGroup schemaName tableName groupKey limit offset >>= traverse Ops.typedRow
 
 -- | List a parent's children.
 getJobsByParent
@@ -847,7 +849,7 @@ getJobsByParent
   -> Int
   -- ^ Offset
   -> m [JobRead payload]
-getJobsByParent pid limit offset = onQueue @payload $ \schemaName tableName -> Ops.getJobsByParent schemaName tableName pid limit offset
+getJobsByParent pid limit offset = onQueue @payload $ \schemaName tableName -> Ops.getJobsByParent schemaName tableName pid limit offset >>= traverse Ops.typedRow
 
 -- | Delete a job by id. Returns 0 for a job with children. 'cancelJobCascade' deletes
 -- those.

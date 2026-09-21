@@ -58,6 +58,7 @@ colTag CText = "text"
 colTag CBool = "bool"
 colTag CTimestamptz = "ts"
 colTag CJsonb = "jsonb"
+colTag CStored = "stored"
 colTag CFloat8 = "float8"
 colTag CUuid = "uuid"
 

@@ -4,6 +4,7 @@ module Arbiter.Hasql.Decode
   ) where
 
 import Arbiter.Core.Codec (Col (..), NullCol (..), RowCodec, runCodec)
+import Arbiter.Core.Job.Types.Internal (Stored (..))
 import Hasql.Decoders qualified as D
 
 -- | Decode all rows through the codec.
@@ -21,5 +22,6 @@ colValue CText = D.text
 colValue CBool = D.bool
 colValue CTimestamptz = D.timestamptz
 colValue CJsonb = D.jsonb
+colValue CStored = D.jsonbBytes (Right . Stored)
 colValue CFloat8 = D.float8
 colValue CUuid = D.uuid
