@@ -58,6 +58,7 @@ library
   hs-source-dirs:  src
   exposed-modules: Arbiter.Servant.UI
   build-depends:
+    , arbiter-core     >=0.1    && <0.2
     , arbiter-servant  >=0.1    && <0.2
     , base             >=4.20   && <5
     , bytestring       >=0.10   && <0.13

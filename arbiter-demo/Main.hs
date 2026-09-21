@@ -133,7 +133,7 @@ type DemoAPI =
     :<|> AdminUI
 
 -- | The demo application. @mDevDir@ serves the dashboard from disk when set.
-demoApp :: Maybe FilePath -> ArbiterServerConfig DemoRegistry -> Application
+demoApp :: Maybe FilePath -> ArbiterServerConfig (SimpleDb DemoRegistry IO) DemoRegistry -> Application
 demoApp mDevDir config =
   serve (Proxy @DemoAPI) $
     arbiterServer config
@@ -230,10 +230,10 @@ runDemo tel = do
   putStrLn "Seeding demo data..."
   seedDemoData producerEnv schema
 
-  -- Create server config (own connection pool for admin API)
+  -- Create server config over the producer env
   putStrLn ""
   putStrLn "Setting up server..."
-  serverConfig <- initArbiterServer (Proxy @DemoRegistry) connStr schema
+  serverConfig <- initArbiterServer (runSimpleDb producerEnv)
   putStrLn "Server ready"
 
   -- Create worker configs with cron jobs

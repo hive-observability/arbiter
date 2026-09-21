@@ -6,10 +6,15 @@ API.
 
 ```haskell
 import Arbiter.Servant qualified as Servant
+import Arbiter.Simple (createSimpleEnv, runSimpleDb)
 
-config <- Servant.initArbiterServer (Proxy @AppRegistry) connStr "arbiter"
+env <- createSimpleEnv (Proxy @AppRegistry) connStr "arbiter"
+config <- Servant.initArbiterServer (runSimpleDb env)
 Servant.runArbiterAPI 8080 config
 ```
+
+The server runs over any backend. Pass `runHasqlDb env` for a hasql
+application. The SSE stream uses the env's listener.
 
 Embed as a sub-route in an existing Servant application:
 

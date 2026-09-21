@@ -44,12 +44,15 @@ import Arbiter.Simple (createSimpleEnvWithPool, runSimpleDb)
 import Arbiter.Test.RateLimit (RLReg, rateLimitTable, setupRateLimitPolicy)
 import Arbiter.Test.Setup (cleanupData, createSharedPool, setupOnce, truncateToMicros)
 import Arbiter.Worker.Logger (LogConfig (..), LogDestination (..), defaultLogConfig)
+import Control.Concurrent (forkIO, killThread)
+import Control.Concurrent.MVar (newEmptyMVar, takeMVar, tryPutMVar)
 import Control.Exception (finally)
 import Control.Monad (forM_, void)
 import Data.Aeson (FromJSON, ToJSON, Value, decode, encode, object, toJSON, (.=))
 import Data.Aeson.QQ.Simple (aesonQQ)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
+import Data.ByteString.Builder qualified as Builder
 import Data.ByteString.Lazy qualified as LB
 import Data.IORef (atomicModifyIORef', newIORef, readIORef)
 import Data.Int (Int64)
@@ -67,6 +70,9 @@ import Data.UUID.Types qualified as UUID
 import Database.PostgreSQL.Simple qualified as PG
 import GHC.Generics (Generic)
 import Network.HTTP.Types (status200, status204, status400, status404, status409)
+import Network.Wai (defaultRequest, pathInfo, requestMethod, responseToStream)
+import Network.Wai.Internal (ResponseReceived (..))
+import System.Timeout (timeout)
 import Test.Hspec
 import Test.Hspec.Wai
 import Test.Hspec.Wai.Internal (runWaiSession)
@@ -164,7 +170,8 @@ spec :: ByteString -> Spec
 spec connStr = do
   runIO (setupOnce connStr testSchema testTable False)
   sharedPool <- runIO (createSharedPool connStr)
-  serverConfig <- runIO (initArbiterServer (Proxy @ServantTestRegistry) connStr testSchema)
+  mkEnv <- runIO (createSimpleEnvWithPool (Proxy @ServantTestRegistry) sharedPool testSchema)
+  serverConfig <- runIO (initArbiterServer (runSimpleDb mkEnv))
   let app = arbiterApp @ServantTestRegistry serverConfig {queueStatsCacheTtl = 0}
 
   let cleanupDb :: IO ()
@@ -178,8 +185,6 @@ spec connStr = do
               conn
               (fromString . T.unpack $ "UPDATE " <> tbl <> " SET payload = '{\"bogus\": 1}' WHERE " <> idColumn <> " = ?")
               (PG.Only jobId)
-
-  mkEnv <- runIO (createSimpleEnvWithPool (Proxy @ServantTestRegistry) sharedPool testSchema)
 
   describe "Jobs API" $ with (cleanupDb >> pure app) $ do
     it "GET /api/v1/arbiter_servant_test/jobs returns empty list initially" $ do
@@ -1099,12 +1104,12 @@ spec connStr = do
       liftIO $ length claimed `shouldBe` 1
       liftIO $ claimedBy (head claimed) `shouldNotBe` Nothing
 
-    it "POST /claim keeps the decoded jobs and reports a rejected row it cannot dead-letter" $ do
-      logged <- liftIO (newIORef [])
+    it "POST /claim keeps the decoded jobs and reports a rejected row it cannot dead-letter" $ liftIO @(WaiSession ()) $ do
+      logged <- newIORef []
       let capturing = LogCallback (\_ msg _ -> atomicModifyIORef' logged (\seen -> (msg : seen, ())))
           reportingApp = arbiterApp @ServantTestRegistry serverConfig {serverLogConfig = defaultLogConfig {logDestination = capturing}}
           dlqTbl = Schema.jobQueueDLQTable testSchema testTable
-      claimed <- liftIO $ do
+      claimed <- do
         Just poison <- runSimpleDb mkEnv $ HL.insertJob (defaultJob (TestMessage "poison"))
         void $ runSimpleDb mkEnv $ HL.insertJob (defaultJob (TestMessage "sibling"))
         corruptPayload (Schema.jobQueueTable testSchema testTable) "id" (primaryKey poison)
@@ -1122,11 +1127,11 @@ spec connStr = do
           decodeClaim
             <$> runWaiSession (postJson "/api/v1/arbiter_servant_test/claim" "{\"maxJobs\":2}") reportingApp
               `finally` PG.execute_ conn (fromString . T.unpack $ "ALTER TABLE " <> dlqTbl <> " DROP CONSTRAINT reject_poison")
-      liftIO $ do
-        map payload claimed `shouldBe` [TestMessage "sibling"]
-        messages <- readIORef logged
-        messages `shouldSatisfy` any (T.isPrefixOf "Dead-letter undecodable job in arbiter_servant_test failed")
+      map payload claimed `shouldBe` [TestMessage "sibling"]
+      messages <- readIORef logged
+      messages `shouldSatisfy` any (T.isPrefixOf "Dead-letter undecodable job in arbiter_servant_test failed")
 
+    it "POST /:id/ack completes a job the lease still holds" $ do
       liftIO $ void $ runSimpleDb mkEnv $ HL.insertJob (defaultJob (TestMessage "ack me"))
       claimed <- decodeClaim <$> postJson "/api/v1/arbiter_servant_test/claim" "{\"maxJobs\":1}"
       let job = head claimed
@@ -1530,11 +1535,36 @@ spec connStr = do
       post "/api/v1/workers/22222222-2222-2222-2222-222222222222/resume" ""
         `shouldRespondWith` 404
 
+  describe "Events API" $
+    it "GET /api/v1/events/stream relays notifications on the event channel" $ do
+      chunks <- newIORef []
+      arrived <- newEmptyMVar
+      let streamRequest = defaultRequest {requestMethod = "GET", pathInfo = ["api", "v1", "events", "stream"]}
+          capture builder = do
+            atomicModifyIORef' chunks (\acc -> (LB.toStrict (Builder.toLazyByteString builder) : acc, ()))
+            void (tryPutMVar arrived ())
+          awaitChunk needle = do
+            got <- timeout 5_000_000 (takeMVar arrived)
+            received <- readIORef chunks
+            if any (BS.isInfixOf needle) received
+              then pure True
+              else if isJust got then awaitChunk needle else pure False
+      streaming <- forkIO . void $ app streamRequest $ \response -> do
+        let (_, _, withBody) = responseToStream response
+        withBody (\body -> body capture (pure ()))
+        pure ResponseReceived
+      flip finally (killThread streaming) $ do
+        awaitChunk "\"event\":\"connected\"" `shouldReturn` True
+        void . withResource sharedPool $ \conn ->
+          PG.execute_ conn (fromString ("NOTIFY " <> T.unpack Schema.eventStreamingChannel <> ", '{\"event\":\"ping\"}'"))
+        awaitChunk "\"event\":\"ping\"" `shouldReturn` True
+
   describe "Maintenance API" $ do
     pacedConfig <- runIO $ do
       setupOnce connStr pacedSchema rateLimitTable False
       setupRateLimitPolicy connStr pacedSchema
-      initArbiterServer (Proxy @RLReg) connStr pacedSchema
+      pacedEnv <- createSimpleEnvWithPool (Proxy @RLReg) sharedPool pacedSchema
+      initArbiterServer (runSimpleDb pacedEnv)
     let pacedCleanup = withResource sharedPool $ cleanupData pacedSchema rateLimitTable
 
     with (pacedCleanup >> pure (arbiterApp @RLReg pacedConfig)) $
@@ -1550,7 +1580,9 @@ spec connStr = do
           Map.member "prune-rate-limit-buckets" (maintenanceOps secondPass) `shouldBe` False
           Map.member "sweep-stale-workers" (maintenanceOps secondPass) `shouldBe` True
 
-    missingConfig <- runIO $ initArbiterServer (Proxy @ServantTestRegistry) connStr missingSchema
+    missingConfig <- runIO $ do
+      missingEnv <- createSimpleEnvWithPool (Proxy @ServantTestRegistry) sharedPool missingSchema
+      initArbiterServer (runSimpleDb missingEnv)
     with (pure (arbiterApp @ServantTestRegistry missingConfig)) $
       it "POST /maintenance names the operations that raised" $ do
         resp <- post "/api/v1/maintenance" ""

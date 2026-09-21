@@ -11,6 +11,7 @@ REST API for managing and monitoring Arbiter job queues, built on Servant.
 {-# LANGUAGE TypeApplications #-}
 
 import Arbiter.Servant (Queue, initArbiterServer, runArbiterAPI)
+import Arbiter.Simple (createSimpleEnv, runSimpleDb)
 import Data.Aeson (FromJSON, ToJSON)
 import Data.Proxy (Proxy (..))
 import Data.Text (Text)
@@ -27,9 +28,13 @@ main = do
   -- Run the Arbiter migrations first. connStr is a libpq connection string and
   -- "arbiter" is the migrated schema. Live SSE updates also need
   -- enableEventStreaming = True.
-  config <- initArbiterServer (Proxy @AppRegistry) connStr "arbiter"
+  env <- createSimpleEnv (Proxy @AppRegistry) connStr "arbiter"
+  config <- initArbiterServer (runSimpleDb env)
   runArbiterAPI 8080 config
 ```
+
+`initArbiterServer` takes any backend runner, so a hasql application passes
+`runHasqlDb env` and the server shares that env's pool and listener.
 
 A queue with a handler result is `QueueWithResult "email_queue" EmailPayload
 Report`. Import `QueueSpec (..)` for the constructor.

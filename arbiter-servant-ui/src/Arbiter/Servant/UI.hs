@@ -43,6 +43,7 @@ module Arbiter.Servant.UI
   , arbiterAppWithAdminDev
   ) where
 
+import Arbiter.Core.MonadArbiter (HasRegistry)
 import Arbiter.Servant.API (ArbiterAPI)
 import Arbiter.Servant.Server (ArbiterServerConfig, BuildServer, arbiterServer)
 import Control.Exception (IOException, catch)
@@ -224,11 +225,12 @@ adminUIServerDevHoisted natTrans dir = hoistServer (Proxy @AdminUI) natTrans (ad
 
 -- | The API at @\/api\/v1@ and the admin UI at the root, in one application.
 arbiterAppWithAdmin
-  :: forall registry
+  :: forall registry m
    . ( BuildServer registry registry
+     , HasRegistry m registry
      , HasServer (ArbiterAPI registry) '[]
      )
-  => ArbiterServerConfig registry
+  => ArbiterServerConfig m registry
   -> Application
 arbiterAppWithAdmin config =
   serve
@@ -237,12 +239,13 @@ arbiterAppWithAdmin config =
 
 -- | 'arbiterAppWithAdmin' serving the UI from disk.
 arbiterAppWithAdminDev
-  :: forall registry
+  :: forall registry m
    . ( BuildServer registry registry
+     , HasRegistry m registry
      , HasServer (ArbiterAPI registry) '[]
      )
   => FilePath
-  -> ArbiterServerConfig registry
+  -> ArbiterServerConfig m registry
   -> Application
 arbiterAppWithAdminDev dir config =
   serve

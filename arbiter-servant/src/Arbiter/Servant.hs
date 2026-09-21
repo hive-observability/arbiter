@@ -7,13 +7,15 @@
 --
 -- @
 -- import Arbiter.Servant
+-- import Arbiter.Simple (createSimpleEnv, runSimpleDb)
 -- import Data.Proxy (Proxy(..))
 --
 -- main :: IO ()
 -- main = do
 --   -- Run migrations with event streaming enabled before starting the server.
---   -- The server config creates its own connection pool.
---   config <- initArbiterServer (Proxy @MyRegistry) connStr "public"
+--   -- The server runs over any backend env.
+--   env <- createSimpleEnv (Proxy @MyRegistry) connStr "public"
+--   config <- initArbiterServer (runSimpleDb env)
 --
 --   -- Start API server on port 8080
 --   runArbiterAPI 8080 config

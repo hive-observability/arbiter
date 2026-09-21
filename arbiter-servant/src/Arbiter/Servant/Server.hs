@@ -5,7 +5,7 @@
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE UndecidableInstances #-}
 
--- | REST API server for the Arbiter job queue (SimpleDb backend).
+-- | REST API server for the Arbiter job queue, over any 'MonadArbiter' backend.
 --
 -- __Security:__ No built-in authentication. All endpoints are publicly
 -- accessible. Add auth middleware before exposing to untrusted networks.
@@ -33,54 +33,53 @@ import Arbiter.Core.Job.Schema qualified as Schema
 import Arbiter.Core.Job.Types (DedupKey (..), JobPayload, JobStatus, isRollup, kindsFor)
 import Arbiter.Core.Job.Types qualified as Job
 import Arbiter.Core.JobResult (EncodeJobResult, encodeJobResult)
-import Arbiter.Core.MonadArbiter (withDbTransaction)
+import Arbiter.Core.Listen (Notification (..), withChannels)
+import Arbiter.Core.MonadArbiter (HasRegistry, getListener, getSchema, withDbTransaction)
 import Arbiter.Core.Operations qualified as Ops
-import Arbiter.Core.PoolConfig (PoolConfig (..))
 import Arbiter.Core.QueueRegistry (JobPayloadRegistry, RegistryTables (..), SpecName, SpecPayload, SpecResult)
 import Arbiter.Core.Queues qualified as Queues
 import Arbiter.Core.Sql.Jobs (ArchiveSortColumn, DLQSortColumn, JobFilter (..), JobSortColumn, SortDir)
 import Arbiter.Core.Trace (withPublishSpan)
-import Arbiter.Simple (Env (..), PoolState (..), SimpleDb, SimpleEnv, createSimpleEnvWithConfig, runSimpleDb)
 import Arbiter.Worker (MaintenancePace (..), runMaintenancePass, storeEncodedResult)
 import Arbiter.Worker.Config (maintenanceOpName)
 import Arbiter.Worker.Cron (nextRunFromExpression, updateCronScheduleChecked)
-import Arbiter.Worker.Logger (FailureGates, LogConfig, LogLevel (..), defaultLogConfig, newFailureGates, tryReportedOn)
-import Control.Concurrent (forkIOWithUnmask, threadDelay)
-import Control.Concurrent.Async (race_)
-import Control.Concurrent.MVar (MVar, modifyMVar, modifyMVar_, newMVar)
+import Arbiter.Worker.Logger
+  ( FailureGates
+  , LogConfig
+  , LogLevel (..)
+  , defaultLogConfig
+  , hubLogFor
+  , newFailureGates
+  , tryReportedOn
+  )
 import Control.Concurrent.STM
-  ( TChan
-  , TVar
+  ( TVar
   , atomically
   , check
-  , dupTChan
   , modifyTVar'
-  , newBroadcastTChanIO
+  , newTChanIO
   , newTVarIO
   , readTChan
   , readTVar
   , readTVarIO
   , writeTChan
   )
-import Control.Exception (bracket, bracket_)
-import Control.Monad (forever, guard, join, mfilter, unless, void, when)
+import Control.Exception (bracket_)
+import Control.Monad (guard, join, mfilter, unless, void, when)
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Data.Aeson (encode)
 import Data.ByteString (ByteString)
 import Data.ByteString.Builder qualified as Builder
-import Data.ByteString.Char8 qualified as BS8
 import Data.ByteString.Lazy qualified as LBS
 import Data.Either (fromRight)
 import Data.Foldable (traverse_)
-import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
+import Data.IORef (modifyIORef', newIORef, readIORef)
 import Data.Int (Int64)
 import Data.Kind (Type)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (catMaybes, fromMaybe, isJust)
 import Data.Ord (clamp)
-import Data.Pool qualified as Pool
 import Data.Set qualified as Set
-import Data.String (fromString)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding (encodeUtf8)
@@ -88,15 +87,12 @@ import Data.Time (NominalDiffTime, UTCTime, diffUTCTime, getCurrentTime)
 import Data.Time.Format (defaultTimeLocale, formatTime)
 import Data.UUID.Types (UUID)
 import Data.UUID.V4 qualified as UUID
-import Database.PostgreSQL.Simple qualified as PG
-import Database.PostgreSQL.Simple.Notification (Notification (..), getNotification)
 import GHC.TypeLits (KnownSymbol, symbolVal)
 import Network.HTTP.Types (status200)
 import Network.Wai (responseStream)
 import Network.Wai.Handler.Warp (Port, defaultSettings, runSettings, setPort)
 import Servant
 import Servant.Server.Generic (AsServerT)
-import System.IO (stderr)
 import System.Timeout (timeout)
 import UnliftIO.Exception (handleAny, tryAny)
 
@@ -119,18 +115,18 @@ import Arbiter.Servant.API
   )
 import Arbiter.Servant.Types
 
--- | Configuration for the API server.
-data ArbiterServerConfig (registry :: JobPayloadRegistry) = ArbiterServerConfig
-  { serverEnv :: SimpleEnv registry
-  -- ^ The SimpleEnv containing schema and connection pool
+-- | Configuration for the API server. @m@ is the backend monad every handler's
+-- statements run in.
+data ArbiterServerConfig m (registry :: JobPayloadRegistry) = ArbiterServerConfig
+  { serverRun :: forall a. m a -> IO a
+  -- ^ Run a backend action, for example @runSimpleDb env@ or @runHasqlDb env@.
+  , serverSchema :: Text
+  -- ^ The schema every handler's statements run against.
   , enableSSE :: Bool
   -- ^ Enable the Server-Sent Events streaming endpoint. When 'False', the
   -- @\/events\/stream@ endpoint returns one \"disabled\" event and closes.
-  -- The admin UI then polls. Default: 'True'.
-  , sseHub :: MVar (Maybe SSEHub)
-  -- ^ Lazily started SSE broadcast hub, shared by all clients. The first
-  -- subscriber starts it. The last disconnect tears it down and releases its
-  -- @LISTEN@ connection.
+  -- The admin UI then polls. A backend with no listener answers the same way.
+  -- Default: 'True'.
   , rateLimitPoliciesCache :: CacheCell RateLimitPoliciesResponse
   -- ^ Short-TTL cache for the rate-limit policy list.
   , concurrencyPoliciesCache :: CacheCell ConcurrencyPoliciesResponse
@@ -163,20 +159,9 @@ data ArbiterServerConfig (registry :: JobPayloadRegistry) = ArbiterServerConfig
   -- ^ Per-queue failure gates for dead-letter reports.
   }
 
--- | A running SSE broadcast hub: the channel every client duplicates, and the
--- live subscriber count the listener watches to release itself at zero.
-data SSEHub = SSEHub
-  { hubChan :: TChan ByteString
-  , hubRefs :: TVar Int
-  }
-
--- | The schema every handler's statements run against.
-serverSchema :: ArbiterServerConfig registry -> Text
-serverSchema = schema . serverEnv
-
--- | Run a statement on the server's own pool.
-runDb :: (MonadIO n) => ArbiterServerConfig registry -> SimpleDb registry IO a -> n a
-runDb config = liftIO . runSimpleDb (serverEnv config)
+-- | Run a statement on the backend.
+runDb :: (MonadIO n) => ArbiterServerConfig m registry -> m a -> n a
+runDb config = liftIO . serverRun config
 
 -- | 'NoContent' when a statement touched a row, 404 otherwise.
 rowsOr404 :: LBS.ByteString -> Int64 -> Handler NoContent
@@ -191,11 +176,12 @@ noContentOr = either throwError (const (pure NoContent))
 -- | Run a job mutation. When it touches no row, re-read the job and answer 404, or
 -- the 409 that @refuse@ derives from the job's state.
 mutateJob
-  :: forall (payload :: Type) registry
-   . Text
-  -> ArbiterServerConfig registry
+  :: forall (payload :: Type) registry m
+   . (HasRegistry m registry)
+  => Text
+  -> ArbiterServerConfig m registry
   -> Int64
-  -> (Text -> SimpleDb registry IO Int64)
+  -> (Text -> m Int64)
   -> (Job.JobRead (Job.Stored payload) -> LBS.ByteString)
   -> Handler NoContent
 mutateJob tableName config jobId mutate refuse =
@@ -208,27 +194,16 @@ mutateJob tableName config jobId mutate refuse =
           maybe (Left err404 {errBody = "Job not found"}) (\job -> Left err409 {errBody = refuse job})
             <$> Ops.getJobById @_ @payload schemaName tableName jobId
 
--- | Small pool configuration for admin API traffic.
-serverPoolConfig :: PoolConfig
-serverPoolConfig =
-  PoolConfig
-    { poolSize = 10
-    , poolIdleTimeout = 60
-    , poolStripes = Just 1
-    }
-
--- | Create an 'ArbiterServerConfig' with a connection pool of its own. SSE needs the
+-- | Create an 'ArbiterServerConfig' over a backend runner. SSE needs the
 -- event-streaming triggers, which 'Arbiter.Migrations.runMigrationsForRegistry' installs
--- when @enableEventStreaming@ is set.
+-- when @enableEventStreaming@ is set, and a backend with a listener.
 initArbiterServer
-  :: forall registry
-   . Proxy registry
-  -> ByteString
-  -> Text
-  -> IO (ArbiterServerConfig registry)
-initArbiterServer _proxy connStr schemaName = do
-  env <- createSimpleEnvWithConfig (Proxy @registry) connStr schemaName serverPoolConfig
-  hub <- newMVar Nothing
+  :: forall m registry
+   . (HasRegistry m registry)
+  => (forall a. m a -> IO a)
+  -> IO (ArbiterServerConfig m registry)
+initArbiterServer run = do
+  schemaName <- run getSchema
   rlCache <- newCacheCell
   ccCache <- newCacheCell
   statsCache <- newCacheCell
@@ -237,9 +212,9 @@ initArbiterServer _proxy connStr schemaName = do
   gates <- newFailureGates
   pure
     ArbiterServerConfig
-      { serverEnv = env
+      { serverRun = run
+      , serverSchema = schemaName
       , enableSSE = True
-      , sseHub = hub
       , rateLimitPoliciesCache = rlCache
       , concurrencyPoliciesCache = ccCache
       , allQueueStatsCache = statsCache
@@ -256,10 +231,10 @@ initArbiterServer _proxy connStr schemaName = do
 
 -- | Jobs API handlers for a specific table.
 jobsServer
-  :: forall registry payload result
-   . (EncodeJobResult result, JobPayload payload)
+  :: forall registry payload result m
+   . (EncodeJobResult result, HasRegistry m registry, JobPayload payload)
   => Text
-  -> ArbiterServerConfig registry
+  -> ArbiterServerConfig m registry
   -> JobsAPI payload result (AsServerT Handler)
 jobsServer table config =
   JobsAPI
@@ -282,9 +257,10 @@ jobsServer table config =
 
 -- | List jobs with pagination and composable filters.
 listJobsHandler
-  :: forall registry (payload :: Type)
-   . Text
-  -> ArbiterServerConfig registry
+  :: forall registry (payload :: Type) m
+   . (HasRegistry m registry)
+  => Text
+  -> ArbiterServerConfig m registry
   -> Maybe Int
   -> Maybe Int
   -> Maybe Text
@@ -346,10 +322,10 @@ listJobsHandler tableName config mLimit mOffset mGroupKey mParentId mJobId roots
 
 -- | Insert a new job into the queue.
 insertJobHandler
-  :: forall registry payload
-   . (JobPayload payload)
+  :: forall registry payload m
+   . (HasRegistry m registry, JobPayload payload)
   => Text
-  -> ArbiterServerConfig registry
+  -> ArbiterServerConfig m registry
   -> ApiJobWrite payload
   -> Handler (JobResponse (Job.JobRead payload))
 insertJobHandler tableName config (ApiJobWrite jobWrite) = do
@@ -368,10 +344,10 @@ insertJobHandler tableName config (ApiJobWrite jobWrite) = do
 
 -- | Insert multiple jobs in a single batch operation.
 insertJobsBatchHandler
-  :: forall registry payload
-   . (JobPayload payload)
+  :: forall registry payload m
+   . (HasRegistry m registry, JobPayload payload)
   => Text
-  -> ArbiterServerConfig registry
+  -> ArbiterServerConfig m registry
   -> BatchInsertRequest payload
   -> Handler (BatchInsertResponse payload)
 insertJobsBatchHandler tableName config (BatchInsertRequest jobWrites) = do
@@ -386,9 +362,10 @@ insertJobsBatchHandler tableName config (BatchInsertRequest jobWrites) = do
 
 -- | Fetch a job by id.
 getJobHandler
-  :: forall registry (payload :: Type)
-   . Text
-  -> ArbiterServerConfig registry
+  :: forall registry (payload :: Type) m
+   . (HasRegistry m registry)
+  => Text
+  -> ArbiterServerConfig m registry
   -> Int64
   -> Handler (JobResponse (ApiJobWithStatus (Job.Stored payload)))
 getJobHandler tableName config jobId = do
@@ -400,9 +377,10 @@ getJobHandler tableName config jobId = do
 
 -- | Cancel a job (delete it from the queue).
 cancelJobHandler
-  :: forall registry
-   . Text
-  -> ArbiterServerConfig registry
+  :: forall registry m
+   . (HasRegistry m registry)
+  => Text
+  -> ArbiterServerConfig m registry
   -> Int64
   -> Handler NoContent
 cancelJobHandler tableName config jobId = do
@@ -411,9 +389,10 @@ cancelJobHandler tableName config jobId = do
 
 -- | Cascade-cancel a job and async-cancel any in-flight handlers via NOTIFY.
 forceCancelJobHandler
-  :: forall registry
-   . Text
-  -> ArbiterServerConfig registry
+  :: forall registry m
+   . (HasRegistry m registry)
+  => Text
+  -> ArbiterServerConfig m registry
   -> Int64
   -> Handler NoContent
 forceCancelJobHandler tableName config jobId = do
@@ -422,9 +401,10 @@ forceCancelJobHandler tableName config jobId = do
 
 -- | Promote a job (make it immediately visible).
 promoteJobHandler
-  :: forall registry
-   . Text
-  -> ArbiterServerConfig registry
+  :: forall registry m
+   . (HasRegistry m registry)
+  => Text
+  -> ArbiterServerConfig m registry
   -> Int64
   -> Handler NoContent
 promoteJobHandler tableName config jobId =
@@ -437,9 +417,10 @@ promoteJobHandler tableName config jobId =
 
 -- | Move a job to the dead letter queue.
 moveToDLQHandler
-  :: forall registry
-   . Text
-  -> ArbiterServerConfig registry
+  :: forall registry m
+   . (HasRegistry m registry)
+  => Text
+  -> ArbiterServerConfig m registry
   -> Int64
   -> Handler NoContent
 moveToDLQHandler tableName config jobId =
@@ -455,9 +436,10 @@ moveToDLQHandler tableName config jobId =
 
 -- | Pause all children of a parent job.
 pauseChildrenHandler
-  :: forall registry
-   . Text
-  -> ArbiterServerConfig registry
+  :: forall registry m
+   . (HasRegistry m registry)
+  => Text
+  -> ArbiterServerConfig m registry
   -> Int64
   -> Handler NoContent
 pauseChildrenHandler tableName config jobId =
@@ -466,9 +448,10 @@ pauseChildrenHandler tableName config jobId =
 
 -- | Resume all suspended children of a parent job.
 resumeChildrenHandler
-  :: forall registry
-   . Text
-  -> ArbiterServerConfig registry
+  :: forall registry m
+   . (HasRegistry m registry)
+  => Text
+  -> ArbiterServerConfig m registry
   -> Int64
   -> Handler NoContent
 resumeChildrenHandler tableName config jobId =
@@ -477,9 +460,10 @@ resumeChildrenHandler tableName config jobId =
 
 -- | Suspend a job (make it unclaimable).
 suspendJobHandler
-  :: forall registry
-   . Text
-  -> ArbiterServerConfig registry
+  :: forall registry m
+   . (HasRegistry m registry)
+  => Text
+  -> ArbiterServerConfig m registry
   -> Int64
   -> Handler NoContent
 suspendJobHandler tableName config jobId =
@@ -492,9 +476,10 @@ suspendJobHandler tableName config jobId =
 -- | Resume a suspended job, making it claimable again. Refuses a finalizer with children
 -- still running.
 resumeJobHandler
-  :: forall registry
-   . Text
-  -> ArbiterServerConfig registry
+  :: forall registry m
+   . (HasRegistry m registry)
+  => Text
+  -> ArbiterServerConfig m registry
   -> Int64
   -> Handler NoContent
 resumeJobHandler tableName config jobId =
@@ -507,10 +492,10 @@ resumeJobHandler tableName config jobId =
 
 -- | DLQ API handlers for a specific table.
 dlqServer
-  :: forall registry payload
-   . (JobPayload payload)
+  :: forall registry payload m
+   . (HasRegistry m registry, JobPayload payload)
   => Text
-  -> ArbiterServerConfig registry
+  -> ArbiterServerConfig m registry
   -> DLQAPI payload (AsServerT Handler)
 dlqServer table config =
   DLQAPI
@@ -522,9 +507,10 @@ dlqServer table config =
 
 -- | List DLQ jobs with pagination and composable filters.
 listDLQHandler
-  :: forall registry (payload :: Type)
-   . Text
-  -> ArbiterServerConfig registry
+  :: forall registry (payload :: Type) m
+   . (HasRegistry m registry)
+  => Text
+  -> ArbiterServerConfig m registry
   -> Maybe Int
   -> Maybe Int
   -> Maybe Int64
@@ -560,10 +546,10 @@ listDLQHandler tableName config mLimit mOffset mParentId mJobId mGroupKey mKind 
 
 -- | Retry a DLQ job back into the main queue. 409 when its parent is gone.
 retryFromDLQHandler
-  :: forall registry (payload :: Type)
-   . (JobPayload payload)
+  :: forall registry (payload :: Type) m
+   . (HasRegistry m registry, JobPayload payload)
   => Text
-  -> ArbiterServerConfig registry
+  -> ArbiterServerConfig m registry
   -> Int64
   -> Handler NoContent
 retryFromDLQHandler tableName config dlqId =
@@ -581,9 +567,10 @@ retryFromDLQHandler tableName config dlqId =
 
 -- | Delete a job from DLQ permanently.
 deleteDLQHandler
-  :: forall registry
-   . Text
-  -> ArbiterServerConfig registry
+  :: forall registry m
+   . (HasRegistry m registry)
+  => Text
+  -> ArbiterServerConfig m registry
   -> Int64
   -> Handler NoContent
 deleteDLQHandler tableName config dlqId = do
@@ -592,9 +579,10 @@ deleteDLQHandler tableName config dlqId = do
 
 -- | Batch delete jobs from DLQ permanently.
 deleteDLQBatchHandler
-  :: forall registry
-   . Text
-  -> ArbiterServerConfig registry
+  :: forall registry m
+   . (HasRegistry m registry)
+  => Text
+  -> ArbiterServerConfig m registry
   -> BatchDeleteRequest
   -> Handler BatchDeleteResponse
 deleteDLQBatchHandler tableName config (BatchDeleteRequest dlqIds) = do
@@ -604,10 +592,10 @@ deleteDLQBatchHandler tableName config (BatchDeleteRequest dlqIds) = do
 
 -- | Archive API handler for a specific table.
 archiveServer
-  :: forall registry payload
-   . (JobPayload payload)
+  :: forall registry payload m
+   . (HasRegistry m registry, JobPayload payload)
   => Text
-  -> ArbiterServerConfig registry
+  -> ArbiterServerConfig m registry
   -> ArchiveAPI payload (AsServerT Handler)
 archiveServer table config =
   ArchiveAPI
@@ -619,9 +607,10 @@ archiveServer table config =
 
 -- | List archived jobs with pagination and composable filters.
 listArchiveHandler
-  :: forall registry (payload :: Type)
-   . Text
-  -> ArbiterServerConfig registry
+  :: forall registry (payload :: Type) m
+   . (HasRegistry m registry)
+  => Text
+  -> ArbiterServerConfig m registry
   -> Maybe Int
   -> Maybe Int
   -> Maybe Int64
@@ -661,10 +650,10 @@ listArchiveHandler tableName config mLimit mOffset mParentId mJobId mGroupKey mK
 
 -- | Re-enqueue an archived job as a fresh job. 404 if the archive row is gone.
 reEnqueueArchiveHandler
-  :: forall registry (payload :: Type)
-   . (JobPayload payload)
+  :: forall registry (payload :: Type) m
+   . (HasRegistry m registry, JobPayload payload)
   => Text
-  -> ArbiterServerConfig registry
+  -> ArbiterServerConfig m registry
   -> Int64
   -> Handler NoContent
 reEnqueueArchiveHandler tableName config archiveId = do
@@ -678,9 +667,10 @@ reEnqueueArchiveHandler tableName config archiveId = do
 
 -- | Purge one archived job by its archive primary key.
 deleteArchiveHandler
-  :: forall registry
-   . Text
-  -> ArbiterServerConfig registry
+  :: forall registry m
+   . (HasRegistry m registry)
+  => Text
+  -> ArbiterServerConfig m registry
   -> Int64
   -> Handler NoContent
 deleteArchiveHandler tableName config archiveId = do
@@ -689,9 +679,10 @@ deleteArchiveHandler tableName config archiveId = do
 
 -- | Bulk-purge archived jobs by archive primary key.
 deleteArchiveBatchHandler
-  :: forall registry
-   . Text
-  -> ArbiterServerConfig registry
+  :: forall registry m
+   . (HasRegistry m registry)
+  => Text
+  -> ArbiterServerConfig m registry
   -> BatchDeleteRequest
   -> Handler BatchDeleteResponse
 deleteArchiveBatchHandler tableName config (BatchDeleteRequest archiveIds) = do
@@ -701,10 +692,10 @@ deleteArchiveBatchHandler tableName config (BatchDeleteRequest archiveIds) = do
 
 -- | Stats API handler for a specific table.
 statsServer
-  :: forall registry payload
-   . (JobPayload payload)
+  :: forall registry payload m
+   . (HasRegistry m registry, JobPayload payload)
   => Text
-  -> ArbiterServerConfig registry
+  -> ArbiterServerConfig m registry
   -> StatsAPI (AsServerT Handler)
 statsServer tableName config =
   StatsAPI
@@ -713,10 +704,11 @@ statsServer tableName config =
 
 -- | Get queue statistics.
 getStatsHandler
-  :: forall registry
-   . Text
+  :: forall registry m
+   . (HasRegistry m registry)
+  => Text
   -> [Text]
-  -> ArbiterServerConfig registry
+  -> ArbiterServerConfig m registry
   -> Handler StatsResponse
 getStatsHandler tableName kinds config =
   liftIO $ cachedForKey (queueStatsCacheTtl config) (queueStatsCache config) tableName $ do
@@ -730,8 +722,9 @@ getStatsHandler tableName kinds config =
 
 -- | Every queue's stats in one request, for the landing overview.
 getAllStatsHandler
-  :: forall registry
-   . ArbiterServerConfig registry
+  :: forall registry m
+   . (HasRegistry m registry)
+  => ArbiterServerConfig m registry
   -> [(Text, [Text])]
   -> Handler AllStatsResponse
 getAllStatsHandler config queueKinds =
@@ -741,10 +734,10 @@ getAllStatsHandler config queueKinds =
 
 -- | Table API handlers for a specific table.
 tableServer
-  :: forall registry payload result
-   . (EncodeJobResult result, JobPayload payload)
+  :: forall registry payload result m
+   . (EncodeJobResult result, HasRegistry m registry, JobPayload payload)
   => Text
-  -> ArbiterServerConfig registry
+  -> ArbiterServerConfig m registry
   -> TableAPI payload result (AsServerT Handler)
 tableServer table config =
   TableAPI
@@ -759,10 +752,10 @@ tableServer table config =
 -- | Lease visible jobs to a consumer outside a worker pool. Each returned job
 -- contains the claim sequence and claimant required for finalization.
 claimJobsHandler
-  :: forall registry payload
-   . (JobPayload payload)
+  :: forall registry payload m
+   . (HasRegistry m registry, JobPayload payload)
   => Text
-  -> ArbiterServerConfig registry
+  -> ArbiterServerConfig m registry
   -> ClaimRequest
   -> Handler (ClaimResponse payload)
 claimJobsHandler tableName config req = liftIO $ do
@@ -792,10 +785,10 @@ claimJobsHandler tableName config req = liftIO $ do
 -- | Complete a job that the caller holds. Store an optional result in the
 -- parent rollup or archive entry, as worker @ackWith@ does.
 ackClaimedJobHandler
-  :: forall registry result
-   . (EncodeJobResult result)
+  :: forall registry result m
+   . (EncodeJobResult result, HasRegistry m registry)
   => Text
-  -> ArbiterServerConfig registry
+  -> ArbiterServerConfig m registry
   -> Int64
   -> AckRequest result
   -> Handler NoContent
@@ -809,9 +802,10 @@ ackClaimedJobHandler tableName config jobId req =
 -- | Restore the attempt used by a claim. The job becomes available when its
 -- lease expires.
 nackClaimedJobHandler
-  :: forall registry
-   . Text
-  -> ArbiterServerConfig registry
+  :: forall registry m
+   . (HasRegistry m registry)
+  => Text
+  -> ArbiterServerConfig m registry
   -> Int64
   -> JobLease
   -> Handler NoContent
@@ -821,9 +815,10 @@ nackClaimedJobHandler tableName config jobId lease =
 
 -- | Extend a held lease. This is the HTTP consumer equivalent of a worker heartbeat.
 extendClaimedJobHandler
-  :: forall registry
-   . Text
-  -> ArbiterServerConfig registry
+  :: forall registry m
+   . (HasRegistry m registry)
+  => Text
+  -> ArbiterServerConfig m registry
   -> Int64
   -> ExtendRequest
   -> Handler NoContent
@@ -835,12 +830,13 @@ extendClaimedJobHandler tableName config jobId req =
 -- longer holds or a lease held by a worker pool. Each statement checks the claim
 -- sequence and writes no change after a lease is lost.
 withHeldJob
-  :: forall registry (payload :: Type)
-   . Text
-  -> ArbiterServerConfig registry
+  :: forall registry (payload :: Type) m
+   . (HasRegistry m registry)
+  => Text
+  -> ArbiterServerConfig m registry
   -> Int64
   -> JobLease
-  -> (Text -> Job.JobRead (Job.Stored payload) -> SimpleDb registry IO Int64)
+  -> (Text -> Job.JobRead (Job.Stored payload) -> m Int64)
   -> Handler NoContent
 withHeldJob tableName config jobId lease finalize = do
   let schemaName = serverSchema config
@@ -868,9 +864,9 @@ withHeldJob tableName config jobId lease finalize = do
 
 -- | Maintenance API handler.
 maintenanceServer
-  :: forall registry
-   . (HL.RegistryAdmissionPolicies registry, RegistryTables registry)
-  => ArbiterServerConfig registry
+  :: forall registry m
+   . (HL.RegistryAdmissionPolicies registry, HasRegistry m registry, RegistryTables registry)
+  => ArbiterServerConfig m registry
   -> MaintenanceAPI (AsServerT Handler)
 maintenanceServer config = MaintenanceAPI {runMaintenance = maintenanceHandler @registry config}
 
@@ -878,9 +874,9 @@ maintenanceServer config = MaintenanceAPI {runMaintenance = maintenanceHandler @
 -- exclude each other across callers. An operation another caller is running is
 -- skipped and absent from the response.
 maintenanceHandler
-  :: forall registry
-   . (HL.RegistryAdmissionPolicies registry, RegistryTables registry)
-  => ArbiterServerConfig registry
+  :: forall registry m
+   . (HL.RegistryAdmissionPolicies registry, HasRegistry m registry, RegistryTables registry)
+  => ArbiterServerConfig m registry
   -> Handler MaintenanceResponse
 maintenanceHandler config = liftIO $ do
   touched <- newIORef Map.empty
@@ -919,10 +915,10 @@ pageLimitRange = (1, 1000)
 
 -- | Queues API handler.
 queuesServer
-  :: forall registry
-   . (RegistryTables registry)
+  :: forall registry m
+   . (HasRegistry m registry, RegistryTables registry)
   => Proxy registry
-  -> ArbiterServerConfig registry
+  -> ArbiterServerConfig m registry
   -> QueuesAPI (AsServerT Handler)
 queuesServer registryProxy config =
   let known = registryTableNames registryProxy
@@ -936,8 +932,9 @@ queuesServer registryProxy config =
 
 -- | Get a queue's operator config.
 getQueueDetailsHandler
-  :: forall registry
-   . ArbiterServerConfig registry
+  :: forall registry m
+   . (HasRegistry m registry)
+  => ArbiterServerConfig m registry
   -> Text
   -> Handler (Maybe QueueRow)
 getQueueDetailsHandler config queue = do
@@ -947,8 +944,9 @@ getQueueDetailsHandler config queue = do
 -- | Flip the @paused@ flag for a queue, validated against the registry. The
 -- @arbiter_queues@ row is created lazily on first pause.
 setQueuePausedHandler
-  :: forall registry
-   . ArbiterServerConfig registry
+  :: forall registry m
+   . (HasRegistry m registry)
+  => ArbiterServerConfig m registry
   -> [Text]
   -> Bool
   -> Text
@@ -962,47 +960,40 @@ setQueuePausedHandler config knownQueues pauseFlag queue = do
   invalidate (allQueueStatsCache config)
   NoContent <$ invalidate (queueStatsCache config)
 
--- | Serve the SSE stream as a raw WAI application. Flush after each event and
--- send a keepalive comment every 15 seconds. Each client reads a duplicate of
--- the shared broadcast hub and does not use a PostgreSQL pool connection. If
--- 'enableSSE' is false, send one @disabled@ event and close the stream. The
--- admin UI then stops reconnection attempts.
+-- | Serve the SSE stream as a raw WAI application. Each client registers on the
+-- backend's shared listener for the response's lifetime and gets a @connected@
+-- event once its channel is subscribed. If 'enableSSE' is false or the backend
+-- has no listener, send one @disabled@ event and close the stream. The admin UI
+-- then stops reconnection attempts.
 eventsServer
-  :: forall registry
-   . ArbiterServerConfig registry
+  :: forall registry m
+   . (HasRegistry m registry)
+  => ArbiterServerConfig m registry
   -> Tagged Handler Application
-eventsServer config = Tagged $ \_req sendResponse ->
-  if not (enableSSE config)
-    then sendResponse $ responseStream status200 sseHeaders $ \write flush -> do
+eventsServer config = Tagged $ \_req sendResponse -> do
+  mListener <- if enableSSE config then runDb config getListener else pure Nothing
+  case mListener of
+    Nothing -> sendResponse $ responseStream status200 sseHeaders $ \write flush -> do
       write "data: {\"event\":\"disabled\"}\n\n"
       flush
-    else
-      -- 'bracket' pairs the refcount increment with its decrement around the
-      -- whole response. The hub is released when the streaming body never runs.
-      bracket (subscribeSSE config) (maybe (pure ()) (const (unsubscribeSSE config))) $ \mSub ->
-        case mSub of
-          Nothing -> sendResponse $ responseStream status200 sseHeaders $ \write flush -> do
-            write "data: {\"event\":\"error\",\"message\":\"No connection pool available\"}\n\n"
-            flush
-          Just sub -> sendResponse $ responseStream status200 sseHeaders $ \write flush ->
-            -- A failed write (client gone) ends the stream. The enclosing bracket
-            -- then drops this subscriber's refcount.
-            handleAny (const (pure ())) $ do
-              write "data: {\"event\":\"connected\",\"message\":\"Stream connected\"}\n\n"
-              flush
-              -- Read this client's channel with a 15s keepalive heartbeat.
-              let go = do
-                    mPayload <- timeout 15_000_000 (atomically (readTChan sub))
-                    case mPayload of
-                      Just payload -> do
-                        write ("data: " <> Builder.byteString payload <> "\n\n")
-                        flush
-                        go
-                      Nothing -> do
-                        write ": keepalive\n\n"
-                        flush
-                        go
-              go
+    Just listener -> do
+      events <- newTChanIO
+      let deliver = atomically . writeTChan events . notificationData
+      -- The registration wraps the whole response. The hub is released when the
+      -- streaming body never runs.
+      withChannels listener (hubLogFor (serverLogConfig config)) [(eventStreamingChannel, deliver)] $ \ready ->
+        sendResponse $ responseStream status200 sseHeaders $ \write flush ->
+          -- A failed write (client gone) ends the stream. The keepalive comment
+          -- every 15s is how a gone client is noticed.
+          handleAny (const (pure ())) $ do
+            let keepalive = write ": keepalive\n\n" >> flush
+                event payload = write ("data: " <> Builder.byteString payload <> "\n\n") >> flush
+                awaitReady = timeout sseKeepaliveMicros (atomically (ready >>= check)) >>= maybe (keepalive >> awaitReady) pure
+                pump = timeout sseKeepaliveMicros (atomically (readTChan events)) >>= maybe keepalive event >> pump
+            -- The connected event says the channel is subscribed.
+            awaitReady
+            event "{\"event\":\"connected\",\"message\":\"Stream connected\"}"
+            pump
   where
     sseHeaders =
       [ ("Content-Type", "text/event-stream")
@@ -1011,84 +1002,19 @@ eventsServer config = Tagged $ \_req sendResponse ->
       , ("X-Accel-Buffering", "no")
       ]
 
--- | Subscribe to the shared SSE hub, returning a duplicated channel to stream
--- from. The first subscriber starts the hub (one @LISTEN@ connection). Later
--- subscribers bump the refcount. 'Nothing' when there is no pool.
-subscribeSSE :: ArbiterServerConfig registry -> IO (Maybe (TChan ByteString))
-subscribeSSE config =
-  modifyMVar (sseHub config) $ \mhub -> case mhub of
-    Just hub -> do
-      sub <- atomically $ do
-        modifyTVar' (hubRefs hub) (+ 1)
-        dupTChan (hubChan hub)
-      pure (Just hub, Just sub)
-    Nothing -> case connectionPool (poolState (serverEnv config)) of
-      Nothing -> pure (Nothing, Nothing)
-      Just pool -> do
-        broadcast <- newBroadcastTChanIO
-        refs <- newTVarIO 1
-        sub <- atomically (dupTChan broadcast)
-        -- subscribeSSE runs masked as a 'bracket' acquire. The listener is
-        -- forked with an explicit unmask.
-        void $ forkIOWithUnmask $ \unmask -> unmask (sseListenerLoop pool broadcast refs)
-        pure (Just (SSEHub broadcast refs), Just sub)
+-- | Idle gap before an SSE client gets a keepalive comment.
+sseKeepaliveMicros :: Int
+sseKeepaliveMicros = 15_000_000
 
--- | Drop one subscriber. When the count reaches zero the hub is removed from
--- the config. The listener observes the same count and releases its connection
--- (see 'sseListenerLoop').
-unsubscribeSSE :: ArbiterServerConfig registry -> IO ()
-unsubscribeSSE config =
-  modifyMVar_ (sseHub config) $ \mhub -> case mhub of
-    Nothing -> pure Nothing
-    Just hub -> do
-      remaining <- atomically $ do
-        modifyTVar' (hubRefs hub) (subtract 1)
-        readTVar (hubRefs hub)
-      pure $ if remaining <= 0 then Nothing else Just hub
-
--- | The single listener. It runs @LISTEN@ on one borrowed connection and fans
--- every notification into the broadcast channel, raced against the subscriber
--- count reaching zero. On connection loss it destroys the dead resource and
--- reconnects. When the count hits zero the race ends, the 'bracket' releases
--- the connection, and the thread exits.
-sseListenerLoop :: Pool.Pool PG.Connection -> TChan ByteString -> TVar Int -> IO ()
-sseListenerLoop pool broadcast refs = do
-  backoff <- newIORef baseBackoff
-  race_ waitForIdle (pump backoff)
-  where
-    baseBackoff = 1_000_000 -- 1s
-    maxBackoff = 30_000_000 -- 30s
-    waitForIdle = atomically $ do
-      subscribers <- readTVar refs
-      check (subscribers == 0)
-    pump backoff =
-      forever
-        $ handleAny (onError backoff)
-        $ bracket
-          (Pool.takeResource pool)
-          (\(conn, localPool) -> Pool.destroyResource pool localPool conn)
-        $ \(conn, _) -> do
-          _ <- PG.execute_ conn $ "LISTEN " <> fromString (T.unpack Schema.eventStreamingChannel)
-          writeIORef backoff baseBackoff -- reset on connect
-          forever $ do
-            notification <- getNotification conn
-            atomically $ writeTChan broadcast (notificationData notification)
-    -- On a sync error log it and retry with capped exponential backoff.
-    onError backoff exception = do
-      delay <- readIORef backoff
-      BS8.hPutStr stderr . encodeUtf8 $
-        "[arbiter:sse] listener error, retrying in "
-          <> T.pack (show (delay `div` 1_000_000))
-          <> "s: "
-          <> T.pack (show exception)
-          <> "\n"
-      threadDelay delay
-      writeIORef backoff (min maxBackoff (delay * 2))
+-- | The event-streaming channel as the hub names it.
+eventStreamingChannel :: ByteString
+eventStreamingChannel = encodeUtf8 Schema.eventStreamingChannel
 
 -- | Cron API handlers.
 cronServer
-  :: forall registry
-   . ArbiterServerConfig registry
+  :: forall registry m
+   . (HasRegistry m registry)
+  => ArbiterServerConfig m registry
   -> CronAPI (AsServerT Handler)
 cronServer config =
   CronAPI
@@ -1099,8 +1025,9 @@ cronServer config =
 
 -- | List cron schedules, optionally scoped to a queue.
 listCronSchedulesHandler
-  :: forall registry
-   . ArbiterServerConfig registry
+  :: forall registry m
+   . (HasRegistry m registry)
+  => ArbiterServerConfig m registry
   -> Maybe Text
   -> Handler CronSchedulesResponse
 listCronSchedulesHandler config mQueue = do
@@ -1121,8 +1048,9 @@ cronScheduleView now row@CS.CronScheduleRow {CS.enabled = isEnabled} =
 
 -- | Update a cron schedule.
 updateCronScheduleHandler
-  :: forall registry
-   . ArbiterServerConfig registry
+  :: forall registry m
+   . (HasRegistry m registry)
+  => ArbiterServerConfig m registry
   -> Text
   -> CronScheduleUpdate
   -> Handler CronScheduleView
@@ -1140,8 +1068,9 @@ updateCronScheduleHandler config name update = do
 -- | Request an out-of-band run of a cron schedule. A disabled schedule is
 -- refused. A schedule with a run already pending is refused.
 runCronScheduleHandler
-  :: forall registry
-   . ArbiterServerConfig registry
+  :: forall registry m
+   . (HasRegistry m registry)
+  => ArbiterServerConfig m registry
   -> Text
   -> Handler NoContent
 runCronScheduleHandler config name = do
@@ -1155,8 +1084,9 @@ runCronScheduleHandler config name = do
 
 -- | Workers API handlers.
 workersServer
-  :: forall registry
-   . ArbiterServerConfig registry
+  :: forall registry m
+   . (HasRegistry m registry)
+  => ArbiterServerConfig m registry
   -> WorkersAPI (AsServerT Handler)
 workersServer config =
   WorkersAPI
@@ -1167,8 +1097,9 @@ workersServer config =
 
 -- | List workers, optionally scoped to a queue and/or to recent heartbeats.
 listWorkersHandler
-  :: forall registry
-   . ArbiterServerConfig registry
+  :: forall registry m
+   . (HasRegistry m registry)
+  => ArbiterServerConfig m registry
   -> Maybe Text
   -> Maybe Double
   -> Handler WorkersResponse
@@ -1180,8 +1111,9 @@ listWorkersHandler config mQueue mLiveSecs = do
 -- | Set a worker's @paused@ flag. The worker reconciles its local state on
 -- the next heartbeat.
 setWorkerPausedHandler
-  :: forall registry
-   . ArbiterServerConfig registry
+  :: forall registry m
+   . (HasRegistry m registry)
+  => ArbiterServerConfig m registry
   -> Bool
   -> UUID
   -> Handler NoContent
@@ -1191,9 +1123,9 @@ setWorkerPausedHandler config pauseFlag workerId = do
 
 -- | Rate-limit management/observability handlers.
 rateLimitsServer
-  :: forall registry
-   . (RegistryTables registry)
-  => ArbiterServerConfig registry
+  :: forall registry m
+   . (HasRegistry m registry, RegistryTables registry)
+  => ArbiterServerConfig m registry
   -> RateLimitsAPI (AsServerT Handler)
 rateLimitsServer config =
   RateLimitsAPI
@@ -1205,8 +1137,9 @@ rateLimitsServer config =
 
 -- | Liveness and readiness handlers.
 healthServer
-  :: forall registry
-   . ArbiterServerConfig registry
+  :: forall registry m
+   . (HasRegistry m registry)
+  => ArbiterServerConfig m registry
   -> HealthAPI (AsServerT Handler)
 healthServer config =
   HealthAPI
@@ -1217,8 +1150,9 @@ healthServer config =
 -- | Readiness for probes and the dashboard. An unreachable database is a 503.
 -- Both answers carry the same body.
 healthHandler
-  :: forall registry
-   . ArbiterServerConfig registry
+  :: forall registry m
+   . (HasRegistry m registry)
+  => ArbiterServerConfig m registry
   -> Handler HealthResponse
 healthHandler config = do
   report <- liftIO (probeHealth config)
@@ -1234,8 +1168,9 @@ healthHandler config = do
 -- | Time a database round-trip and report what it says about itself. Cancellation
 -- still propagates.
 probeHealth
-  :: forall registry
-   . ArbiterServerConfig registry
+  :: forall registry m
+   . (HasRegistry m registry)
+  => ArbiterServerConfig m registry
   -> IO HealthResponse
 probeHealth config = cachedFor healthCacheTtl (healthCache config) $ do
   let schemaName = serverSchema config
@@ -1339,9 +1274,9 @@ invalidate cell = liftIO $ atomically $ modifyTVar' (cacheEntries cell) $ \(epoc
 
 -- | List policies with bucket stats and currently-throttled job counts.
 listRateLimitsHandler
-  :: forall registry
-   . (RegistryTables registry)
-  => ArbiterServerConfig registry
+  :: forall registry m
+   . (HasRegistry m registry, RegistryTables registry)
+  => ArbiterServerConfig m registry
   -> Handler RateLimitPoliciesResponse
 listRateLimitsHandler config =
   liftIO $ cachedFor policyStatsCacheTtl (rateLimitPoliciesCache config) $ do
@@ -1350,8 +1285,9 @@ listRateLimitsHandler config =
 
 -- | List a prefix's buckets with fill levels, paginated (default 100, max 1000).
 listRateLimitBucketsHandler
-  :: forall registry
-   . ArbiterServerConfig registry
+  :: forall registry m
+   . (HasRegistry m registry)
+  => ArbiterServerConfig m registry
   -> Text
   -> Maybe Int
   -> Maybe Int
@@ -1362,8 +1298,8 @@ listRateLimitBucketsHandler config prefix mLimit mOffset = do
   pure $ RateLimitBucketsResponse {buckets = rows}
 
 updateThenView
-  :: ArbiterServerConfig registry
-  -> SimpleDb registry IO (Maybe a)
+  :: ArbiterServerConfig m registry
+  -> m (Maybe a)
   -> LBS.ByteString
   -> Handler a
 updateThenView config action notFound = do
@@ -1372,9 +1308,9 @@ updateThenView config action notFound = do
 
 -- | Set or clear a policy's override params, then return the updated view.
 updateRateLimitPolicyHandler
-  :: forall registry
-   . (RegistryTables registry)
-  => ArbiterServerConfig registry
+  :: forall registry m
+   . (HasRegistry m registry, RegistryTables registry)
+  => ArbiterServerConfig m registry
   -> Text
   -> RateLimitPolicyUpdate
   -> Handler RateLimitPolicyView
@@ -1395,9 +1331,9 @@ updateRateLimitPolicyHandler config prefix upd@(RateLimitPolicyUpdate mMax mRefi
 
 -- | Clear every bucket for a prefix. Returns the number reset. 404s an unknown prefix.
 resetRateLimitBucketsHandler
-  :: forall registry
-   . (RegistryTables registry)
-  => ArbiterServerConfig registry
+  :: forall registry m
+   . (HasRegistry m registry, RegistryTables registry)
+  => ArbiterServerConfig m registry
   -> Text
   -> Handler RateLimitResetResponse
 resetRateLimitBucketsHandler config prefix = do
@@ -1409,9 +1345,9 @@ resetRateLimitBucketsHandler config prefix = do
 
 -- | Concurrency management/observability handlers.
 concurrencyServer
-  :: forall registry
-   . (RegistryTables registry)
-  => ArbiterServerConfig registry
+  :: forall registry m
+   . (HasRegistry m registry, RegistryTables registry)
+  => ArbiterServerConfig m registry
   -> ConcurrencyAPI (AsServerT Handler)
 concurrencyServer config =
   ConcurrencyAPI
@@ -1423,8 +1359,9 @@ concurrencyServer config =
 
 -- | List pools with their default/override limit and live key/in-flight stats.
 listConcurrencyHandler
-  :: forall registry
-   . ArbiterServerConfig registry
+  :: forall registry m
+   . (HasRegistry m registry)
+  => ArbiterServerConfig m registry
   -> Handler ConcurrencyPoliciesResponse
 listConcurrencyHandler config =
   liftIO $ cachedFor policyStatsCacheTtl (concurrencyPoliciesCache config) $ do
@@ -1433,8 +1370,9 @@ listConcurrencyHandler config =
 
 -- | List a prefix's keys with in-flight fill levels, paginated (default 100, max 1000).
 listConcurrencyKeysHandler
-  :: forall registry
-   . ArbiterServerConfig registry
+  :: forall registry m
+   . (HasRegistry m registry)
+  => ArbiterServerConfig m registry
   -> Text
   -> Maybe Int
   -> Maybe Int
@@ -1446,8 +1384,9 @@ listConcurrencyKeysHandler config prefix mLimit mOffset = do
 
 -- | Set or clear a pool's override limit, then return the updated view.
 updateConcurrencyPolicyHandler
-  :: forall registry
-   . ArbiterServerConfig registry
+  :: forall registry m
+   . (HasRegistry m registry)
+  => ArbiterServerConfig m registry
   -> Text
   -> ConcurrencyPolicyUpdate
   -> Handler ConcurrencyPolicyView
@@ -1463,9 +1402,9 @@ updateConcurrencyPolicyHandler config prefix upd@(ConcurrencyPolicyUpdate mLimit
 
 -- | Recompute every key's in-flight count from live jobs. Returns rows repaired.
 reconcileConcurrencyHandler
-  :: forall registry
-   . (RegistryTables registry)
-  => ArbiterServerConfig registry
+  :: forall registry m
+   . (HasRegistry m registry, RegistryTables registry)
+  => ArbiterServerConfig m registry
   -> Handler ConcurrencyReconcileResponse
 reconcileConcurrencyHandler config = do
   repaired <- runDb config HL.reconcileConcurrencyCounts
@@ -1474,9 +1413,9 @@ reconcileConcurrencyHandler config = do
 
 -- | Server for the shared top-level routes.
 sharedServer
-  :: forall registry
-   . (HL.RegistryAdmissionPolicies registry, RegistryTables registry)
-  => ArbiterServerConfig registry
+  :: forall registry m
+   . (HL.RegistryAdmissionPolicies registry, HasRegistry m registry, RegistryTables registry)
+  => ArbiterServerConfig m registry
   -> ServerT SharedAPI Handler
 sharedServer config =
   queuesServer @registry (Proxy @registry) config
@@ -1490,7 +1429,7 @@ sharedServer config =
 
 -- | Builds a registry's per-queue server implementations.
 class BuildServer registry (reg :: JobPayloadRegistry) where
-  buildServer :: ArbiterServerConfig registry -> ServerT (RegistryToAPI reg) Handler
+  buildServer :: (HasRegistry m registry) => ArbiterServerConfig m registry -> ServerT (RegistryToAPI reg) Handler
 
 -- The empty registry builds the shared top-level routes alone.
 instance
@@ -1515,44 +1454,47 @@ instance
 
 -- | Complete Arbiter server at @\/api\/v1\/...@
 arbiterServer
-  :: forall registry
-   . (BuildServer registry registry)
-  => ArbiterServerConfig registry
+  :: forall registry m
+   . (BuildServer registry registry, HasRegistry m registry)
+  => ArbiterServerConfig m registry
   -> ServerT (ArbiterAPI registry) Handler
 arbiterServer = buildServer @registry @registry
 
 -- | Hoisted server for integration into a route tree using a custom monad.
 arbiterServerHoisted
-  :: forall registry m
+  :: forall registry m n
    . ( BuildServer registry registry
+     , HasRegistry m registry
      , HasServer (ArbiterAPI registry) '[]
      )
-  => (forall x. Handler x -> m x)
-  -> ArbiterServerConfig registry
-  -> ServerT (ArbiterAPI registry) m
+  => (forall x. Handler x -> n x)
+  -> ArbiterServerConfig m registry
+  -> ServerT (ArbiterAPI registry) n
 arbiterServerHoisted natTrans config =
   hoistServer (Proxy @(ArbiterAPI registry)) natTrans (arbiterServer config)
 
 -- | Convert to WAI Application. Each 'QueueWithResult' result type needs
 -- @FromJSON@ and @ToJSON@.
 arbiterApp
-  :: forall registry
+  :: forall registry m
    . ( BuildServer registry registry
+     , HasRegistry m registry
      , HasServer (ArbiterAPI registry) '[]
      )
-  => ArbiterServerConfig registry
+  => ArbiterServerConfig m registry
   -> Application
 arbiterApp config =
   serve (Proxy @(ArbiterAPI registry)) (arbiterServer config)
 
 -- | Run the API server on a port.
 runArbiterAPI
-  :: forall registry
+  :: forall registry m
    . ( BuildServer registry registry
+     , HasRegistry m registry
      , HasServer (ArbiterAPI registry) '[]
      )
   => Port
-  -> ArbiterServerConfig registry
+  -> ArbiterServerConfig m registry
   -> IO ()
 runArbiterAPI port config = do
   putStrLn $ "Starting Arbiter API server on port " <> show port
