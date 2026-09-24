@@ -52,7 +52,7 @@ library
     , postgresql-migration  >=0.2  && <0.3
     , postgresql-simple     >=0.6  && <0.8
     , text                  >=1.2  && <2.2
-    , time                  >=1.12 && <1.15
+    , time                  >=1.12 && <1.16
 
 test-suite arbiter-migrations-tests
   import:         shared-properties

@@ -1,5 +1,8 @@
 name: CI
 
+env:
+  RELEASE_PACKAGES: arbiter-core arbiter-migrations arbiter-test-common arbiter-worker arbiter-worker-testkit arbiter-libpq arbiter-simple arbiter-hasql arbiter-orville arbiter-servant arbiter-servant-openapi arbiter-servant-ui arbiter-otel
+
 on:
   push:
     branches: [main]
@@ -62,3 +65,12 @@ jobs:
         env:
           ARBITER_TEST_CONN_STRING: "host=localhost port=5432 user=postgres password=master dbname=postgres"
         run: cabal test all
+
+      - name: Package release libraries
+        run: |
+          for pkg in $RELEASE_PACKAGES; do
+            cabal sdist "$pkg"
+          done
+
+      - name: Build release tarballs without workspace overrides
+        run: bash .github/check-sdists.sh

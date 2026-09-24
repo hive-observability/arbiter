@@ -8,7 +8,8 @@ on:
         required: true
 
 env:
-  RELEASE_PACKAGES: arbiter-core arbiter-migrations arbiter-test-common arbiter-worker arbiter-worker-testkit arbiter-simple arbiter-libpq arbiter-hasql arbiter-orville arbiter-servant arbiter-servant-openapi arbiter-servant-ui arbiter-otel
+  RELEASE_PACKAGES: arbiter-core arbiter-migrations arbiter-test-common arbiter-worker arbiter-worker-testkit arbiter-libpq arbiter-simple arbiter-hasql arbiter-orville arbiter-servant arbiter-servant-openapi arbiter-servant-ui arbiter-otel
+  RELEASE_TAG: ${{ inputs.tag }}
 
 jobs:
   promote:
@@ -18,21 +19,32 @@ jobs:
         with:
           ref: ${{ inputs.tag }}
 
-      - uses: haskell-actions/setup@v2
-        with:
-          ghc-version: '9.14'
-          cabal-version: '3.12'
+      - name: Verify candidates exist
+        run: |
+          set -euo pipefail
+          for pkg in $RELEASE_PACKAGES; do
+            version=$(awk '/^version:/ { print $2; exit }' "$pkg/$pkg.cabal")
+            test "$RELEASE_TAG" = "v$version" || { echo "Tag $RELEASE_TAG does not match $pkg version $version"; exit 1; }
+            url="https://hackage.haskell.org/package/${pkg}-${version}/candidate"
+            echo "Checking $url"
+            status=$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' "$url")
+            test "$status" = 200 || { echo "Expected candidate at $url (HTTP $status)"; exit 1; }
+          done
 
       - name: Promote candidates
         env:
           HACKAGE_USERNAME: ${{ secrets.HACKAGE_USERNAME }}
           HACKAGE_PASSWORD: ${{ secrets.HACKAGE_PASSWORD }}
         run: |
+          set -euo pipefail
           for pkg in $RELEASE_PACKAGES; do
-            cabal sdist $pkg
             version=$(awk '/^version:/ { print $2; exit }' "$pkg/$pkg.cabal")
-            tarball="dist-newstyle/sdist/${pkg}-${version}.tar.gz"
-            test -f "$tarball" || { echo "No sdist at $tarball"; exit 1; }
-            echo "Promoting $tarball..."
-            cabal upload --publish --username="$HACKAGE_USERNAME" --password="$HACKAGE_PASSWORD" "$tarball"
+            echo "Publishing candidate ${pkg}-${version}..."
+            curl --fail --silent --show-error --output /dev/null \
+              --user "$HACKAGE_USERNAME:$HACKAGE_PASSWORD" \
+              --header 'Accept: text/html' --request POST \
+              "https://hackage.haskell.org/package/${pkg}-${version}/candidate/publish"
+            url="https://hackage.haskell.org/package/${pkg}-${version}"
+            status=$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' "$url")
+            test "$status" = 200 || { echo "Published package not found at $url (HTTP $status)"; exit 1; }
           done
